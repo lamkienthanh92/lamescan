@@ -10,8 +10,10 @@
       href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap"
       rel="stylesheet"
     />
-    <!-- OpenCV.js loaded globally; App.jsx polls for window.cv readiness -->
-    <script src="https://docs.opencv.org/4.9.0/opencv.js"></script>
+    <!-- OpenCV.js is served as a same-origin static asset from /public (see public/opencv.js). -->
+    <!-- Loading it same-origin avoids CORS/CORP cross-origin blocking on hosts like Netlify. -->
+    <!-- App.jsx polls for window.cv readiness. -->
+    <script src="/opencv.js"></script>
   </head>
   <body>
     <div id="root"></div>

@@ -29,10 +29,20 @@ Thư mục `dist/` sau khi build có thể triển khai lên bất kỳ static h
 - **Cần chạy qua HTTP(S)/localhost**, không mở trực tiếp file `index.html` từ
   ổ đĩa (`file://`) — API chia sẻ màn hình (`getDisplayMedia`) của trình duyệt
   yêu cầu "secure context". `npm run dev`/`npm run preview` đã tự lo việc này.
-- OpenCV.js (~8MB) được tải từ CDN (`docs.opencv.org`) ngay trong `index.html`,
-  cần có internet ở máy chạy app. Nếu muốn dùng offline, tải file `opencv.js`
-  về và đặt vào thư mục `public/`, rồi đổi đường dẫn `<script src="...">`
-  trong `index.html` thành `/opencv.js`.
+- **OpenCV.js được tự lưu trữ tại `public/opencv.js`** (cùng gốc/same-origin
+  với app), thay vì tải từ CDN `docs.opencv.org`. Lý do: khi deploy lên
+  Netlify/Vercel..., tải script từ một origin khác có thể bị trình duyệt chặn
+  với lỗi `ERR_BLOCKED_BY_RESPONSE.NotSameOrigin` nếu server CDN đó gửi header
+  `Cross-Origin-Resource-Policy`. Để cùng gốc thì không gặp vấn đề này, và app
+  cũng không phụ thuộc CDN ngoài khi chạy production.
+- **Triển khai lên Netlify:** đã có sẵn file `netlify.toml` với
+  `command = "npm run build"` và `publish = "dist"`. Trên dashboard Netlify,
+  vào **Site settings → Build & deploy → Build settings** và đảm bảo 2 giá trị
+  này khớp (nếu bạn tạo site từ trước khi có `netlify.toml`, có thể cần sửa
+  tay). Nếu Netlify serve thẳng file nguồn (`src/main.jsx`) thay vì bản build
+  trong `dist/`, trình duyệt sẽ báo lỗi
+  `Failed to load module script... MIME type of "application/octet-stream"`
+  — đây là dấu hiệu build/publish directory bị cấu hình sai.
 - Việc ghép ảnh là **ghép liên tiếp (frame-to-frame)**: mỗi ô chỉ so khớp với
   ô ngay trước, nên chuỗi rất dài có thể trôi (sai số tích luỹ). Ảnh ghép ra
   chỉ nên dùng để minh hoạ/toàn cảnh; việc đếm/phân loại vẫn nên làm trên
