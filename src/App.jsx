@@ -250,17 +250,17 @@ export default function App() {
       let info;
       if (m.ok) {
         transformBase = matMul3(prevTile.transform, m.H);
-        info = { text: `Khớp: ${m.inliers}/${m.total} điểm nội. Kiểm tra rồi xác nhận.`, kind: m.inliers >= 8 ? 'ok' : 'warn' };
+        info = { text: `Khớp: ${m.inliers}/${m.total} điểm nội (${Math.round((m.inliers / m.total) * 100)}%). Kiểm tra rồi xác nhận.`, kind: 'ok' };
       } else {
         transformBase = prevTile.transform;
-        info = { text: `Không đủ điểm khớp (${m.inliers}/${m.total}). Dùng phím mũi tên để canh tay.`, kind: 'warn' };
+        info = { text: `Không đủ điểm khớp tin cậy (${m.inliers}/${m.total}). Dùng phím mũi tên để canh tay.`, kind: 'warn' };
       }
 
       c.pending = { mat, w, h, dataURL, transformBase, nudgeX: 0, nudgeY: 0 };
       setMatchInfo(info);
       renderPending();
 
-      if (autoConfirmRef.current && m.ok && m.inliers >= 8) {
+      if (autoConfirmRef.current && m.ok) {
         confirmTile();
       } else {
         setPending(true);
@@ -404,7 +404,7 @@ export default function App() {
             <div style={{ height: 8 }} />
             <label className="status-line" style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
               <input type="checkbox" checked={autoConfirm} onChange={(e) => setAutoConfirm(e.target.checked)} />
-              Tự động xác nhận khi khớp tốt (≥8 điểm nội)
+              Tự động xác nhận khi khớp đủ tin cậy (≥15 điểm nội, ≥25%)
             </label>
           </div>
 
