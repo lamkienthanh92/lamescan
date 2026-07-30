@@ -1,0 +1,8 @@
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
+body {
+  font-family: 'Space Grotesk', system-ui, sans-serif;
+  background: #F3F4F0;
+  color: #16201D;
+}
+#root { min-height: 100vh; display: flex; flex-direction: column; }
