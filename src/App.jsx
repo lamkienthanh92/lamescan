@@ -4,6 +4,7 @@ import JSZip from 'jszip';
 import './App.css';
 import { IDENT, matMul3, translateM, cornersOf, bboxOf, findAnchorTile } from './matrix.js';
 import { computeFeatures, matchTiles } from './cvMatch.js';
+import { addEdge, removeEdgesForTile, relax, maxRenderedDrift } from './graph.js';
 
 const INIT_PAD = 40;
 const AUTO_INTERVAL_MS = 350; // how often the continuous loop samples a frame
@@ -13,6 +14,11 @@ const AUTO_MOVE_MIN_RATIO = 0.025; // ...as a fraction of frame width, whichever
 const ANCHOR_EXCLUDE_COUNT = 8; // don't treat the last N tiles as "revisits" — they're just normal chain overlap
 const ANCHOR_MIN_TILES = ANCHOR_EXCLUDE_COUNT + 2;
 const EXTRAPOLATE_MIN_PX = 3; // minimum recent motion before it's worth extrapolating a guess
+const RELAX_ITERS_PER_TICK = 6; // small warm-started relaxation pass, run every tick
+const GUESS_EDGE_WEIGHT = 1; // low confidence for extrapolated (unmatched) placements
+const REBUILD_DRIFT_PX = 6; // repaint the mosaic once any already-painted tile drifts this much
+const REBUILD_MIN_TILES = 25; // ...but don't repaint more often than every N new tiles
+const REBUILD_MAX_MS = 8000; // ...or longer than this since the last repaint, if dirty
 
 function tileBBox(transform, w, h) {
   return bboxOf(cornersOf(transform, w, h));
@@ -63,9 +69,13 @@ export default function App() {
     originY: INIT_PAD,
     w: 0,
     h: 0,
-    tiles: [], // {transform:[9], w, h, blob, bbox, capturedAt, estimated?}
+    tiles: [], // {transform:[9], w, h, blob, bbox, capturedAt, estimated?, renderedTx, renderedTy}
+    edges: [], // {a, b, dx, dy, w} — pairwise translation observations between tile indices
+    adjacency: [], // adjacency[tileIndex] -> list of edges touching that tile
     autoFails: 0,
     busy: false,
+    lastRebuildTileCount: 0,
+    lastRebuildTime: 0,
   });
 
   const uiRef = useRef({ cvReady: false, capturing: false });
@@ -168,7 +178,17 @@ export default function App() {
     cv.split(warped, channels);
     const alpha = channels.get(3);
     const mask = new cv.Mat();
-    cv.threshold(alpha, mask, 10, 255, cv.THRESH_BINARY);
+    // Only trust fully-opaque pixels: near the tile's edge, linear interpolation
+    // blends real content with the transparent (black) border, which darkens
+    // those pixels even though their alpha isn't quite zero. A loose threshold
+    // let that blended ring through, showing up as a thin dark seam at every
+    // tile boundary.
+    cv.threshold(alpha, mask, 250, 255, cv.THRESH_BINARY);
+    // Erode a couple more pixels off the valid region as a safety margin, in
+    // case of small misregistration at the boundary too.
+    const kernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(3, 3));
+    cv.erode(mask, mask, kernel, new cv.Point(-1, -1), 2);
+    kernel.delete();
     warped.copyTo(targetMat, mask);
     Tmat.delete();
     warped.delete();
@@ -233,8 +253,12 @@ export default function App() {
       const mat = await blobToMat(tile.blob);
       composite(mat, tile.transform, tile.w, tile.h, c.mosaicMat);
       mat.delete();
+      tile.renderedTx = tile.transform[2];
+      tile.renderedTy = tile.transform[5];
     }
     paintCanvas(c.mosaicMat);
+    c.lastRebuildTileCount = c.tiles.length;
+    c.lastRebuildTime = Date.now();
     setTileCount(c.tiles.length);
   }, [composite, blobToMat, growCanvasIfNeeded, paintCanvas]);
 
@@ -355,25 +379,45 @@ export default function App() {
         composite(mat, IDENT, w, h, c.mosaicMat);
         paintCanvas(c.mosaicMat);
         const blob = await blobPromise;
-        c.tiles.push({ transform: IDENT, w, h, blob, bbox: tileBBox(IDENT, w, h), capturedAt: Date.now() });
+        c.tiles.push({
+          transform: IDENT.slice(), w, h, blob, bbox: tileBBox(IDENT, w, h), capturedAt: Date.now(),
+          renderedTx: 0, renderedTy: 0,
+        });
         setLastFeatures(computeFeatures(mat));
         mat.delete();
         c.autoFails = 0;
+        c.lastRebuildTileCount = 1;
+        c.lastRebuildTime = Date.now();
         setTileCount(1);
         setMatchInfo({ text: 'Ô nền (#1) đã đặt — kéo tiêu bản để tiếp tục.', kind: 'ok' });
         return;
       }
 
-      const prevTile = c.tiles[c.tiles.length - 1];
+      const prevIndex = c.tiles.length - 1;
+      const prevTile = c.tiles[prevIndex];
       const prevFeat = await getLastFeatures();
       const featNew = computeFeatures(mat);
       const m = matchTiles(featNew.kp, featNew.desc, prevFeat.kp, prevFeat.desc);
+
+      // Runs the shared warm-started relaxation pass, then checks whether any
+      // already-painted tile drifted enough (or enough time/tiles have passed)
+      // to justify the cost of a full mosaic repaint.
+      const relaxAndMaybeRebuild = async () => {
+        relax(c.tiles, c.adjacency, 0, RELAX_ITERS_PER_TICK);
+        const drift = maxRenderedDrift(c.tiles);
+        const dueForRebuild =
+          drift > REBUILD_DRIFT_PX &&
+          (c.tiles.length - c.lastRebuildTileCount >= REBUILD_MIN_TILES || Date.now() - c.lastRebuildTime >= REBUILD_MAX_MS);
+        if (dueForRebuild) {
+          await rebuildMosaic();
+        }
+      };
 
       if (!m.ok) {
         // Low-texture / motion-blur frame — guess from recent motion instead of stopping.
         let usedGuess = false;
         if (c.tiles.length >= 2) {
-          const prev2 = c.tiles[c.tiles.length - 2];
+          const prev2 = c.tiles[prevIndex - 1];
           const dx = prevTile.transform[2] - prev2.transform[2];
           const dy = prevTile.transform[5] - prev2.transform[5];
           if (Math.hypot(dx, dy) > EXTRAPOLATE_MIN_PX) {
@@ -384,9 +428,16 @@ export default function App() {
             growCanvasIfNeeded(guessTransform, w, h);
             composite(mat, guessTransform, w, h, c.mosaicMat);
             paintCanvas(c.mosaicMat);
-            c.tiles.push({ transform: guessTransform, w, h, blob, bbox: tileBBox(guessTransform, w, h), capturedAt: Date.now(), estimated: true });
+            const newIndex = c.tiles.length;
+            c.tiles.push({
+              transform: guessTransform, w, h, blob, bbox: tileBBox(guessTransform, w, h), capturedAt: Date.now(),
+              estimated: true, renderedTx: guessTransform[2], renderedTy: guessTransform[5],
+            });
+            // Low-weight edge: a rough guess, easily outweighed by any real match later.
+            addEdge(c.edges, c.adjacency, prevIndex, newIndex, dx, dy, GUESS_EDGE_WEIGHT);
             setLastFeatures(featNew);
             c.autoFails = 0;
+            await relaxAndMaybeRebuild();
             setTileCount(c.tiles.length);
             setMatchInfo({ text: 'Vùng ít chi tiết — đã ước lượng vị trí theo hướng di chuyển gần nhất.', kind: 'warn' });
             usedGuess = true;
@@ -416,17 +467,32 @@ export default function App() {
         return;
       }
 
+      // Chain-based placement — this is the tile's initial position estimate.
       const transform = matMul3(prevTile.transform, m.H);
+      const newIndex = c.tiles.length;
+      const blob = await blobPromise;
+      growCanvasIfNeeded(transform, w, h);
+      composite(mat, transform, w, h, c.mosaicMat);
+      paintCanvas(c.mosaicMat);
+      c.tiles.push({
+        transform, w, h, blob, bbox: tileBBox(transform, w, h), capturedAt: Date.now(),
+        renderedTx: transform[2], renderedTy: transform[5],
+      });
+      addEdge(c.edges, c.adjacency, prevIndex, newIndex, transform[2] - prevTile.transform[2], transform[5] - prevTile.transform[5], m.inliers);
+      mat.delete();
+      setLastFeatures(featNew);
+      c.autoFails = 0;
 
       // Zigzag/raster loop-closure: if this frame's provisional world position
       // overlaps a tile placed much earlier (e.g. the row above, on the way back),
-      // re-register against that tile instead of trusting the drifted chain.
-      let finalTransform = transform;
+      // ALSO record that as an independent edge — both observations feed the
+      // same relaxation pass rather than one overriding the other.
       let usedAnchor = false;
       if (c.tiles.length >= ANCHOR_MIN_TILES) {
         const candBBox = tileBBox(transform, w, h);
-        const anchor = findAnchorTile(c.tiles, candBBox, ANCHOR_EXCLUDE_COUNT);
+        const anchor = findAnchorTile(c.tiles.slice(0, newIndex), candBBox, ANCHOR_EXCLUDE_COUNT);
         if (anchor) {
+          const anchorIndex = c.tiles.indexOf(anchor);
           const anchorMat = await blobToMat(anchor.blob);
           const anchorFeat = computeFeatures(anchorMat);
           anchorMat.delete();
@@ -434,24 +500,21 @@ export default function App() {
           anchorFeat.kp.delete();
           anchorFeat.desc.delete();
           if (am.ok) {
-            finalTransform = matMul3(anchor.transform, am.H);
+            const anchorTransform = matMul3(anchor.transform, am.H);
+            addEdge(
+              c.edges, c.adjacency, anchorIndex, newIndex,
+              anchorTransform[2] - anchor.transform[2], anchorTransform[5] - anchor.transform[5], am.inliers
+            );
             usedAnchor = true;
           }
         }
       }
 
-      const blob = await blobPromise;
-      growCanvasIfNeeded(finalTransform, w, h);
-      composite(mat, finalTransform, w, h, c.mosaicMat);
-      paintCanvas(c.mosaicMat);
-      c.tiles.push({ transform: finalTransform, w, h, blob, bbox: tileBBox(finalTransform, w, h), capturedAt: Date.now() });
-      mat.delete();
-      setLastFeatures(featNew);
-      c.autoFails = 0;
+      await relaxAndMaybeRebuild();
       setTileCount(c.tiles.length);
       setMatchInfo({
         text: usedAnchor
-          ? `Đã tự chỉnh trôi theo điểm tham chiếu trước đó — ${m.inliers}/${m.total} điểm nội.`
+          ? `Đã nối tự động, phát hiện trùng vùng cũ — đang điều hoà toàn cục (${m.inliers}/${m.total} điểm nội).`
           : `Đã nối tự động — ${m.inliers}/${m.total} điểm nội (${Math.round((m.inliers / m.total) * 100)}%).`,
         kind: 'ok',
       });
@@ -459,7 +522,7 @@ export default function App() {
       c.busy = false;
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [composite, ensureMosaic, growCanvasIfNeeded, paintCanvas, getLastFeatures, blobToMat]);
+  }, [composite, ensureMosaic, growCanvasIfNeeded, paintCanvas, getLastFeatures, blobToMat, rebuildMosaic]);
 
   const autoTickRef = useRef(autoTick);
   useEffect(() => { autoTickRef.current = autoTick; }, [autoTick]);
@@ -485,7 +548,9 @@ export default function App() {
   const undoLast = async () => {
     const c = cv_.current;
     if (c.tiles.length === 0) return;
+    const removedIndex = c.tiles.length - 1;
     c.tiles.pop();
+    removeEdgesForTile(c.edges, c.adjacency, removedIndex);
     clearLastFeatures();
     await rebuildMosaic();
     setMatchInfo({ text: 'Đã hoàn tác ô cuối.', kind: 'idle' });
@@ -500,11 +565,15 @@ export default function App() {
       c.mosaicMat = null;
     }
     c.tiles = [];
+    c.edges = [];
+    c.adjacency = [];
     c.originX = INIT_PAD;
     c.originY = INIT_PAD;
     c.w = 0;
     c.h = 0;
     c.autoFails = 0;
+    c.lastRebuildTileCount = 0;
+    c.lastRebuildTime = 0;
     setTileCount(0);
     setCanvasDims({ w: 0, h: 0 });
     if (mosaicCanvasRef.current) {
@@ -514,6 +583,20 @@ export default function App() {
       ctx.clearRect(0, 0, 1, 1);
     }
     setMatchInfo({ text: 'Đã đặt lại toàn bộ.', kind: 'idle' });
+  };
+
+  const forceOptimize = async () => {
+    const c = cv_.current;
+    if (c.tiles.length < 2 || exportingZip || c.busy) return;
+    c.busy = true;
+    try {
+      relax(c.tiles, c.adjacency, 0, 200); // run to near-full convergence
+      setMatchInfo({ text: 'Đang vẽ lại ảnh ghép sau khi tối ưu…', kind: 'idle' });
+      await rebuildMosaic();
+      setMatchInfo({ text: 'Đã tối ưu vị trí toàn cục và vẽ lại ảnh ghép.', kind: 'ok' });
+    } finally {
+      c.busy = false;
+    }
   };
 
   const exportPNG = () => {
@@ -696,9 +779,11 @@ export default function App() {
               </button>
             )}
             <div className="note" style={{ marginTop: 8 }}>
-              Cứ kéo tiêu bản bình thường — app tự lấy mẫu, tự ghép, và khi gặp vùng ít
-              chi tiết sẽ tự ước lượng vị trí theo hướng di chuyển gần nhất thay vì dừng
-              lại hỏi bạn. Những ô ước lượng được đánh dấu riêng trong manifest xuất ra.
+              Cứ kéo tiêu bản bình thường — app tự lấy mẫu, tự ghép, và <b>liên tục điều
+              hoà vị trí toàn bộ các ô</b> (không chỉ ô mới nhất) mỗi khi phát hiện trùng
+              vùng đã quét trước đó, để giảm trôi tích luỹ ở các đường quét dài/zigzag.
+              Ảnh ghép sẽ tự vẽ lại định kỳ khi có điều chỉnh đáng kể. Vùng ít chi tiết sẽ
+              được ước lượng theo hướng di chuyển gần nhất thay vì dừng lại hỏi bạn.
             </div>
           </div>
 
@@ -723,6 +808,10 @@ export default function App() {
               <button onClick={undoLast} disabled={tileCount === 0}>Hoàn tác ô cuối</button>
               <button onClick={resetAll} disabled={tileCount === 0}>Đặt lại</button>
             </div>
+            <div style={{ height: 8 }} />
+            <button onClick={forceOptimize} disabled={tileCount < 2}>
+              Tối ưu &amp; vẽ lại ngay
+            </button>
             <div style={{ height: 8 }} />
             <button className="primary" onClick={exportPNG} disabled={tileCount === 0}>
               Xuất ảnh ghép (PNG)

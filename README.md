@@ -78,6 +78,31 @@ Thư mục `dist/` sau khi build có thể triển khai lên bất kỳ static h
   (`captureStream` + `requestPictureInPicture`), được Chrome/Edge desktop hỗ trợ
   tốt nhất. Nếu trình duyệt không hỗ trợ, nút này sẽ tự ẩn/báo không khả dụng,
   không ảnh hưởng đến chức năng ghép ảnh chính.
+- **Tối ưu hoá toàn cục liên tục (điểm khác biệt so với Fiji/Hugin).** Thay vì chỉ
+  tin 1 phép khớp cho mỗi ô (chuỗi tuần tự, hoặc để điểm neo ghi đè), mọi phép khớp
+  thành công — cả khớp chuỗi lẫn khớp điểm neo khi phát hiện trùng vùng cũ — đều
+  được ghi lại thành 1 "cạnh" trong 1 đồ thị vị trí (`src/graph.js`). Mỗi vài khung
+  hình, app chạy 1 vòng lặp Gauss-Seidel nhẹ để điều hoà vị trí (x,y) của **toàn bộ**
+  các ô sao cho tổng sai lệch trên mọi cạnh là nhỏ nhất — giống nguyên lý bundle
+  adjustment/pose-graph optimization dùng trong SLAM, nhưng đơn giản hoá thành bài
+  toán tuyến tính vì chỉ tối ưu tịnh tiến (xoay/tỷ lệ giữ nguyên từ phép khớp cục bộ,
+  vì tiêu bản dịch chuyển dưới kính hiển vi không tạo biến dạng phối cảnh).
+  - Đây là điểm Fiji/Hugin **không có**: các công cụ đó chỉ tối ưu toàn cục theo lô,
+    sau khi đã có sẵn toàn bộ ảnh — không tương tác thời gian thực. App này điều hoà
+    liên tục ngay trong lúc quét.
+  - **Thành thật về giới hạn:** "liên tục" ở đây nghĩa là *vị trí* được điều hoà mỗi
+    tick (rất rẻ, chỉ vài phép cộng trừ), nhưng việc **vẽ lại ảnh ghép hiển thị** thì
+    làm theo đợt (khi phát hiện lệch đủ lớn, hoặc tối đa mỗi ~25 ô/8 giây) — vẽ lại
+    toàn bộ hàng trăm ô mỗi khung hình sẽ không kịp thời gian thực. Có thể thấy ảnh
+    ghép "khựng" nhẹ vài giây mỗi khi tự vẽ lại — đó là lúc nó đang áp dụng kết quả
+    tối ưu, không phải lỗi.
+  - Dùng nút **"Tối ưu & vẽ lại ngay"** để ép chạy hội tụ đầy đủ + vẽ lại ngay lập
+    tức — nên bấm trước khi xuất ảnh/zip để đảm bảo kết quả cuối cùng đã ổn định.
+  - Đây vẫn là bản đơn giản hoá (chỉ tối ưu tịnh tiến, quan hệ hàng xóm thưa — chủ
+    yếu chuỗi + một vài cạnh điểm neo) chứ chưa phải bundle adjustment đầy đủ như
+    Fiji (tối ưu mọi cặp chồng lấn, cả xoay lẫn tỷ lệ). Với chuỗi cực dài và nhiều
+    vùng khó, kết quả có thể vẫn kém hơn Fiji chạy offline — nhưng bù lại có phản
+    hồi trực quan ngay trong lúc quét, điều Fiji không làm được.
 - **Không còn bước xác nhận thủ công nào** — mọi ô đều được đặt tự động. Khi
   không đủ điểm khớp tin cậy (vùng ít chi tiết), app dùng phương án dự phòng:
   **ngoại suy vị trí theo vector di chuyển giữa 2 ô liền trước** thay vì dừng lại.
