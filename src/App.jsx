@@ -396,7 +396,9 @@ export default function App() {
           featNew.kp.delete();
           featNew.desc.delete();
           c.autoFails += 1;
-          if (c.autoFails >= AUTO_FAIL_WARN) {
+          if (m.unsupported) {
+            setMatchInfo({ text: 'Trình duyệt/bản OpenCV.js hiện tại thiếu hàm cần thiết để so khớp ảnh — không thể ghép tự động. Thử lại bằng Chrome/Edge bản mới nhất.', kind: 'warn' });
+          } else if (c.autoFails >= AUTO_FAIL_WARN) {
             setMatchInfo({ text: 'Mất khớp liên tục — kéo chậm lại một chút để lấy nét ổn định.', kind: 'warn' });
           }
         }

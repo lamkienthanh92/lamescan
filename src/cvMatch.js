@@ -10,6 +10,23 @@
 // points while warping/ghosting everything else. Estimating a constrained
 // similarity transform (rotation + uniform scale + translation, 4 DOF) is much
 // harder to fool and matches what's actually happening physically.
+//
+// Not every opencv.js build actually exposes estimateAffinePartial2D to JS —
+// this is a known gap even in the official docs.opencv.org build, independent
+// of whether the C++ function exists. If it's missing, every match would
+// otherwise fail unconditionally with no obvious cause, so we detect what's
+// actually available once at runtime and fall back gracefully.
+let cachedMethod = null;
+function detectMethod() {
+  if (cachedMethod) return cachedMethod;
+  if (typeof cv.estimateAffinePartial2D === 'function') cachedMethod = 'partial';
+  else if (typeof cv.estimateAffine2D === 'function') cachedMethod = 'affine';
+  else if (typeof cv.findHomography === 'function') cachedMethod = 'homography';
+  else cachedMethod = 'none';
+  // eslint-disable-next-line no-console
+  console.info('[panorama] transform estimation method in use:', cachedMethod);
+  return cachedMethod;
+}
 
 export function computeFeatures(mat) {
   const gray = new cv.Mat();
@@ -26,8 +43,7 @@ export function computeFeatures(mat) {
 }
 
 // Returns { ok, inliers, total, H? } where H is a flat 3x3 row-major array
-// (translation row padded with [0,0,1]) mapping points from the "new" tile's
-// pixel space into the "prev" tile's pixel space.
+// mapping points from the "new" tile's pixel space into the "prev" tile's pixel space.
 export function matchTiles(kpNew, descNew, kpPrev, descPrev) {
   if (descNew.rows < 4 || descPrev.rows < 4) return { ok: false, inliers: 0, total: 0 };
 
@@ -61,8 +77,9 @@ export function matchTiles(kpNew, descNew, kpPrev, descPrev) {
   const srcMat = cv.matFromArray(keep.length, 1, cv.CV_32FC2, src);
   const dstMat = cv.matFromArray(keep.length, 1, cv.CV_32FC2, dst);
   const inlierMask = new cv.Mat();
+  const method = detectMethod();
 
-  if (typeof cv.estimateAffinePartial2D !== 'function') {
+  if (method === 'none') {
     srcMat.delete();
     dstMat.delete();
     inlierMask.delete();
@@ -73,8 +90,16 @@ export function matchTiles(kpNew, descNew, kpPrev, descPrev) {
 
   let M;
   try {
-    // Similarity transform only: rotation + uniform scale + translation.
-    M = cv.estimateAffinePartial2D(srcMat, dstMat, inlierMask, cv.RANSAC, 4, 3000, 0.99, 10);
+    if (method === 'partial') {
+      // Rotation + uniform scale + translation only (4 DOF) — the tightest fit.
+      M = cv.estimateAffinePartial2D(srcMat, dstMat, inlierMask, cv.RANSAC, 4, 3000, 0.99, 10);
+    } else if (method === 'affine') {
+      // Adds shear/non-uniform scale (6 DOF) — still no perspective distortion.
+      M = cv.estimateAffine2D(srcMat, dstMat, inlierMask, cv.RANSAC, 4, 3000, 0.99, 10);
+    } else {
+      // Last resort: full projective homography (8 DOF).
+      M = cv.findHomography(srcMat, dstMat, cv.RANSAC, 5, inlierMask);
+    }
   } catch (e) {
     srcMat.delete();
     dstMat.delete();
@@ -95,8 +120,11 @@ export function matchTiles(kpNew, descNew, kpPrev, descPrev) {
   if (M.empty() || inliers < 15 || ratio < 0.25) {
     result = { ok: false, inliers, total: keep.length };
   } else {
-    const a = Array.from(M.data64F); // [a,b,tx, c,d,ty] (2x3 row-major)
-    result = { ok: true, inliers, total: keep.length, H: [a[0], a[1], a[2], a[3], a[4], a[5], 0, 0, 1] };
+    const a = Array.from(M.data64F);
+    // findHomography already returns a full 3x3 matrix; the affine estimators
+    // return 2x3, which we pad into the same 3x3 homogeneous form.
+    const H = method === 'homography' ? a : [a[0], a[1], a[2], a[3], a[4], a[5], 0, 0, 1];
+    result = { ok: true, inliers, total: keep.length, H };
   }
 
   M.delete();
@@ -107,3 +135,4 @@ export function matchTiles(kpNew, descNew, kpPrev, descPrev) {
   matches.delete();
   return result;
 }
+
