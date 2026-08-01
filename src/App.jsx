@@ -112,6 +112,16 @@ export default function App() {
     };
   }, []);
 
+  const pipStreamRef = useRef(null);
+
+  const ensurePipStream = async () => {
+    if (pipStreamRef.current) return; // already set up this session — reuse it
+    const stream = mosaicCanvasRef.current.captureStream(15);
+    pipStreamRef.current = stream;
+    pipVideoRef.current.srcObject = stream;
+    await pipVideoRef.current.play();
+  };
+
   const togglePip = async () => {
     try {
       if (document.pictureInPictureElement) {
@@ -119,9 +129,7 @@ export default function App() {
         return;
       }
       if (!mosaicCanvasRef.current || !pipVideoRef.current) return;
-      const stream = mosaicCanvasRef.current.captureStream(15);
-      pipVideoRef.current.srcObject = stream;
-      await pipVideoRef.current.play();
+      await ensurePipStream();
       await pipVideoRef.current.requestPictureInPicture();
     } catch (e) {
       setMatchInfo({ text: 'Không thể mở cửa sổ nổi: ' + e.message, kind: 'warn' });
