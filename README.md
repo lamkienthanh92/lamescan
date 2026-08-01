@@ -61,6 +61,26 @@ Thư mục `dist/` sau khi build có thể triển khai lên bất kỳ static h
   dấu "có thể mờ" — hiện số lượng ở khối Trạng thái, và liệt kê chi tiết trong
   panel "Ô đã chụp". Đây là ngưỡng tương đối, tự thích nghi theo từng phiên
   quét, không phải một con số cố định.
+- **Xác định lại vị trí khi tiếp tục phiên (relocalization).** Sau khi "Tiếp
+  tục phiên cũ" hoặc "Nhập lại từ ZIP" (không phải mỗi lần bấm "Bắt đầu ghép tự
+  động" trong cùng 1 phiên — việc đó chỉ dùng cơ chế ước lượng/điểm neo sẵn có,
+  nhẹ hơn nhiều), app **không mặc định** là vị trí vật lý hiện tại vẫn liền
+  mạch với ô cuối cùng đã lưu. Ô đầu tiên chụp sau đó sẽ được dò khớp với
+  **toàn bộ** các ô đã có (không chỉ ô cuối) để xác nhận đúng vị trí trước khi
+  cho phép ghép tiếp — tránh tình trạng khớp nhầm vào ô lân cận có vân/kết cấu
+  giống nhau (dễ gặp với mô có sợi lặp lại) rồi dán chồng sai chỗ. Nếu không
+  xác định được sau 6 lần thử, app tự dừng thử lại (tránh
+  quét lặp vô hạn) và quay về ghép bình thường kèm cảnh báo — lúc đó nên dùng
+  "Chụp lại" trong panel "Ô đã chụp" để sửa đúng 1 ô, hoặc kiểm tra đang đúng
+  lame/vùng cũ.
+- **Cache đặc trưng vĩnh viễn theo từng ô (tăng tốc).** Trước đây, mỗi khi cần
+  so khớp với 1 ô cũ (điểm neo zigzag, xác định lại vị trí, chụp lại 1 ô), app
+  giải mã lại ảnh PNG + tính lại đặc trưng ORB **từ đầu mỗi lần**, dù ô đó có
+  thể đã được kiểm tra trước đó. Giờ mỗi ô tự giữ lại đặc trưng của chính nó
+  sau lần tính đầu tiên (gắn thẳng vào đối tượng ô trong bộ nhớ, không lưu vào
+  IndexedDB) — các lần so khớp lặp lại với cùng 1 ô sau đó gần như tức thời.
+  Đây là nguyên nhân chính của hiện tượng "trật nhịp, chuyển trục quét tiếp bị
+  khựng lại khá lâu" mà bạn gặp phải.
 - **Chụp lại 1 ô giữa chuỗi.** Trong panel "Ô đã chụp", bấm "Chụp lại" ở ô cần
   sửa (đưa kính hiển vi về đúng vị trí đó trước) — ảnh mới được so khớp với cả
   ô liền trước lẫn liền sau (nếu có) để xác định lại đúng vị trí, rồi thay thế
@@ -77,6 +97,22 @@ Thư mục `dist/` sau khi build có thể triển khai lên bất kỳ static h
   tuần tự với độ tin cậy mặc định — không mất độ chính xác vị trí (vẫn dùng
   đúng ma trận đã lưu), chỉ là các cạnh "điểm neo" đặc biệt trước đó sẽ cần
   hình thành lại tự nhiên nếu quét tiếp qua vùng cũ.
+- **Quét nhiều lớp Z (chọn lọc theo từng ô).** Trong panel "Ô đã chụp", nút
+  "Quét Z" cho 1 ô cụ thể: chỉnh tiêu cự rồi bấm "Chụp thêm lớp" nhiều lần
+  (không di chuyển tiêu bản theo x,y giữa các lần, chỉ vặn ốc lấy nét) — mỗi
+  ô có thể có nhiều lớp ở các độ cao tiêu điểm khác nhau. Bấm "Xong" để lưu cả
+  chồng ảnh: **lớp nét nhất** (theo cùng chỉ số Laplacian variance đã dùng để
+  phát hiện mờ) được dùng để ghép vào ảnh toàn cảnh, còn **toàn bộ chồng ảnh**
+  được lưu kèm để xem lại bằng thanh trượt (nhấp nháy qua từng lớp) ngay trong
+  panel — không tự động ghép nhiều lớp thành 1 ảnh (không làm EDF/extended-
+  depth-of-field), mục đích là để mắt người xác nhận trực quan, phù hợp hơn
+  cho việc đếm AFB cần xác nhận thủ công.
+  **Giới hạn:** hoàn toàn thủ công (app không điều khiển được motor lấy nét),
+  và hiện tại **"Xuất toàn bộ ảnh gốc + manifest (ZIP)" / "Nhập lại từ ZIP"
+  chưa mang theo chồng ảnh Z** — chỉ ảnh đại diện (lớp nét nhất) được xuất/nhập;
+  chồng ảnh Z chỉ tồn tại trong phiên làm việc hiện tại (có lưu vào IndexedDB
+  nên vẫn sống sót qua "Tiếp tục phiên cũ", chỉ không đi qua đường xuất/nhập
+  ZIP).
 - **Cần chạy qua HTTP(S)/localhost**, không mở trực tiếp file `index.html` từ
   ổ đĩa (`file://`) — API chia sẻ màn hình (`getDisplayMedia`) của trình duyệt
   yêu cầu "secure context". `npm run dev`/`npm run preview` đã tự lo việc này.

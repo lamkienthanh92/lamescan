@@ -23,6 +23,7 @@ const REBUILD_MAX_MS = 8000; // ...or longer than this since the last repaint, i
 const SHARPNESS_HISTORY_SIZE = 30; // recent "good" tiles used as the running focus baseline
 const SHARPNESS_MIN_SAMPLES = 5; // don't flag anything until we have a baseline
 const SHARPNESS_BLUR_RATIO = 0.4; // flag a tile if its sharpness < 40% of the recent median
+const RELOC_MAX_ATTEMPTS = 6; // give up auto-retrying relocalization after this many failed full searches
 
 function tileBBox(transform, w, h) {
   return bboxOf(cornersOf(transform, w, h));
@@ -53,6 +54,26 @@ function TileThumb({ blob }) {
   return url ? <img src={url} alt="" className="tile-thumb" /> : <div className="tile-thumb" />;
 }
 
+function ZStackScrubber({ zstack }) {
+  const [idx, setIdx] = useState(0);
+  const layer = zstack[Math.min(idx, zstack.length - 1)];
+  return (
+    <div className="zstack-scrub">
+      <TileThumb blob={layer.blob} />
+      <input
+        type="range"
+        min={0}
+        max={zstack.length - 1}
+        value={idx}
+        onChange={(e) => setIdx(Number(e.target.value))}
+      />
+      <span className="mono" style={{ fontSize: 10, color: 'var(--ink-dim)' }}>
+        lớp {idx + 1}/{zstack.length}
+      </span>
+    </div>
+  );
+}
+
 export default function App() {
   const [cvReady, setCvReady] = useState(false);
   const [capturing, setCapturing] = useState(false);
@@ -71,6 +92,8 @@ export default function App() {
   const [tilePanelShowAll, setTilePanelShowAll] = useState(false);
   const [tilePanelVersion, setTilePanelVersion] = useState(0); // bump to force the panel list to re-render
   const [recapturingIndex, setRecapturingIndex] = useState(null);
+  const [zCaptureIndex, setZCaptureIndex] = useState(null);
+  const [zLayers, setZLayers] = useState([]);
 
   const videoRef = useRef(null);
   const pipVideoRef = useRef(null);
@@ -79,7 +102,6 @@ export default function App() {
   const workCanvasRef = useRef(document.createElement('canvas'));
   const streamRef = useRef(null);
   const autoTimerRef = useRef(null);
-  const lastFeaturesRef = useRef(null); // cached {kp, desc} for the most recently integrated tile
   const cropRef = useRef(null); // {x,y,w,h} in native video px, read by grabVideoFrame
   const dragStartRef = useRef(null);
 
@@ -97,6 +119,9 @@ export default function App() {
     lastRebuildTileCount: 0,
     lastRebuildTime: 0,
     sharpnessHistory: [],
+    needsRelocalization: false,
+    lastRelocAttempt: 0,
+    relocAttempts: 0,
   });
 
   const uiRef = useRef({ cvReady: false, capturing: false });
@@ -132,6 +157,7 @@ export default function App() {
     const c = cv_.current;
     try {
       const [tiles, meta] = await Promise.all([db.loadAllTiles(), db.loadMeta()]);
+      freeAllTileFeatures(c.tiles);
       c.tiles = tiles.map((t) => ({ ...t, renderedTx: undefined, renderedTy: undefined }));
       c.edges = (meta && meta.edges) || [];
       c.adjacency = [];
@@ -140,11 +166,13 @@ export default function App() {
         (c.adjacency[e.b] ||= []).push(e);
       }
       c.sharpnessHistory = tiles.filter((t) => !t.blurry && t.sharpness).map((t) => t.sharpness).slice(-SHARPNESS_HISTORY_SIZE);
+      c.needsRelocalization = true;
+      c.relocAttempts = 0;
       setBlurryCount(tiles.filter((t) => t.blurry).length);
       setResumePrompt(null);
       setMatchInfo({ text: `Đang khôi phục ${tiles.length} ô từ phiên trước…`, kind: 'idle' });
       await rebuildMosaic();
-      setMatchInfo({ text: `Đã khôi phục ${tiles.length} ô. Có thể tiếp tục kéo tiêu bản.`, kind: 'ok' });
+      setMatchInfo({ text: `Đã khôi phục ${tiles.length} ô. Kéo tiêu bản để app tự xác định lại vị trí trước khi ghép tiếp.`, kind: 'ok' });
     } catch (e) {
       setMatchInfo({ text: 'Không thể khôi phục phiên trước: ' + e.message, kind: 'warn' });
       setResumePrompt(null);
@@ -286,9 +314,8 @@ export default function App() {
   // median of recent "good" tiles, since what counts as "sharp" depends on
   // scene/magnification. Only non-blurry tiles feed the baseline, so a run of
   // blur doesn't drag the threshold down with it.
-  const evaluateSharpness = (mat) => {
+  const classifySharpness = (value) => {
     const c = cv_.current;
-    const value = computeSharpness(mat);
     let blurry = false;
     if (c.sharpnessHistory.length >= SHARPNESS_MIN_SAMPLES) {
       const sorted = [...c.sharpnessHistory].sort((a, b) => a - b);
@@ -299,17 +326,24 @@ export default function App() {
       c.sharpnessHistory.push(value);
       if (c.sharpnessHistory.length > SHARPNESS_HISTORY_SIZE) c.sharpnessHistory.shift();
     }
-    return { value, blurry };
+    return blurry;
+  };
+
+  const evaluateSharpness = (mat) => {
+    const value = computeSharpness(mat);
+    return { value, blurry: classifySharpness(value) };
   };
 
   // Fire-and-forget: don't block the real-time capture loop on disk I/O, but
   // do surface a warning if IndexedDB writes start failing (e.g. quota).
   const persistTile = (index, tile) => {
-    db.saveTile({
+    const record = {
       index, transform: tile.transform, w: tile.w, h: tile.h, blob: tile.blob,
       bbox: tile.bbox, capturedAt: tile.capturedAt, estimated: !!tile.estimated,
       sharpness: tile.sharpness, blurry: !!tile.blurry,
-    }).catch((e) => {
+    };
+    if (tile.zstack) record.zstack = tile.zstack;
+    db.saveTile(record).catch((e) => {
       setMatchInfo({ text: 'Cảnh báo: không lưu được ảnh vào bộ nhớ tạm (' + e.message + ') — mất dữ liệu nếu tab bị đóng.', kind: 'warn' });
     });
   };
@@ -319,34 +353,40 @@ export default function App() {
     db.saveMeta({ edges: c.edges, tileCount: c.tiles.length, updatedAt: Date.now() }).catch(() => {});
   };
 
-  const setLastFeatures = (feat) => {
-    const old = lastFeaturesRef.current;
-    if (old) {
-      old.kp.delete();
-      old.desc.delete();
-    }
-    lastFeaturesRef.current = feat;
-  };
-
-  const clearLastFeatures = () => {
-    if (lastFeaturesRef.current) {
-      lastFeaturesRef.current.kp.delete();
-      lastFeaturesRef.current.desc.delete();
-      lastFeaturesRef.current = null;
-    }
-  };
-
-  const getLastFeatures = useCallback(async () => {
-    if (lastFeaturesRef.current) return lastFeaturesRef.current;
-    const c = cv_.current;
-    const last = c.tiles[c.tiles.length - 1];
-    if (!last) return null;
-    const mat = await blobToMat(last.blob);
+  // Every tile permanently caches its own ORB features (kp/desc) once computed,
+  // instead of the old single-slot "last tile only" cache. This matters a lot
+  // for anchor/loop-closure checks and relocalization, which compare the
+  // current frame against arbitrary OLDER tiles, not just the most recent one
+  // — without this, every such check was re-decoding the tile's PNG blob and
+  // re-running ORB detection from scratch, every single time, even for tiles
+  // checked repeatedly (e.g. a busy anchor spot revisited across a zigzag).
+  const getTileFeatures = async (tile) => {
+    if (tile._kp && tile._desc) return { kp: tile._kp, desc: tile._desc };
+    const mat = await blobToMat(tile.blob);
     const feat = computeFeatures(mat);
     mat.delete();
-    lastFeaturesRef.current = feat;
+    tile._kp = feat.kp;
+    tile._desc = feat.desc;
     return feat;
-  }, [blobToMat]);
+  };
+
+  // cv.Mat isn't garbage-collected — any tile we discard (undo, replace via
+  // recapture, reset, or overwritten by import/resume) must explicitly free
+  // its cached features or the WASM heap leaks over a long session.
+  const freeTileFeatures = (tile) => {
+    if (tile._kp) {
+      tile._kp.delete();
+      tile._kp = null;
+    }
+    if (tile._desc) {
+      tile._desc.delete();
+      tile._desc = null;
+    }
+  };
+
+  const freeAllTileFeatures = (tiles) => {
+    for (const t of tiles) freeTileFeatures(t);
+  };
 
   const rebuildMosaic = useCallback(async () => {
     const c = cv_.current;
@@ -500,7 +540,9 @@ export default function App() {
         persistTile(0, baseTile);
         persistMeta();
         if (sharp.blurry) setBlurryCount((n) => n + 1);
-        setLastFeatures(computeFeatures(mat));
+        const baseFeat = computeFeatures(mat);
+        baseTile._kp = baseFeat.kp;
+        baseTile._desc = baseFeat.desc;
         mat.delete();
         c.autoFails = 0;
         c.lastRebuildTileCount = 1;
@@ -510,11 +552,11 @@ export default function App() {
         return;
       }
 
-      const prevIndex = c.tiles.length - 1;
-      const prevTile = c.tiles[prevIndex];
-      const prevFeat = await getLastFeatures();
+      let prevIndex = c.tiles.length - 1;
+      let prevTile = c.tiles[prevIndex];
+      const prevFeat = await getTileFeatures(prevTile);
       const featNew = computeFeatures(mat);
-      const m = matchTiles(featNew.kp, featNew.desc, prevFeat.kp, prevFeat.desc);
+      let m = matchTiles(featNew.kp, featNew.desc, prevFeat.kp, prevFeat.desc);
 
       // Runs the shared warm-started relaxation pass, then checks whether any
       // already-painted tile drifted enough (or enough time/tiles have passed)
@@ -529,6 +571,64 @@ export default function App() {
           await rebuildMosaic();
         }
       };
+
+      // After resuming a session (continue from IndexedDB, or import from a
+      // ZIP), we cannot assume the physical slide is still wherever the last
+      // saved tile left off — the microscope/slide may well have moved in the
+      // meantime. Blindly chain-matching against "the last tile" in that case
+      // risks a confident-looking but wrong match (especially on repetitive
+      // textures like muscle/collagen fibers), silently pasting the new run
+      // onto the wrong spot. So the first tile after any resume must instead
+      // re-locate itself against the WHOLE existing tile set before anything
+      // gets integrated.
+      if (c.needsRelocalization) {
+        if (m.ok) {
+          c.needsRelocalization = false; // still right where we left off — cheap common case
+        } else {
+          const now = Date.now();
+          if (now - c.lastRelocAttempt < 800) {
+            featNew.kp.delete();
+            featNew.desc.delete();
+            mat.delete();
+            return;
+          }
+          c.lastRelocAttempt = now;
+          c.relocAttempts += 1;
+          setMatchInfo({ text: 'Đang xác định lại vị trí hiện tại so với phiên trước…', kind: 'idle' });
+          let best = null;
+          for (let idx = c.tiles.length - 1; idx >= 0; idx--) {
+            if (idx === prevIndex) continue; // already tried above
+            const cand = c.tiles[idx];
+            const candFeat = await getTileFeatures(cand);
+            const mm = matchTiles(featNew.kp, featNew.desc, candFeat.kp, candFeat.desc);
+            if (mm.ok && (!best || mm.inliers > best.m.inliers)) best = { index: idx, m: mm };
+          }
+          if (!best) {
+            featNew.kp.delete();
+            featNew.desc.delete();
+            mat.delete();
+            if (c.relocAttempts >= RELOC_MAX_ATTEMPTS) {
+              c.needsRelocalization = false; // give up auto-retrying — avoid spinning forever
+              setMatchInfo({
+                text: 'Không thể tự xác định vị trí sau nhiều lần thử. Đang tiếp tục ghép bình thường — kiểm tra kỹ ảnh ghép, hoặc dùng "Chụp lại" nếu sai chỗ.',
+                kind: 'warn',
+              });
+            } else {
+              setMatchInfo({
+                text: `Không xác định được vị trí hiện tại so với phiên trước (lần ${c.relocAttempts}/${RELOC_MAX_ATTEMPTS}). Dùng "Chụp lại" để sửa đúng 1 ô, hoặc kiểm tra bạn đang ở đúng lame/vùng cũ.`,
+                kind: 'warn',
+              });
+            }
+            return; // keep needsRelocalization=true (unless just gave up above) — retry next tick
+          }
+          prevIndex = best.index;
+          prevTile = c.tiles[prevIndex];
+          m = best.m;
+          c.needsRelocalization = false;
+          c.relocAttempts = 0;
+          setMatchInfo({ text: `Đã xác định lại vị trí — khớp với ô #${prevIndex + 1}.`, kind: 'ok' });
+        }
+      }
 
       if (!m.ok) {
         // Low-texture / motion-blur frame — guess from recent motion instead of stopping.
@@ -553,12 +653,13 @@ export default function App() {
               sharpness: sharp.value, blurry: sharp.blurry,
             };
             c.tiles.push(guessTile);
+            guessTile._kp = featNew.kp;
+            guessTile._desc = featNew.desc;
             persistTile(newIndex, guessTile);
             if (sharp.blurry) setBlurryCount((n) => n + 1);
             // Low-weight edge: a rough guess, easily outweighed by any real match later.
             addEdge(c.edges, c.adjacency, prevIndex, newIndex, dx, dy, GUESS_EDGE_WEIGHT);
             persistMeta();
-            setLastFeatures(featNew);
             c.autoFails = 0;
             await relaxAndMaybeRebuild();
             setTileCount(c.tiles.length);
@@ -603,11 +704,12 @@ export default function App() {
         renderedTx: transform[2], renderedTy: transform[5], sharpness: sharp.value, blurry: sharp.blurry,
       };
       c.tiles.push(newTile);
+      newTile._kp = featNew.kp;
+      newTile._desc = featNew.desc;
       persistTile(newIndex, newTile);
       if (sharp.blurry) setBlurryCount((n) => n + 1);
       addEdge(c.edges, c.adjacency, prevIndex, newIndex, transform[2] - prevTile.transform[2], transform[5] - prevTile.transform[5], m.inliers);
       mat.delete();
-      setLastFeatures(featNew);
       c.autoFails = 0;
 
       // Zigzag/raster loop-closure: if this frame's provisional world position
@@ -620,12 +722,8 @@ export default function App() {
         const anchor = findAnchorTile(c.tiles.slice(0, newIndex), candBBox, ANCHOR_EXCLUDE_COUNT);
         if (anchor) {
           const anchorIndex = c.tiles.indexOf(anchor);
-          const anchorMat = await blobToMat(anchor.blob);
-          const anchorFeat = computeFeatures(anchorMat);
-          anchorMat.delete();
+          const anchorFeat = await getTileFeatures(anchor);
           const am = matchTiles(featNew.kp, featNew.desc, anchorFeat.kp, anchorFeat.desc);
-          anchorFeat.kp.delete();
-          anchorFeat.desc.delete();
           if (am.ok) {
             const anchorTransform = matMul3(anchor.transform, am.H);
             addEdge(
@@ -652,7 +750,7 @@ export default function App() {
       c.busy = false;
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [composite, ensureMosaic, growCanvasIfNeeded, paintCanvas, getLastFeatures, blobToMat, rebuildMosaic]);
+  }, [composite, ensureMosaic, growCanvasIfNeeded, paintCanvas, blobToMat, rebuildMosaic]);
 
   const autoTickRef = useRef(autoTick);
   useEffect(() => { autoTickRef.current = autoTick; }, [autoTick]);
@@ -660,6 +758,12 @@ export default function App() {
   const startAuto = () => {
     if (autoTimerRef.current || !uiRef.current.capturing) return;
     cv_.current.autoFails = 0;
+    // Note: needsRelocalization is intentionally NOT set here. A routine
+    // stop/start within the same live session (e.g. pausing between zigzag
+    // rows) doesn't need the expensive full-tileset search — extrapolation +
+    // the cheap anchor/loop-closure check already handle that case. Full
+    // relocalization is reserved for continueSession()/importFromZip(), where
+    // the physical position genuinely can't be assumed.
     setMatchInfo({ text: 'Đang ghép tự động — kéo tiêu bản dưới kính hiển vi.', kind: 'ok' });
     autoTimerRef.current = setInterval(() => {
       autoTickRef.current();
@@ -696,12 +800,8 @@ export default function App() {
       let matchedAny = false;
       const newEdges = [];
       for (const neighbor of neighbors) {
-        const neighborMat = await blobToMat(neighbor.blob);
-        const neighborFeat = computeFeatures(neighborMat);
-        neighborMat.delete();
+        const neighborFeat = await getTileFeatures(neighbor);
         const mm = matchTiles(featNew.kp, featNew.desc, neighborFeat.kp, neighborFeat.desc);
-        neighborFeat.kp.delete();
-        neighborFeat.desc.delete();
         if (mm.ok) {
           const t = matMul3(neighbor.transform, mm.H);
           if (!matchedAny) bestTransform = t;
@@ -717,6 +817,7 @@ export default function App() {
 
       const oldTile = c.tiles[index];
       if (oldTile.blurry) setBlurryCount((n) => Math.max(0, n - 1));
+      freeTileFeatures(oldTile);
       c.tiles[index] = {
         ...oldTile,
         transform: bestTransform,
@@ -728,12 +829,14 @@ export default function App() {
         blurry: sharp.blurry,
         renderedTx: undefined,
         renderedTy: undefined,
+        _kp: featNew.kp,
+        _desc: featNew.desc,
+        zstack: undefined,
       };
       if (sharp.blurry) setBlurryCount((n) => n + 1);
       persistTile(index, c.tiles[index]);
       persistMeta();
       mat.delete();
-      clearLastFeatures(); // safest default: force a lazy recompute next match, regardless of which tile changed
       if (newEdges.length > 0) relax(c.tiles, c.adjacency, 0, 60);
       await rebuildMosaic();
       setTilePanelVersion((v) => v + 1);
@@ -751,13 +854,130 @@ export default function App() {
     }
   };
 
+  // ---- Z-stack: capture several manually-focused layers at the same x,y position ----
+  // The stage/lens don't move between layers (only the focus knob), so unlike
+  // recaptureTile there's no need to re-verify x,y — but the operator might
+  // still nudge the slide slightly by hand, so we still cross-check against
+  // neighbors once, using whichever layer turns out sharpest.
+  const startZCapture = (index) => {
+    if (cv_.current.busy) return;
+    setZCaptureIndex(index);
+    setZLayers([]);
+  };
+
+  const captureZLayer = async () => {
+    const c = cv_.current;
+    if (!uiRef.current.capturing || c.busy || zCaptureIndex === null) return;
+    c.busy = true;
+    try {
+      const { mat, w, h, blobPromise } = grabVideoFrame();
+      const blob = await blobPromise;
+      mat.delete();
+      setZLayers((prev) => [...prev, { blob, w, h }]);
+    } finally {
+      c.busy = false;
+    }
+  };
+
+  const cancelZCapture = () => {
+    setZCaptureIndex(null);
+    setZLayers([]);
+  };
+
+  const finishZCapture = async () => {
+    const c = cv_.current;
+    const index = zCaptureIndex;
+    const layers = zLayers;
+    if (index === null || layers.length === 0 || c.busy) {
+      cancelZCapture();
+      return;
+    }
+    c.busy = true;
+    try {
+      setMatchInfo({ text: `Đang xử lý ${layers.length} lớp Z…`, kind: 'idle' });
+      let best = null;
+      const scored = [];
+      for (const layer of layers) {
+        const mat = await blobToMat(layer.blob);
+        const value = computeSharpness(mat);
+        mat.delete();
+        const scoredLayer = { blob: layer.blob, w: layer.w, h: layer.h, sharpness: value };
+        scored.push(scoredLayer);
+        if (!best || value > best.sharpness) best = scoredLayer;
+      }
+
+      const bestMat = await blobToMat(best.blob);
+      const featNew = computeFeatures(bestMat);
+      bestMat.delete();
+
+      const neighbors = [];
+      if (index > 0) neighbors.push(c.tiles[index - 1]);
+      if (index < c.tiles.length - 1) neighbors.push(c.tiles[index + 1]);
+      let bestTransform = c.tiles[index].transform;
+      let matchedAny = false;
+      const newEdges = [];
+      for (const neighbor of neighbors) {
+        const neighborFeat = await getTileFeatures(neighbor);
+        const mm = matchTiles(featNew.kp, featNew.desc, neighborFeat.kp, neighborFeat.desc);
+        if (mm.ok) {
+          const t = matMul3(neighbor.transform, mm.H);
+          if (!matchedAny) bestTransform = t;
+          matchedAny = true;
+          const neighborIndex = c.tiles.indexOf(neighbor);
+          newEdges.push({ a: neighborIndex, b: index, dx: t[2] - neighbor.transform[2], dy: t[5] - neighbor.transform[5], w: mm.inliers });
+        }
+      }
+
+      removeEdgesForTile(c.edges, c.adjacency, index);
+      for (const e of newEdges) addEdge(c.edges, c.adjacency, e.a, e.b, e.dx, e.dy, e.w);
+
+      const oldTile = c.tiles[index];
+      if (oldTile.blurry) setBlurryCount((n) => Math.max(0, n - 1));
+      freeTileFeatures(oldTile);
+      const blurryFlag = classifySharpness(best.sharpness);
+      c.tiles[index] = {
+        ...oldTile,
+        transform: bestTransform,
+        blob: best.blob,
+        w: best.w,
+        h: best.h,
+        bbox: tileBBox(bestTransform, best.w, best.h),
+        capturedAt: Date.now(),
+        estimated: !matchedAny,
+        sharpness: best.sharpness,
+        blurry: blurryFlag,
+        renderedTx: undefined,
+        renderedTy: undefined,
+        _kp: featNew.kp,
+        _desc: featNew.desc,
+        zstack: scored.map((l) => ({ blob: l.blob, sharpness: l.sharpness })),
+      };
+      if (blurryFlag) setBlurryCount((n) => n + 1);
+      persistTile(index, c.tiles[index]);
+      persistMeta();
+      if (newEdges.length > 0) relax(c.tiles, c.adjacency, 0, 60);
+      await rebuildMosaic();
+      setTilePanelVersion((v) => v + 1);
+      setMatchInfo({
+        text: `Đã lưu ${layers.length} lớp Z cho ô #${index + 1} — dùng lớp nét nhất để ghép` +
+          (matchedAny ? '.' : ' (không khớp được vị trí với ô lân cận, giữ nguyên vị trí cũ).'),
+        kind: 'ok',
+      });
+    } catch (e) {
+      setMatchInfo({ text: 'Quét lớp Z thất bại: ' + e.message, kind: 'warn' });
+    } finally {
+      c.busy = false;
+      cancelZCapture();
+    }
+  };
+
   const undoLast = async () => {
     const c = cv_.current;
     if (c.tiles.length === 0) return;
     const removedIndex = c.tiles.length - 1;
     const removedTile = c.tiles.pop();
     removeEdgesForTile(c.edges, c.adjacency, removedIndex);
-    clearLastFeatures();
+    freeTileFeatures(removedTile);
     if (removedTile.blurry) setBlurryCount((n) => Math.max(0, n - 1));
     db.deleteTilesFrom(removedIndex).catch(() => {});
     db.saveMeta({ edges: c.edges, tileCount: c.tiles.length, updatedAt: Date.now() }).catch(() => {});
@@ -768,7 +988,7 @@ export default function App() {
   const resetAll = () => {
     stopAuto();
     const c = cv_.current;
-    clearLastFeatures();
+    freeAllTileFeatures(c.tiles);
     if (c.mosaicMat) {
       c.mosaicMat.delete();
       c.mosaicMat = null;
@@ -784,6 +1004,7 @@ export default function App() {
     c.lastRebuildTileCount = 0;
     c.lastRebuildTime = 0;
     c.sharpnessHistory = [];
+    c.needsRelocalization = false;
     setBlurryCount(0);
     db.clearAll().catch(() => {});
     setTileCount(0);
@@ -919,10 +1140,12 @@ export default function App() {
       for (let i = 1; i < tiles.length; i++) {
         addEdge(c.edges, c.adjacency, i - 1, i, tiles[i].transform[2] - tiles[i - 1].transform[2], tiles[i].transform[5] - tiles[i - 1].transform[5], 20);
       }
+      freeAllTileFeatures(c.tiles);
       c.tiles = tiles;
       c.sharpnessHistory = tiles.filter((t) => !t.blurry && t.sharpness).map((t) => t.sharpness).slice(-SHARPNESS_HISTORY_SIZE);
+      c.needsRelocalization = true;
+      c.relocAttempts = 0;
       setBlurryCount(tiles.filter((t) => t.blurry).length);
-      clearLastFeatures();
 
       await rebuildMosaic();
 
@@ -931,7 +1154,7 @@ export default function App() {
       for (let i = 0; i < tiles.length; i++) persistTile(i, tiles[i]);
       persistMeta();
 
-      setMatchInfo({ text: `Đã nhập lại ${tiles.length} ô từ file ZIP. Chọn cửa sổ nguồn rồi có thể "Chụp lại" ô cần sửa.`, kind: 'ok' });
+      setMatchInfo({ text: `Đã nhập lại ${tiles.length} ô từ file ZIP. Chọn cửa sổ nguồn, bấm "Bắt đầu ghép tự động" rồi kéo tới gần vùng cũ để app tự xác định lại vị trí.`, kind: 'ok' });
     } catch (e) {
       setMatchInfo({ text: 'Nhập file thất bại: ' + e.message, kind: 'warn' });
     }
@@ -1123,18 +1346,55 @@ export default function App() {
                       return <div className="note">Không có ô nào {tilePanelShowAll ? 'đã chụp' : 'bị đánh dấu mờ'}.</div>;
                     }
                     return rows.map(({ t, i }) => (
-                      <div className="tile-row" key={i}>
-                        <span className="idx mono">#{i + 1}</span>
-                        <TileThumb blob={t.blob} />
-                        {t.blurry && <span className="badge warn">Mờ</span>}
-                        {t.estimated && <span className="badge warn">Ước lượng</span>}
-                        <button
-                          onClick={() => recaptureTile(i)}
-                          disabled={!capturing || recapturingIndex !== null}
-                          style={{ marginLeft: 'auto' }}
-                        >
-                          {recapturingIndex === i ? 'Đang chụp…' : 'Chụp lại'}
-                        </button>
+                      <div className="tile-row" key={i} style={{ flexDirection: 'column', alignItems: 'stretch' }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                          <span className="idx mono">#{i + 1}</span>
+                          <TileThumb blob={t.blob} />
+                          {t.blurry && <span className="badge warn">Mờ</span>}
+                          {t.estimated && <span className="badge warn">Ước lượng</span>}
+                          {t.zstack && <span className="badge ok">{t.zstack.length} lớp Z</span>}
+                          <div style={{ marginLeft: 'auto', display: 'flex', gap: 6 }}>
+                            <button
+                              onClick={() => recaptureTile(i)}
+                              disabled={!capturing || recapturingIndex !== null || zCaptureIndex !== null}
+                              style={{ width: 'auto', flex: 'none' }}
+                            >
+                              {recapturingIndex === i ? 'Đang chụp…' : 'Chụp lại'}
+                            </button>
+                            <button
+                              onClick={() => startZCapture(i)}
+                              disabled={!capturing || recapturingIndex !== null || zCaptureIndex !== null}
+                              style={{ width: 'auto', flex: 'none' }}
+                            >
+                              Quét Z
+                            </button>
+                          </div>
+                        </div>
+                        {t.zstack && t.zstack.length > 1 && <ZStackScrubber zstack={t.zstack} />}
+                        {zCaptureIndex === i && (
+                          <div className="zcapture-panel">
+                            <div className="note">
+                              Chỉnh tiêu cự rồi bấm "Chụp thêm lớp" — lặp lại cho mỗi độ cao tiêu điểm cần lấy.
+                              Không di chuyển tiêu bản theo x,y trong lúc này.
+                            </div>
+                            <div className="row" style={{ marginTop: 6 }}>
+                              <button onClick={captureZLayer} disabled={!capturing}>
+                                Chụp thêm lớp ({zLayers.length})
+                              </button>
+                              <button className="primary" onClick={finishZCapture} disabled={zLayers.length === 0}>
+                                Xong — lưu {zLayers.length} lớp
+                              </button>
+                              <button className="ghost" onClick={cancelZCapture}>Huỷ</button>
+                            </div>
+                            {zLayers.length > 0 && (
+                              <div className="zlayer-thumbs">
+                                {zLayers.map((l, li) => (
+                                  <TileThumb blob={l.blob} key={li} />
+                                ))}
+                              </div>
+                            )}
+                          </div>
+                        )}
                       </div>
                     ));
                   })()}
