@@ -3,8 +3,9 @@ import { useState, useRef, useEffect, useCallback } from 'react';
 import JSZip from 'jszip';
 import './App.css';
 import { IDENT, matMul3, translateM, cornersOf, bboxOf, findAnchorTile } from './matrix.js';
-import { computeFeatures, matchTiles } from './cvMatch.js';
+import { computeFeatures, matchTiles, computeSharpness } from './cvMatch.js';
 import { addEdge, removeEdgesForTile, relax, maxRenderedDrift } from './graph.js';
+import * as db from './db.js';
 
 const INIT_PAD = 40;
 const AUTO_INTERVAL_MS = 350; // how often the continuous loop samples a frame
@@ -19,6 +20,9 @@ const GUESS_EDGE_WEIGHT = 1; // low confidence for extrapolated (unmatched) plac
 const REBUILD_DRIFT_PX = 6; // repaint the mosaic once any already-painted tile drifts this much
 const REBUILD_MIN_TILES = 25; // ...but don't repaint more often than every N new tiles
 const REBUILD_MAX_MS = 8000; // ...or longer than this since the last repaint, if dirty
+const SHARPNESS_HISTORY_SIZE = 30; // recent "good" tiles used as the running focus baseline
+const SHARPNESS_MIN_SAMPLES = 5; // don't flag anything until we have a baseline
+const SHARPNESS_BLUR_RATIO = 0.4; // flag a tile if its sharpness < 40% of the recent median
 
 function tileBBox(transform, w, h) {
   return bboxOf(cornersOf(transform, w, h));
@@ -39,6 +43,16 @@ function getVideoContentRect(container, video) {
   return { x: (cw - dispW) / 2, y: (ch - dispH) / 2, w: dispW, h: dispH, scale };
 }
 
+function TileThumb({ blob }) {
+  const [url, setUrl] = useState(null);
+  useEffect(() => {
+    const u = URL.createObjectURL(blob);
+    setUrl(u);
+    return () => URL.revokeObjectURL(u);
+  }, [blob]);
+  return url ? <img src={url} alt="" className="tile-thumb" /> : <div className="tile-thumb" />;
+}
+
 export default function App() {
   const [cvReady, setCvReady] = useState(false);
   const [capturing, setCapturing] = useState(false);
@@ -51,6 +65,12 @@ export default function App() {
   const [exportingZip, setExportingZip] = useState(false);
   const [cropBox, setCropBox] = useState(null); // {x,y,w,h} in native video px — for rendering the overlay
   const [dragRect, setDragRect] = useState(null); // {x,y,w,h} in container CSS px — live drag feedback
+  const [resumePrompt, setResumePrompt] = useState(null); // {count} | null
+  const [blurryCount, setBlurryCount] = useState(0);
+  const [showTilePanel, setShowTilePanel] = useState(false);
+  const [tilePanelShowAll, setTilePanelShowAll] = useState(false);
+  const [tilePanelVersion, setTilePanelVersion] = useState(0); // bump to force the panel list to re-render
+  const [recapturingIndex, setRecapturingIndex] = useState(null);
 
   const videoRef = useRef(null);
   const pipVideoRef = useRef(null);
@@ -76,6 +96,7 @@ export default function App() {
     busy: false,
     lastRebuildTileCount: 0,
     lastRebuildTime: 0,
+    sharpnessHistory: [],
   });
 
   const uiRef = useRef({ cvReady: false, capturing: false });
@@ -92,6 +113,52 @@ export default function App() {
     }, 150);
     return () => clearInterval(check);
   }, []);
+
+  // ---- crash/close recovery: check for a previous session once OpenCV is ready ----
+  useEffect(() => {
+    if (!cvReady) return;
+    (async () => {
+      try {
+        const count = await db.countTiles();
+        if (count > 0) setResumePrompt({ count });
+      } catch (e) {
+        // IndexedDB unavailable (private browsing, old browser, etc.) — silently
+        // proceed without resume support; nothing else depends on it.
+      }
+    })();
+  }, [cvReady]);
+
+  const continueSession = async () => {
+    const c = cv_.current;
+    try {
+      const [tiles, meta] = await Promise.all([db.loadAllTiles(), db.loadMeta()]);
+      c.tiles = tiles.map((t) => ({ ...t, renderedTx: undefined, renderedTy: undefined }));
+      c.edges = (meta && meta.edges) || [];
+      c.adjacency = [];
+      for (const e of c.edges) {
+        (c.adjacency[e.a] ||= []).push(e);
+        (c.adjacency[e.b] ||= []).push(e);
+      }
+      c.sharpnessHistory = tiles.filter((t) => !t.blurry && t.sharpness).map((t) => t.sharpness).slice(-SHARPNESS_HISTORY_SIZE);
+      setBlurryCount(tiles.filter((t) => t.blurry).length);
+      setResumePrompt(null);
+      setMatchInfo({ text: `Đang khôi phục ${tiles.length} ô từ phiên trước…`, kind: 'idle' });
+      await rebuildMosaic();
+      setMatchInfo({ text: `Đã khôi phục ${tiles.length} ô. Có thể tiếp tục kéo tiêu bản.`, kind: 'ok' });
+    } catch (e) {
+      setMatchInfo({ text: 'Không thể khôi phục phiên trước: ' + e.message, kind: 'warn' });
+      setResumePrompt(null);
+    }
+  };
+
+  const discardSession = async () => {
+    try {
+      await db.clearAll();
+    } catch (e) {
+      // ignore
+    }
+    setResumePrompt(null);
+  };
 
   // ---- floating "picture-in-picture" preview window ----
   useEffect(() => {
@@ -214,6 +281,43 @@ export default function App() {
     bitmap.close();
     return cv.imread(tmp);
   }, []);
+
+  // Compares this tile's Laplacian-variance sharpness against the running
+  // median of recent "good" tiles, since what counts as "sharp" depends on
+  // scene/magnification. Only non-blurry tiles feed the baseline, so a run of
+  // blur doesn't drag the threshold down with it.
+  const evaluateSharpness = (mat) => {
+    const c = cv_.current;
+    const value = computeSharpness(mat);
+    let blurry = false;
+    if (c.sharpnessHistory.length >= SHARPNESS_MIN_SAMPLES) {
+      const sorted = [...c.sharpnessHistory].sort((a, b) => a - b);
+      const median = sorted[Math.floor(sorted.length / 2)];
+      if (value < median * SHARPNESS_BLUR_RATIO) blurry = true;
+    }
+    if (!blurry) {
+      c.sharpnessHistory.push(value);
+      if (c.sharpnessHistory.length > SHARPNESS_HISTORY_SIZE) c.sharpnessHistory.shift();
+    }
+    return { value, blurry };
+  };
+
+  // Fire-and-forget: don't block the real-time capture loop on disk I/O, but
+  // do surface a warning if IndexedDB writes start failing (e.g. quota).
+  const persistTile = (index, tile) => {
+    db.saveTile({
+      index, transform: tile.transform, w: tile.w, h: tile.h, blob: tile.blob,
+      bbox: tile.bbox, capturedAt: tile.capturedAt, estimated: !!tile.estimated,
+      sharpness: tile.sharpness, blurry: !!tile.blurry,
+    }).catch((e) => {
+      setMatchInfo({ text: 'Cảnh báo: không lưu được ảnh vào bộ nhớ tạm (' + e.message + ') — mất dữ liệu nếu tab bị đóng.', kind: 'warn' });
+    });
+  };
+
+  const persistMeta = () => {
+    const c = cv_.current;
+    db.saveMeta({ edges: c.edges, tileCount: c.tiles.length, updatedAt: Date.now() }).catch(() => {});
+  };
 
   const setLastFeatures = (feat) => {
     const old = lastFeaturesRef.current;
@@ -387,10 +491,15 @@ export default function App() {
         composite(mat, IDENT, w, h, c.mosaicMat);
         paintCanvas(c.mosaicMat);
         const blob = await blobPromise;
-        c.tiles.push({
+        const sharp = evaluateSharpness(mat);
+        const baseTile = {
           transform: IDENT.slice(), w, h, blob, bbox: tileBBox(IDENT, w, h), capturedAt: Date.now(),
-          renderedTx: 0, renderedTy: 0,
-        });
+          renderedTx: 0, renderedTy: 0, sharpness: sharp.value, blurry: sharp.blurry,
+        };
+        c.tiles.push(baseTile);
+        persistTile(0, baseTile);
+        persistMeta();
+        if (sharp.blurry) setBlurryCount((n) => n + 1);
         setLastFeatures(computeFeatures(mat));
         mat.delete();
         c.autoFails = 0;
@@ -433,21 +542,27 @@ export default function App() {
             guessTransform[2] += dx;
             guessTransform[5] += dy;
             const blob = await blobPromise;
+            const sharp = evaluateSharpness(mat);
             growCanvasIfNeeded(guessTransform, w, h);
             composite(mat, guessTransform, w, h, c.mosaicMat);
             paintCanvas(c.mosaicMat);
             const newIndex = c.tiles.length;
-            c.tiles.push({
+            const guessTile = {
               transform: guessTransform, w, h, blob, bbox: tileBBox(guessTransform, w, h), capturedAt: Date.now(),
               estimated: true, renderedTx: guessTransform[2], renderedTy: guessTransform[5],
-            });
+              sharpness: sharp.value, blurry: sharp.blurry,
+            };
+            c.tiles.push(guessTile);
+            persistTile(newIndex, guessTile);
+            if (sharp.blurry) setBlurryCount((n) => n + 1);
             // Low-weight edge: a rough guess, easily outweighed by any real match later.
             addEdge(c.edges, c.adjacency, prevIndex, newIndex, dx, dy, GUESS_EDGE_WEIGHT);
+            persistMeta();
             setLastFeatures(featNew);
             c.autoFails = 0;
             await relaxAndMaybeRebuild();
             setTileCount(c.tiles.length);
-            setMatchInfo({ text: 'Vùng ít chi tiết — đã ước lượng vị trí theo hướng di chuyển gần nhất.', kind: 'warn' });
+            setMatchInfo({ text: 'Vùng ít chi tiết — đã ước lượng vị trí theo hướng di chuyển gần nhất.' + (sharp.blurry ? ' (ô này có thể bị mờ)' : ''), kind: 'warn' });
             usedGuess = true;
           }
         }
@@ -479,13 +594,17 @@ export default function App() {
       const transform = matMul3(prevTile.transform, m.H);
       const newIndex = c.tiles.length;
       const blob = await blobPromise;
+      const sharp = evaluateSharpness(mat);
       growCanvasIfNeeded(transform, w, h);
       composite(mat, transform, w, h, c.mosaicMat);
       paintCanvas(c.mosaicMat);
-      c.tiles.push({
+      const newTile = {
         transform, w, h, blob, bbox: tileBBox(transform, w, h), capturedAt: Date.now(),
-        renderedTx: transform[2], renderedTy: transform[5],
-      });
+        renderedTx: transform[2], renderedTy: transform[5], sharpness: sharp.value, blurry: sharp.blurry,
+      };
+      c.tiles.push(newTile);
+      persistTile(newIndex, newTile);
+      if (sharp.blurry) setBlurryCount((n) => n + 1);
       addEdge(c.edges, c.adjacency, prevIndex, newIndex, transform[2] - prevTile.transform[2], transform[5] - prevTile.transform[5], m.inliers);
       mat.delete();
       setLastFeatures(featNew);
@@ -519,12 +638,15 @@ export default function App() {
       }
 
       await relaxAndMaybeRebuild();
+      persistMeta();
       setTileCount(c.tiles.length);
       setMatchInfo({
-        text: usedAnchor
-          ? `Đã nối tự động, phát hiện trùng vùng cũ — đang điều hoà toàn cục (${m.inliers}/${m.total} điểm nội).`
-          : `Đã nối tự động — ${m.inliers}/${m.total} điểm nội (${Math.round((m.inliers / m.total) * 100)}%).`,
-        kind: 'ok',
+        text:
+          (usedAnchor
+            ? `Đã nối tự động, phát hiện trùng vùng cũ — đang điều hoà toàn cục (${m.inliers}/${m.total} điểm nội).`
+            : `Đã nối tự động — ${m.inliers}/${m.total} điểm nội (${Math.round((m.inliers / m.total) * 100)}%).`) +
+          (sharp.blurry ? ' Ô này có thể bị mờ — xem trong "Ô đã chụp".' : ''),
+        kind: sharp.blurry ? 'warn' : 'ok',
       });
     } finally {
       c.busy = false;
@@ -553,13 +675,92 @@ export default function App() {
     setAutoRunning(false);
   };
 
+  // Re-verifies a single tile against its immediate neighbors (both before and
+  // after it in the sequence) and replaces it in place — no need to undo
+  // everything captured after it, unlike a plain "undo last".
+  const recaptureTile = async (index) => {
+    const c = cv_.current;
+    if (c.busy || !uiRef.current.capturing) return;
+    c.busy = true;
+    setRecapturingIndex(index);
+    try {
+      const { mat, w, h, blobPromise } = grabVideoFrame();
+      const featNew = computeFeatures(mat);
+      const sharp = evaluateSharpness(mat);
+
+      const neighbors = [];
+      if (index > 0) neighbors.push(c.tiles[index - 1]);
+      if (index < c.tiles.length - 1) neighbors.push(c.tiles[index + 1]);
+
+      let bestTransform = c.tiles[index].transform;
+      let matchedAny = false;
+      const newEdges = [];
+      for (const neighbor of neighbors) {
+        const neighborMat = await blobToMat(neighbor.blob);
+        const neighborFeat = computeFeatures(neighborMat);
+        neighborMat.delete();
+        const mm = matchTiles(featNew.kp, featNew.desc, neighborFeat.kp, neighborFeat.desc);
+        neighborFeat.kp.delete();
+        neighborFeat.desc.delete();
+        if (mm.ok) {
+          const t = matMul3(neighbor.transform, mm.H);
+          if (!matchedAny) bestTransform = t;
+          matchedAny = true;
+          const neighborIndex = c.tiles.indexOf(neighbor);
+          newEdges.push({ a: neighborIndex, b: index, dx: t[2] - neighbor.transform[2], dy: t[5] - neighbor.transform[5], w: mm.inliers });
+        }
+      }
+
+      const blob = await blobPromise;
+      removeEdgesForTile(c.edges, c.adjacency, index);
+      for (const e of newEdges) addEdge(c.edges, c.adjacency, e.a, e.b, e.dx, e.dy, e.w);
+
+      const oldTile = c.tiles[index];
+      if (oldTile.blurry) setBlurryCount((n) => Math.max(0, n - 1));
+      c.tiles[index] = {
+        ...oldTile,
+        transform: bestTransform,
+        blob,
+        bbox: tileBBox(bestTransform, w, h),
+        capturedAt: Date.now(),
+        estimated: !matchedAny,
+        sharpness: sharp.value,
+        blurry: sharp.blurry,
+        renderedTx: undefined,
+        renderedTy: undefined,
+      };
+      if (sharp.blurry) setBlurryCount((n) => n + 1);
+      persistTile(index, c.tiles[index]);
+      persistMeta();
+      mat.delete();
+      clearLastFeatures(); // safest default: force a lazy recompute next match, regardless of which tile changed
+      if (newEdges.length > 0) relax(c.tiles, c.adjacency, 0, 60);
+      await rebuildMosaic();
+      setTilePanelVersion((v) => v + 1);
+      setMatchInfo({
+        text: matchedAny
+          ? `Đã chụp lại ô #${index + 1}, khớp với ${newEdges.length} ô lân cận.`
+          : `Đã chụp lại ô #${index + 1} nhưng không khớp được với ô lân cận — giữ nguyên vị trí cũ, chỉ thay ảnh.`,
+        kind: matchedAny ? 'ok' : 'warn',
+      });
+    } catch (e) {
+      setMatchInfo({ text: 'Chụp lại thất bại: ' + e.message, kind: 'warn' });
+    } finally {
+      c.busy = false;
+      setRecapturingIndex(null);
+    }
+  };
+
   const undoLast = async () => {
     const c = cv_.current;
     if (c.tiles.length === 0) return;
     const removedIndex = c.tiles.length - 1;
-    c.tiles.pop();
+    const removedTile = c.tiles.pop();
     removeEdgesForTile(c.edges, c.adjacency, removedIndex);
     clearLastFeatures();
+    if (removedTile.blurry) setBlurryCount((n) => Math.max(0, n - 1));
+    db.deleteTilesFrom(removedIndex).catch(() => {});
+    db.saveMeta({ edges: c.edges, tileCount: c.tiles.length, updatedAt: Date.now() }).catch(() => {});
     await rebuildMosaic();
     setMatchInfo({ text: 'Đã hoàn tác ô cuối.', kind: 'idle' });
   };
@@ -582,6 +783,9 @@ export default function App() {
     c.autoFails = 0;
     c.lastRebuildTileCount = 0;
     c.lastRebuildTime = 0;
+    c.sharpnessHistory = [];
+    setBlurryCount(0);
+    db.clearAll().catch(() => {});
     setTileCount(0);
     setCanvasDims({ w: 0, h: 0 });
     if (mosaicCanvasRef.current) {
@@ -627,7 +831,9 @@ export default function App() {
     try {
       const zip = new JSZip();
       const pad = String(tiles.length).length;
-      const manifestRows = ['index,filename,x_px,y_px,width_px,height_px,estimated,captured_at_iso'];
+      const manifestRows = [
+        'index,filename,x_px,y_px,width_px,height_px,estimated,blurry,sharpness,t_a,t_b,t_tx,t_c,t_d,t_ty,captured_at_iso',
+      ];
 
       tiles.forEach((tile, i) => {
         const idx = String(i + 1).padStart(Math.max(4, pad), '0');
@@ -636,7 +842,11 @@ export default function App() {
         const xPx = Math.round(tile.bbox.minX + c.originX);
         const yPx = Math.round(tile.bbox.minY + c.originY);
         const iso = new Date(tile.capturedAt || Date.now()).toISOString();
-        manifestRows.push(`${i + 1},${filename},${xPx},${yPx},${tile.w},${tile.h},${tile.estimated ? 1 : 0},${iso}`);
+        const t = tile.transform;
+        manifestRows.push(
+          `${i + 1},${filename},${xPx},${yPx},${tile.w},${tile.h},${tile.estimated ? 1 : 0},${tile.blurry ? 1 : 0},` +
+          `${tile.sharpness || 0},${t[0]},${t[1]},${t[2]},${t[3]},${t[4]},${t[5]},${iso}`
+        );
       });
 
       zip.file('manifest.csv', manifestRows.join('\n'));
@@ -658,6 +868,72 @@ export default function App() {
       setMatchInfo({ text: 'Xuất ảnh gốc thất bại: ' + e.message, kind: 'warn' });
     } finally {
       setExportingZip(false);
+    }
+  };
+
+  const fileInputRef = useRef(null);
+
+  const importFromZip = async (file) => {
+    const c = cv_.current;
+    if (c.tiles.length > 0) {
+      const proceed = window.confirm(`Đang có ${c.tiles.length} ô trong phiên hiện tại. Nhập file sẽ THAY THẾ toàn bộ. Tiếp tục?`);
+      if (!proceed) return;
+    }
+    setMatchInfo({ text: 'Đang đọc file ZIP…', kind: 'idle' });
+    try {
+      const zip = await JSZip.loadAsync(file);
+      const manifestEntry = zip.file('manifest.csv');
+      if (!manifestEntry) throw new Error('Không tìm thấy manifest.csv trong file này');
+      const csv = await manifestEntry.async('string');
+      const lines = csv.trim().split('\n').slice(1); // skip header
+
+      const tiles = [];
+      for (let i = 0; i < lines.length; i++) {
+        const cols = lines[i].split(',');
+        const [, filename, , , wStr, hStr, estimatedStr, blurryStr, sharpnessStr, ta, tb, ttx, tc, td, tty, capturedAtIso] = cols;
+        const entry = zip.file(filename);
+        if (!entry) continue;
+        const blob = await entry.async('blob');
+        const w = parseInt(wStr, 10);
+        const h = parseInt(hStr, 10);
+        const transform = [parseFloat(ta), parseFloat(tb), parseFloat(ttx), parseFloat(tc), parseFloat(td), parseFloat(tty), 0, 0, 1];
+        tiles.push({
+          transform, w, h, blob,
+          bbox: tileBBox(transform, w, h),
+          capturedAt: capturedAtIso ? Date.parse(capturedAtIso) : Date.now(),
+          estimated: estimatedStr === '1',
+          blurry: blurryStr === '1',
+          sharpness: parseFloat(sharpnessStr) || 0,
+        });
+        setMatchInfo({ text: `Đang nạp lại ${i + 1}/${lines.length} ô…`, kind: 'idle' });
+      }
+
+      if (tiles.length === 0) throw new Error('manifest.csv không có ô nào hợp lệ');
+
+      // Original per-pair match confidence isn't stored in the manifest — rebuild
+      // a simple sequential chain (moderate default weight) so the session is at
+      // least resumable/optimizable; richer loop-closure edges will re-form
+      // naturally as scanning continues past old tiles.
+      c.edges = [];
+      c.adjacency = [];
+      for (let i = 1; i < tiles.length; i++) {
+        addEdge(c.edges, c.adjacency, i - 1, i, tiles[i].transform[2] - tiles[i - 1].transform[2], tiles[i].transform[5] - tiles[i - 1].transform[5], 20);
+      }
+      c.tiles = tiles;
+      c.sharpnessHistory = tiles.filter((t) => !t.blurry && t.sharpness).map((t) => t.sharpness).slice(-SHARPNESS_HISTORY_SIZE);
+      setBlurryCount(tiles.filter((t) => t.blurry).length);
+      clearLastFeatures();
+
+      await rebuildMosaic();
+
+      // Persist the reimported session to IndexedDB so it's protected going forward too.
+      await db.clearAll().catch(() => {});
+      for (let i = 0; i < tiles.length; i++) persistTile(i, tiles[i]);
+      persistMeta();
+
+      setMatchInfo({ text: `Đã nhập lại ${tiles.length} ô từ file ZIP. Chọn cửa sổ nguồn rồi có thể "Chụp lại" ô cần sửa.`, kind: 'ok' });
+    } catch (e) {
+      setMatchInfo({ text: 'Nhập file thất bại: ' + e.message, kind: 'warn' });
     }
   };
 
@@ -686,6 +962,15 @@ export default function App() {
             Đang tải bộ xử lý ảnh (OpenCV.js)…
           </div>
           <div className="bar"><div className="fill"></div></div>
+        </div>
+      )}
+      {resumePrompt && (
+        <div className="resume-banner">
+          <span>
+            Tìm thấy phiên quét dở từ trước ({resumePrompt.count} ô đã lưu). Tiếp tục hay bắt đầu mới?
+          </span>
+          <button className="primary" onClick={continueSession}>Tiếp tục phiên cũ</button>
+          <button onClick={discardSession}>Bắt đầu mới (xoá phiên cũ)</button>
         </div>
       )}
       <video
@@ -807,7 +1092,59 @@ export default function App() {
               Số ô đã ghép: <b className="mono">{tileCount}</b>
               <br />
               Kích thước ảnh ghép: <span className="mono">{canvasDims.w}×{canvasDims.h}px</span>
+              {blurryCount > 0 && (
+                <>
+                  <br />
+                  <span style={{ color: 'var(--amber)' }}>⚠ {blurryCount} ô có thể bị mờ</span>
+                </>
+              )}
             </div>
+          </div>
+
+          <div className="block">
+            <h2>Ô đã chụp</h2>
+            <div className="row">
+              <button onClick={() => setShowTilePanel((s) => !s)}>
+                {showTilePanel ? 'Ẩn danh sách' : 'Hiện danh sách'}
+              </button>
+              <button onClick={() => setTilePanelShowAll((s) => !s)} disabled={!showTilePanel}>
+                {tilePanelShowAll ? 'Chỉ hiện ô mờ' : 'Hiện tất cả'}
+              </button>
+            </div>
+            {showTilePanel && (
+              <>
+                <div style={{ height: 8 }} />
+                <div className="tile-list">
+                  {(() => {
+                    const rows = cv_.current.tiles
+                      .map((t, i) => ({ t, i }))
+                      .filter(({ t }) => tilePanelShowAll || t.blurry);
+                    if (rows.length === 0) {
+                      return <div className="note">Không có ô nào {tilePanelShowAll ? 'đã chụp' : 'bị đánh dấu mờ'}.</div>;
+                    }
+                    return rows.map(({ t, i }) => (
+                      <div className="tile-row" key={i}>
+                        <span className="idx mono">#{i + 1}</span>
+                        <TileThumb blob={t.blob} />
+                        {t.blurry && <span className="badge warn">Mờ</span>}
+                        {t.estimated && <span className="badge warn">Ước lượng</span>}
+                        <button
+                          onClick={() => recaptureTile(i)}
+                          disabled={!capturing || recapturingIndex !== null}
+                          style={{ marginLeft: 'auto' }}
+                        >
+                          {recapturingIndex === i ? 'Đang chụp…' : 'Chụp lại'}
+                        </button>
+                      </div>
+                    ));
+                  })()}
+                </div>
+                <div className="note" style={{ marginTop: 6 }}>
+                  Đưa kính hiển vi về đúng vị trí của ô cần sửa rồi bấm "Chụp lại" — ảnh và vị trí
+                  của riêng ô đó sẽ được thay thế, không ảnh hưởng các ô khác.
+                </div>
+              </>
+            )}
           </div>
 
           <div className="block">
@@ -828,6 +1165,26 @@ export default function App() {
             <button onClick={exportAllTilesZip} disabled={tileCount === 0 || exportingZip}>
               {exportingZip ? 'Đang đóng gói…' : 'Xuất toàn bộ ảnh gốc + manifest (ZIP)'}
             </button>
+            <div style={{ height: 8 }} />
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept=".zip"
+              style={{ display: 'none' }}
+              onChange={(e) => {
+                const file = e.target.files && e.target.files[0];
+                if (file) importFromZip(file);
+                e.target.value = '';
+              }}
+            />
+            <button onClick={() => fileInputRef.current && fileInputRef.current.click()}>
+              Nhập lại từ file ZIP đã xuất…
+            </button>
+            <div className="note" style={{ marginTop: 6 }}>
+              Dùng khi đã xuất ảnh, xem lại sau đó mới phát hiện 1 ô bị lỗi — nạp lại đúng
+              file ZIP đã xuất, rồi chọn cửa sổ nguồn và dùng "Chụp lại" trong panel "Ô đã
+              chụp" ở trên để quét bù đúng vị trí đó.
+            </div>
           </div>
 
           <div className="note">

@@ -42,6 +42,26 @@ export function computeFeatures(mat) {
   return { kp, desc };
 }
 
+// Laplacian variance: a standard, cheap focus/blur metric. Higher = sharper.
+// Not an absolute threshold on its own — the caller compares it against a
+// running baseline from recent tiles, since "sharp" is scene/magnification
+// dependent.
+export function computeSharpness(mat) {
+  const gray = new cv.Mat();
+  cv.cvtColor(mat, gray, cv.COLOR_RGBA2GRAY);
+  const lap = new cv.Mat();
+  cv.Laplacian(gray, lap, cv.CV_64F);
+  const mean = new cv.Mat();
+  const stddev = new cv.Mat();
+  cv.meanStdDev(lap, mean, stddev);
+  const variance = stddev.data64F[0] * stddev.data64F[0];
+  gray.delete();
+  lap.delete();
+  mean.delete();
+  stddev.delete();
+  return variance;
+}
+
 // Returns { ok, inliers, total, H? } where H is a flat 3x3 row-major array
 // mapping points from the "new" tile's pixel space into the "prev" tile's pixel space.
 export function matchTiles(kpNew, descNew, kpPrev, descPrev) {

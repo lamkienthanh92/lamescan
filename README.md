@@ -49,6 +49,34 @@ Thư mục `dist/` sau khi build có thể triển khai lên bất kỳ static h
 
 ## Lưu ý quan trọng
 
+- **Lưu tạm chống mất dữ liệu (IndexedDB).** Mỗi ảnh gốc + vị trí được ghi vào
+  IndexedDB của trình duyệt ngay khi chụp (không chỉ giữ trong biến JS) — nên
+  nếu tab bị đóng nhầm, crash, hoặc mất điện, mở lại trang sẽ thấy banner
+  "Tìm thấy phiên quét dở" và có thể tiếp tục đúng chỗ đang dừng thay vì mất
+  sạch. IndexedDB là bộ nhớ trên đĩa của trình duyệt, không phải RAM của tab,
+  nên sống sót qua việc đóng/crash tab (chỉ mất khi người dùng chủ động xoá
+  dữ liệu trình duyệt, hoặc bấm "Đặt lại" trong app).
+- **Kiểm tra độ nét (Laplacian variance).** Mỗi ô chụp được so với đường nền
+  (median) độ nét của ~30 ô gần nhất; ô nào nét kém hơn 40% mức nền sẽ bị đánh
+  dấu "có thể mờ" — hiện số lượng ở khối Trạng thái, và liệt kê chi tiết trong
+  panel "Ô đã chụp". Đây là ngưỡng tương đối, tự thích nghi theo từng phiên
+  quét, không phải một con số cố định.
+- **Chụp lại 1 ô giữa chuỗi.** Trong panel "Ô đã chụp", bấm "Chụp lại" ở ô cần
+  sửa (đưa kính hiển vi về đúng vị trí đó trước) — ảnh mới được so khớp với cả
+  ô liền trước lẫn liền sau (nếu có) để xác định lại đúng vị trí, rồi thay thế
+  tại chỗ. Các ô khác trong chuỗi không bị ảnh hưởng, không cần "Hoàn tác" lùi
+  lại từ cuối.
+- **Nhập lại từ file ZIP đã xuất.** File zip xuất ra (`manifest.csv` + ảnh gốc)
+  giờ lưu đủ thông tin (kể cả ma trận vị trí) để **nạp lại y nguyên thành 1
+  phiên làm việc** — dùng khi đã xuất ảnh, xem lại sau đó (có thể vài ngày sau,
+  máy khác) mới phát hiện 1 ô bị lỗi. Nút "Nhập lại từ file ZIP đã xuất…" trong
+  khối Công cụ nạp lại toàn bộ ô, sau đó chọn cửa sổ nguồn và dùng "Chụp lại"
+  như bình thường để quét bù đúng vị trí đó.
+  **Giới hạn:** manifest không lưu số điểm nội (độ tin cậy) của từng phép khớp
+  gốc, nên khi nhập lại, các cạnh trong đồ thị vị trí được dựng lại thành chuỗi
+  tuần tự với độ tin cậy mặc định — không mất độ chính xác vị trí (vẫn dùng
+  đúng ma trận đã lưu), chỉ là các cạnh "điểm neo" đặc biệt trước đó sẽ cần
+  hình thành lại tự nhiên nếu quét tiếp qua vùng cũ.
 - **Cần chạy qua HTTP(S)/localhost**, không mở trực tiếp file `index.html` từ
   ổ đĩa (`file://`) — API chia sẻ màn hình (`getDisplayMedia`) của trình duyệt
   yêu cầu "secure context". `npm run dev`/`npm run preview` đã tự lo việc này.
