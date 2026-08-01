@@ -70,6 +70,12 @@
 @keyframes pulse{0%,100%{opacity:1;}50%{opacity:.25;}}
 .preview-empty{color:#8FA098;font-size:12px;text-align:center;padding:20px;}
 
+.crop-box{
+  position:absolute;border:2px dashed var(--teal);background:#0E6E5D22;
+  pointer-events:none;box-sizing:border-box;
+}
+.crop-box.dragging{border-color:#fff;background:#ffffff22;}
+
 button{
   font-family:inherit;font-size:13px;font-weight:600;
   border-radius:7px;padding:9px 12px;cursor:pointer;

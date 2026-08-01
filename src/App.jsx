@@ -6,58 +6,71 @@ import { IDENT, matMul3, translateM, cornersOf, bboxOf, findAnchorTile } from '.
 import { computeFeatures, matchTiles } from './cvMatch.js';
 
 const INIT_PAD = 40;
-const NUDGE_STEP = 6;
 const AUTO_INTERVAL_MS = 350; // how often the continuous loop samples a frame
-const AUTO_FAIL_WARN = 6; // consecutive failed matches before warning the user
+const AUTO_FAIL_WARN = 6; // consecutive unhandled failures before warning the user
 const AUTO_MOVE_MIN_PX = 18; // minimum translation (px) before a frame is worth integrating
 const AUTO_MOVE_MIN_RATIO = 0.025; // ...as a fraction of frame width, whichever is larger
 const ANCHOR_EXCLUDE_COUNT = 8; // don't treat the last N tiles as "revisits" — they're just normal chain overlap
 const ANCHOR_MIN_TILES = ANCHOR_EXCLUDE_COUNT + 2;
+const EXTRAPOLATE_MIN_PX = 3; // minimum recent motion before it's worth extrapolating a guess
 
 function tileBBox(transform, w, h) {
   return bboxOf(cornersOf(transform, w, h));
 }
 
+// Maps the displayed (CSS-pixel) video content area within its container,
+// accounting for object-fit:contain letterboxing, so mouse drags can be
+// converted into native video pixel coordinates.
+function getVideoContentRect(container, video) {
+  const cw = container.clientWidth;
+  const ch = container.clientHeight;
+  const vw = video.videoWidth;
+  const vh = video.videoHeight;
+  if (!vw || !vh) return { x: 0, y: 0, w: cw, h: ch, scale: 1 };
+  const scale = Math.min(cw / vw, ch / vh);
+  const dispW = vw * scale;
+  const dispH = vh * scale;
+  return { x: (cw - dispW) / 2, y: (ch - dispH) / 2, w: dispW, h: dispH, scale };
+}
+
 export default function App() {
   const [cvReady, setCvReady] = useState(false);
   const [capturing, setCapturing] = useState(false);
-  const [pending, setPending] = useState(false);
   const [autoRunning, setAutoRunning] = useState(false);
   const [tileCount, setTileCount] = useState(0);
   const [matchInfo, setMatchInfo] = useState({ text: 'Chưa có ô nào', kind: 'idle' });
-  const [autoConfirm, setAutoConfirm] = useState(false);
   const [canvasDims, setCanvasDims] = useState({ w: 0, h: 0 });
   const [pipActive, setPipActive] = useState(false);
   const [pipSupported, setPipSupported] = useState(true);
   const [exportingZip, setExportingZip] = useState(false);
+  const [cropBox, setCropBox] = useState(null); // {x,y,w,h} in native video px — for rendering the overlay
+  const [dragRect, setDragRect] = useState(null); // {x,y,w,h} in container CSS px — live drag feedback
 
   const videoRef = useRef(null);
   const pipVideoRef = useRef(null);
+  const previewContainerRef = useRef(null);
   const mosaicCanvasRef = useRef(null);
   const workCanvasRef = useRef(document.createElement('canvas'));
   const streamRef = useRef(null);
   const autoTimerRef = useRef(null);
   const lastFeaturesRef = useRef(null); // cached {kp, desc} for the most recently integrated tile
+  const cropRef = useRef(null); // {x,y,w,h} in native video px, read by grabVideoFrame
+  const dragStartRef = useRef(null);
 
-  // persistent OpenCV-side state, kept out of React state to avoid re-render churn on Mats
   const cv_ = useRef({
     mosaicMat: null,
     originX: INIT_PAD,
     originY: INIT_PAD,
     w: 0,
     h: 0,
-    tiles: [], // {transform:[9], w, h, blob, bbox, capturedAt}
-    pending: null, // {mat, w, h, blob, transformBase, nudgeX, nudgeY, kp, desc}
+    tiles: [], // {transform:[9], w, h, blob, bbox, capturedAt, estimated?}
     autoFails: 0,
-    busy: false, // shared mutex between manual capture and the auto loop
+    busy: false,
   });
 
-  const uiRef = useRef({ cvReady: false, pending: false, capturing: false });
+  const uiRef = useRef({ cvReady: false, capturing: false });
   useEffect(() => { uiRef.current.cvReady = cvReady; }, [cvReady]);
-  useEffect(() => { uiRef.current.pending = pending; }, [pending]);
   useEffect(() => { uiRef.current.capturing = capturing; }, [capturing]);
-  const autoConfirmRef = useRef(false);
-  useEffect(() => { autoConfirmRef.current = autoConfirm; }, [autoConfirm]);
 
   // ---- load opencv.js (script tag is included in index.html) ----
   useEffect(() => {
@@ -174,20 +187,6 @@ export default function App() {
     return cv.imread(tmp);
   }, []);
 
-  // Returns cached ORB features for the last integrated tile, computing (and caching)
-  // them from its stored image if the cache is empty (e.g. right after an undo).
-  const getLastFeatures = useCallback(async () => {
-    if (lastFeaturesRef.current) return lastFeaturesRef.current;
-    const c = cv_.current;
-    const last = c.tiles[c.tiles.length - 1];
-    if (!last) return null;
-    const mat = await blobToMat(last.blob);
-    const feat = computeFeatures(mat);
-    mat.delete();
-    lastFeaturesRef.current = feat;
-    return feat;
-  }, [blobToMat]);
-
   const setLastFeatures = (feat) => {
     const old = lastFeaturesRef.current;
     if (old) {
@@ -204,6 +203,18 @@ export default function App() {
       lastFeaturesRef.current = null;
     }
   };
+
+  const getLastFeatures = useCallback(async () => {
+    if (lastFeaturesRef.current) return lastFeaturesRef.current;
+    const c = cv_.current;
+    const last = c.tiles[c.tiles.length - 1];
+    if (!last) return null;
+    const mat = await blobToMat(last.blob);
+    const feat = computeFeatures(mat);
+    mat.delete();
+    lastFeaturesRef.current = feat;
+    return feat;
+  }, [blobToMat]);
 
   const rebuildMosaic = useCallback(async () => {
     const c = cv_.current;
@@ -252,126 +263,89 @@ export default function App() {
     setCapturing(false);
   };
 
+  // ---- crop region selection (drag directly on the live preview) ----
+  const onPreviewMouseDown = (e) => {
+    if (!capturing) return;
+    const rect = previewContainerRef.current.getBoundingClientRect();
+    dragStartRef.current = { x: e.clientX - rect.left, y: e.clientY - rect.top };
+    setDragRect({ x: dragStartRef.current.x, y: dragStartRef.current.y, w: 0, h: 0 });
+  };
+
+  const onPreviewMouseMove = (e) => {
+    if (!dragStartRef.current) return;
+    const rect = previewContainerRef.current.getBoundingClientRect();
+    const cx = e.clientX - rect.left;
+    const cy = e.clientY - rect.top;
+    const s = dragStartRef.current;
+    setDragRect({ x: Math.min(s.x, cx), y: Math.min(s.y, cy), w: Math.abs(cx - s.x), h: Math.abs(cy - s.y) });
+  };
+
+  const onPreviewMouseUp = () => {
+    if (!dragStartRef.current) return;
+    const container = previewContainerRef.current;
+    const video = videoRef.current;
+    const content = getVideoContentRect(container, video);
+    const dr = dragRect;
+    dragStartRef.current = null;
+    if (!dr || dr.w < 12 || dr.h < 12) {
+      setDragRect(null);
+      return;
+    }
+    const nx1 = Math.max(0, (dr.x - content.x) / content.scale);
+    const ny1 = Math.max(0, (dr.y - content.y) / content.scale);
+    const nx2 = Math.min(video.videoWidth, (dr.x + dr.w - content.x) / content.scale);
+    const ny2 = Math.min(video.videoHeight, (dr.y + dr.h - content.y) / content.scale);
+    const box = { x: Math.round(nx1), y: Math.round(ny1), w: Math.round(nx2 - nx1), h: Math.round(ny2 - ny1) };
+    if (box.w > 20 && box.h > 20) {
+      cropRef.current = box;
+      setCropBox(box);
+    }
+    setDragRect(null);
+  };
+
+  const clearCrop = () => {
+    cropRef.current = null;
+    setCropBox(null);
+  };
+
+  // Overlay rect (CSS px) representing the currently-locked crop box, recomputed
+  // from native video coords each render so it tracks the preview's live size.
+  const cropOverlayStyle = (() => {
+    if (!cropBox || !videoRef.current || !previewContainerRef.current) return null;
+    const content = getVideoContentRect(previewContainerRef.current, videoRef.current);
+    return {
+      left: content.x + cropBox.x * content.scale,
+      top: content.y + cropBox.y * content.scale,
+      width: cropBox.w * content.scale,
+      height: cropBox.h * content.scale,
+    };
+  })();
+
   const grabVideoFrame = () => {
     const v = videoRef.current;
-    const w = v.videoWidth;
-    const h = v.videoHeight;
+    const crop = cropRef.current;
+    const sx = crop ? crop.x : 0;
+    const sy = crop ? crop.y : 0;
+    const sw = crop ? crop.w : v.videoWidth;
+    const sh = crop ? crop.h : v.videoHeight;
     const wc = workCanvasRef.current;
-    wc.width = w;
-    wc.height = h;
-    wc.getContext('2d').drawImage(v, 0, 0, w, h);
+    wc.width = sw;
+    wc.height = sh;
+    wc.getContext('2d').drawImage(v, sx, sy, sw, sh, 0, 0, sw, sh);
     const mat = cv.imread(wc);
     // toBlob encodes a snapshot of the canvas taken at call time, so it's safe
     // even if wc gets redrawn again before this promise resolves.
     const blobPromise = new Promise((resolve) => wc.toBlob(resolve, 'image/png'));
-    return { mat, w, h, blobPromise };
+    return { mat, w: sw, h: sh, blobPromise };
   };
 
-  const renderPending = useCallback(() => {
-    const c = cv_.current;
-    const p = c.pending;
-    if (!p) return;
-    const final = matMul3(translateM(p.nudgeX, p.nudgeY), p.transformBase);
-    growCanvasIfNeeded(final, p.w, p.h);
-    const preview = c.mosaicMat.clone();
-    composite(p.mat, final, p.w, p.h, preview);
-    paintCanvas(preview);
-    preview.delete();
-  }, [composite, growCanvasIfNeeded, paintCanvas]);
-
-  const confirmTile = () => {
-    const c = cv_.current;
-    const p = c.pending;
-    if (!p) return;
-    const final = matMul3(translateM(p.nudgeX, p.nudgeY), p.transformBase);
-    growCanvasIfNeeded(final, p.w, p.h);
-    composite(p.mat, final, p.w, p.h, c.mosaicMat);
-    paintCanvas(c.mosaicMat);
-    c.tiles.push({ transform: final, w: p.w, h: p.h, blob: p.blob, bbox: tileBBox(final, p.w, p.h), capturedAt: Date.now() });
-    p.mat.delete();
-    setLastFeatures({ kp: p.kp, desc: p.desc }); // adopt candidate features, no recompute needed
-    c.pending = null;
-    setPending(false);
-    setTileCount(c.tiles.length);
-    setMatchInfo((prev) => ({ text: prev.text + ' — đã ghép.', kind: prev.kind }));
-  };
-
-  const discardPending = () => {
-    const c = cv_.current;
-    if (c.pending) {
-      c.pending.mat.delete();
-      c.pending.kp.delete();
-      c.pending.desc.delete();
-      c.pending = null;
-    }
-    paintCanvas(c.mosaicMat);
-    setPending(false);
-    setMatchInfo({ text: 'Đã huỷ — chụp lại ô này.', kind: 'idle' });
-  };
-
-  // ---- manual single-shot capture (fallback tool: review + nudge + confirm) ----
-  const captureFrame = async () => {
-    const c = cv_.current;
-    if (!uiRef.current.cvReady || !uiRef.current.capturing || uiRef.current.pending || c.busy) return;
-    c.busy = true;
-    try {
-      const { mat, w, h, blobPromise } = grabVideoFrame();
-
-      if (c.tiles.length === 0) {
-        ensureMosaic(w + INIT_PAD * 2, h + INIT_PAD * 2);
-        composite(mat, IDENT, w, h, c.mosaicMat);
-        paintCanvas(c.mosaicMat);
-        const blob = await blobPromise;
-        c.tiles.push({ transform: IDENT, w, h, blob, bbox: tileBBox(IDENT, w, h), capturedAt: Date.now() });
-        setLastFeatures(computeFeatures(mat));
-        mat.delete();
-        setTileCount(1);
-        setMatchInfo({ text: 'Ô nền (#1) đã đặt — đây là gốc toạ độ.', kind: 'ok' });
-        return;
-      }
-
-      const prevTile = c.tiles[c.tiles.length - 1];
-      const prevFeat = await getLastFeatures();
-      const featNew = computeFeatures(mat);
-      const m = matchTiles(featNew.kp, featNew.desc, prevFeat.kp, prevFeat.desc);
-      const blob = await blobPromise;
-
-      let transformBase;
-      let info;
-      if (m.ok) {
-        transformBase = matMul3(prevTile.transform, m.H);
-        info = { text: `Khớp: ${m.inliers}/${m.total} điểm nội (${Math.round((m.inliers / m.total) * 100)}%). Kiểm tra rồi xác nhận.`, kind: 'ok' };
-      } else {
-        transformBase = prevTile.transform;
-        info = { text: `Không đủ điểm khớp tin cậy (${m.inliers}/${m.total}). Dùng phím mũi tên để canh tay.`, kind: 'warn' };
-      }
-
-      c.pending = { mat, w, h, blob, transformBase, nudgeX: 0, nudgeY: 0, kp: featNew.kp, desc: featNew.desc };
-      setMatchInfo(info);
-      renderPending();
-
-      if (autoConfirmRef.current && m.ok) {
-        confirmTile();
-      } else {
-        setPending(true);
-      }
-    } finally {
-      c.busy = false;
-    }
-  };
-
-  const nudge = (dx, dy) => {
-    const c = cv_.current;
-    if (!c.pending) return;
-    c.pending.nudgeX += dx;
-    c.pending.nudgeY += dy;
-    renderPending();
-  };
-
-  // ---- continuous auto-stitch loop: sample frames while dragging, integrate automatically ----
+  // ---- continuous, fully autonomous stitch loop ----
+  // Never asks for confirmation: on a confident feature match it integrates
+  // directly; when matching fails (low-texture region) it falls back to
+  // extrapolating the last known motion instead of stopping to ask the user.
   const autoTick = useCallback(async () => {
     const c = cv_.current;
-    if (!uiRef.current.capturing || c.pending || c.busy) return;
+    if (!uiRef.current.capturing || c.busy) return;
     c.busy = true;
     try {
       const { mat, w, h, blobPromise } = grabVideoFrame();
@@ -396,20 +370,43 @@ export default function App() {
       const m = matchTiles(featNew.kp, featNew.desc, prevFeat.kp, prevFeat.desc);
 
       if (!m.ok) {
-        featNew.kp.delete();
-        featNew.desc.delete();
-        mat.delete();
-        c.autoFails += 1;
-        if (c.autoFails >= AUTO_FAIL_WARN) {
-          setMatchInfo({ text: 'Mất khớp liên tục — kéo chậm lại, hoặc dùng "Chụp thủ công" để canh tay tại đây.', kind: 'warn' });
+        // Low-texture / motion-blur frame — guess from recent motion instead of stopping.
+        let usedGuess = false;
+        if (c.tiles.length >= 2) {
+          const prev2 = c.tiles[c.tiles.length - 2];
+          const dx = prevTile.transform[2] - prev2.transform[2];
+          const dy = prevTile.transform[5] - prev2.transform[5];
+          if (Math.hypot(dx, dy) > EXTRAPOLATE_MIN_PX) {
+            const guessTransform = prevTile.transform.slice();
+            guessTransform[2] += dx;
+            guessTransform[5] += dy;
+            const blob = await blobPromise;
+            growCanvasIfNeeded(guessTransform, w, h);
+            composite(mat, guessTransform, w, h, c.mosaicMat);
+            paintCanvas(c.mosaicMat);
+            c.tiles.push({ transform: guessTransform, w, h, blob, bbox: tileBBox(guessTransform, w, h), capturedAt: Date.now(), estimated: true });
+            setLastFeatures(featNew);
+            c.autoFails = 0;
+            setTileCount(c.tiles.length);
+            setMatchInfo({ text: 'Vùng ít chi tiết — đã ước lượng vị trí theo hướng di chuyển gần nhất.', kind: 'warn' });
+            usedGuess = true;
+          }
         }
+        if (!usedGuess) {
+          featNew.kp.delete();
+          featNew.desc.delete();
+          c.autoFails += 1;
+          if (c.autoFails >= AUTO_FAIL_WARN) {
+            setMatchInfo({ text: 'Mất khớp liên tục — kéo chậm lại một chút để lấy nét ổn định.', kind: 'warn' });
+          }
+        }
+        mat.delete();
         return;
       }
 
       const moveMag = Math.hypot(m.H[2], m.H[5]);
       const threshold = Math.max(AUTO_MOVE_MIN_PX, w * AUTO_MOVE_MIN_RATIO);
       if (moveMag < threshold) {
-        // essentially stationary — nothing new to add, don't waste a tile slot
         featNew.kp.delete();
         featNew.desc.delete();
         mat.delete();
@@ -485,10 +482,9 @@ export default function App() {
 
   const undoLast = async () => {
     const c = cv_.current;
-    if (c.pending) discardPending();
     if (c.tiles.length === 0) return;
     c.tiles.pop();
-    clearLastFeatures(); // will be recomputed lazily from the new last tile on next match
+    clearLastFeatures();
     await rebuildMosaic();
     setMatchInfo({ text: 'Đã hoàn tác ô cuối.', kind: 'idle' });
   };
@@ -496,13 +492,6 @@ export default function App() {
   const resetAll = () => {
     stopAuto();
     const c = cv_.current;
-    if (c.pending) {
-      c.pending.mat.delete();
-      c.pending.kp.delete();
-      c.pending.desc.delete();
-      c.pending = null;
-      setPending(false);
-    }
     clearLastFeatures();
     if (c.mosaicMat) {
       c.mosaicMat.delete();
@@ -545,7 +534,7 @@ export default function App() {
     try {
       const zip = new JSZip();
       const pad = String(tiles.length).length;
-      const manifestRows = ['index,filename,x_px,y_px,width_px,height_px,captured_at_iso'];
+      const manifestRows = ['index,filename,x_px,y_px,width_px,height_px,estimated,captured_at_iso'];
 
       tiles.forEach((tile, i) => {
         const idx = String(i + 1).padStart(Math.max(4, pad), '0');
@@ -554,13 +543,13 @@ export default function App() {
         const xPx = Math.round(tile.bbox.minX + c.originX);
         const yPx = Math.round(tile.bbox.minY + c.originY);
         const iso = new Date(tile.capturedAt || Date.now()).toISOString();
-        manifestRows.push(`${i + 1},${filename},${xPx},${yPx},${tile.w},${tile.h},${iso}`);
+        manifestRows.push(`${i + 1},${filename},${xPx},${yPx},${tile.w},${tile.h},${tile.estimated ? 1 : 0},${iso}`);
       });
 
       zip.file('manifest.csv', manifestRows.join('\n'));
 
       const blob = await zip.generateAsync(
-        { type: 'blob', compression: 'STORE' }, // PNGs are already compressed — skip re-deflating
+        { type: 'blob', compression: 'STORE' },
         (meta) => {
           const done = Math.round((meta.percent / 100) * tiles.length);
           setMatchInfo({ text: `Đang đóng gói ${done}/${tiles.length} ảnh gốc…`, kind: 'idle' });
@@ -579,27 +568,14 @@ export default function App() {
     }
   };
 
-  // ---- keyboard shortcuts ----
+  // Space toggles the auto-stitch loop; no other manual capture step exists.
   useEffect(() => {
     const onKey = (e) => {
-      if (!uiRef.current.cvReady) return;
+      if (!uiRef.current.cvReady || !uiRef.current.capturing) return;
       if (e.code === 'Space') {
         e.preventDefault();
-        if (uiRef.current.pending) confirmTile();
-        else captureFrame();
-      } else if (e.code === 'Enter') {
-        if (uiRef.current.pending) {
-          e.preventDefault();
-          confirmTile();
-        }
-      } else if (e.code === 'Escape') {
-        if (uiRef.current.pending) discardPending();
-      } else if (uiRef.current.pending && e.code.startsWith('Arrow')) {
-        e.preventDefault();
-        if (e.code === 'ArrowLeft') nudge(-NUDGE_STEP, 0);
-        if (e.code === 'ArrowRight') nudge(NUDGE_STEP, 0);
-        if (e.code === 'ArrowUp') nudge(0, -NUDGE_STEP);
-        if (e.code === 'ArrowDown') nudge(0, NUDGE_STEP);
+        if (autoTimerRef.current) stopAuto();
+        else startAuto();
       }
     };
     window.addEventListener('keydown', onKey);
@@ -607,7 +583,6 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // stop the auto loop on unmount
   useEffect(() => () => stopAuto(), []);
 
   return (
@@ -628,13 +603,21 @@ export default function App() {
       ></video>
       <header className="app-head">
         <h1>Ghép Panorama Kính Hiển Vi</h1>
-        <span className="sub">Kéo tiêu bản liên tục — app tự tích luỹ &amp; ghép thành 1 ảnh scan lame</span>
+        <span className="sub">Kéo tiêu bản liên tục — app tự tích luỹ &amp; ghép thành 1 ảnh scan lame, không cần xác nhận từng bước</span>
       </header>
       <div className="layout">
         <div className="rail">
           <div className="block">
-            <h2>1 · Nguồn hình ảnh</h2>
-            <div className="preview-wrap">
+            <h2>1 · Nguồn hình ảnh &amp; vùng chụp</h2>
+            <div
+              className="preview-wrap"
+              ref={previewContainerRef}
+              onMouseDown={onPreviewMouseDown}
+              onMouseMove={onPreviewMouseMove}
+              onMouseUp={onPreviewMouseUp}
+              onMouseLeave={onPreviewMouseUp}
+              style={{ cursor: capturing ? 'crosshair' : 'default' }}
+            >
               <video ref={videoRef} muted playsInline></video>
               {capturing && (
                 <div className="rec-dot">
@@ -648,6 +631,10 @@ export default function App() {
                   Bấm "Chọn cửa sổ" bên dưới, rồi chọn đúng cửa sổ phần mềm camera kính hiển vi.
                 </div>
               )}
+              {cropOverlayStyle && <div className="crop-box" style={cropOverlayStyle}></div>}
+              {dragRect && (
+                <div className="crop-box dragging" style={{ left: dragRect.x, top: dragRect.y, width: dragRect.w, height: dragRect.h }}></div>
+              )}
             </div>
             <div style={{ height: 10 }} />
             {!capturing ? (
@@ -658,6 +645,20 @@ export default function App() {
               <button className="danger" onClick={stopCapture}>
                 Dừng ghi
               </button>
+            )}
+            {capturing && (
+              <>
+                <div style={{ height: 8 }} />
+                <div className="row">
+                  <button className="ghost" onClick={clearCrop} disabled={!cropBox}>
+                    Xoá vùng chọn
+                  </button>
+                </div>
+                <div className="note" style={{ marginTop: 6 }}>
+                  Kéo chuột trực tiếp trên khung xem trước để chọn 1 vùng nhỏ cần quét
+                  (không bắt buộc dùng cả cửa sổ). Không chọn gì thì dùng toàn khung.
+                </div>
+              </>
             )}
           </div>
 
@@ -682,63 +683,22 @@ export default function App() {
             <h2>2 · Ghép tự động (kéo &amp; thả)</h2>
             {!autoRunning ? (
               <button className="primary" disabled={!cvReady || !capturing} onClick={startAuto}>
-                Bắt đầu ghép tự động
+                Bắt đầu ghép tự động <span className="kbd">Space</span>
               </button>
             ) : (
               <button className="warn" onClick={stopAuto}>
                 <span className="rec-dot" style={{ position: 'static', display: 'inline-flex', marginRight: 6 }}>
                   <span className="d"></span>
                 </span>
-                Đang ghép tự động — bấm để dừng
+                Đang ghép tự động — bấm để dừng <span className="kbd">Space</span>
               </button>
             )}
             <div className="note" style={{ marginTop: 8 }}>
-              Cứ kéo tiêu bản bình thường — app tự lấy mẫu ~3 lần/giây, tự bỏ qua khung
-              gần như đứng yên, chỉ ghép khi phát hiện đủ di chuyển.
+              Cứ kéo tiêu bản bình thường — app tự lấy mẫu, tự ghép, và khi gặp vùng ít
+              chi tiết sẽ tự ước lượng vị trí theo hướng di chuyển gần nhất thay vì dừng
+              lại hỏi bạn. Những ô ước lượng được đánh dấu riêng trong manifest xuất ra.
             </div>
           </div>
-
-          <div className="block">
-            <h2>3 · Chụp thủ công (dự phòng)</h2>
-            <button disabled={!cvReady || !capturing || pending} onClick={captureFrame}>
-              Chụp 1 ô tại đây <span className="kbd">Space</span>
-            </button>
-            <div style={{ height: 8 }} />
-            <label className="status-line" style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-              <input type="checkbox" checked={autoConfirm} onChange={(e) => setAutoConfirm(e.target.checked)} />
-              Tự động xác nhận khi khớp đủ tin cậy
-            </label>
-            <div className="note" style={{ marginTop: 6 }}>
-              Dùng khi ghép tự động bị mất khớp liên tục ở một điểm khó — tạm dừng
-              ghép tự động, chụp 1 ô rồi canh tay bằng mũi tên nếu cần.
-            </div>
-          </div>
-
-          {pending && (
-            <div className="block" style={{ borderColor: 'var(--amber)' }}>
-              <h2>Canh chỉnh &amp; xác nhận</h2>
-              <div className="nudge-grid">
-                <span></span>
-                <button onClick={() => nudge(0, -NUDGE_STEP)}>↑</button>
-                <span></span>
-                <button onClick={() => nudge(-NUDGE_STEP, 0)}>←</button>
-                <button className="ghost" style={{ opacity: 0.3 }} disabled>•</button>
-                <button onClick={() => nudge(NUDGE_STEP, 0)}>→</button>
-                <span></span>
-                <button onClick={() => nudge(0, NUDGE_STEP)}>↓</button>
-                <span></span>
-              </div>
-              <div style={{ height: 10 }} />
-              <div className="row">
-                <button className="primary" onClick={confirmTile}>
-                  Xác nhận <span className="kbd">Enter/Space</span>
-                </button>
-                <button className="ghost" onClick={discardPending}>
-                  Huỷ <span className="kbd">Esc</span>
-                </button>
-              </div>
-            </div>
-          )}
 
           <div className="block">
             <h2>Trạng thái</h2>
@@ -772,17 +732,15 @@ export default function App() {
           </div>
 
           <div className="note">
-            Cách dùng: chọn đúng cửa sổ phần mềm camera kính hiển vi → bấm "Bắt đầu ghép tự động"
-            → kéo tiêu bản liên tục như bình thường, không cần dừng lại để chụp. Ô đầu tiên luôn
-            được đặt làm gốc. Nếu một vùng ít chi tiết khiến app báo "mất khớp liên tục", tạm dừng
-            ghép tự động và dùng "Chụp thủ công" + phím mũi tên để canh qua điểm đó, rồi bật lại
-            ghép tự động.
+            Cách dùng: chọn cửa sổ phần mềm camera → (tuỳ chọn) kéo chọn vùng cần quét trên
+            khung xem trước → bấm "Bắt đầu ghép tự động" → kéo tiêu bản liên tục, kể cả
+            theo kiểu zigzag. Ô đầu tiên luôn được đặt làm gốc ngay khi bắt đầu.
           </div>
         </div>
 
         <div className="stage-area">
           <div className="stage-scroll">
-            {tileCount === 0 && !pending && (
+            {tileCount === 0 && (
               <div className="stage-empty">
                 Vùng ghép ảnh sẽ hiện ở đây.
                 <br />
@@ -791,7 +749,7 @@ export default function App() {
                 Chọn cửa sổ nguồn ở bên trái, rồi bấm "Bắt đầu ghép tự động".
               </div>
             )}
-            <div className="stage-frame" style={{ display: tileCount > 0 || pending ? 'block' : 'none' }}>
+            <div className="stage-frame" style={{ display: tileCount > 0 ? 'block' : 'none' }}>
               <canvas ref={mosaicCanvasRef}></canvas>
               <div className="tick tl"></div>
               <div className="tick tr"></div>
@@ -800,7 +758,7 @@ export default function App() {
             </div>
           </div>
           <div className="footer-bar mono">
-            <span>ORB + RANSAC similarity transform · ghép chuỗi khung liền kề</span>
+            <span>ORB + RANSAC similarity transform · tự ước lượng khi mất khớp</span>
             <span className="tiles">{tileCount} ô</span>
           </div>
         </div>

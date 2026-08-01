@@ -9,21 +9,23 @@ hoạt động.
 ## Cách dùng
 
 1. Bấm **"Chọn cửa sổ / màn hình…"**, chọn đúng cửa sổ phần mềm camera kính hiển vi.
-2. (Tuỳ chọn) Bấm **"Mở cửa sổ nổi"** — tách khung ảnh ghép ra 1 cửa sổ nhỏ nổi
-   trên mọi cửa sổ khác, để theo dõi tiến độ ghép trong lúc cửa sổ chính của app
-   bị che bởi phần mềm camera.
-3. Bấm **"Bắt đầu ghép tự động"**.
-4. Kéo tiêu bản bình thường — kể cả theo kiểu **zigzag** (trái→phải, xuống hàng,
-   phải→trái, ...) như cách scan lame thủ công vẫn hay làm. App tự lấy mẫu khung
-   hình định kỳ (~3 lần/giây), tự bỏ qua khung gần như đứng yên, và chỉ ghép vào
-   khi phát hiện đã di chuyển đủ xa.
-5. Nếu một vùng ít chi tiết khiến app báo **"mất khớp liên tục"**: tạm dừng ghép tự
-   động, dùng nút **"Chụp 1 ô tại đây"** (chế độ thủ công) rồi canh bằng phím mũi
-   tên trước khi xác nhận, sau đó bật lại ghép tự động.
+2. (Tuỳ chọn) **Kéo chuột trực tiếp trên khung xem trước** để khoanh vùng cần quét —
+   không cần dùng cả cửa sổ được chia sẻ. Bấm "Xoá vùng chọn" để quay lại dùng toàn khung.
+3. (Tuỳ chọn) Bấm **"Mở cửa sổ nổi"** để theo dõi ảnh ghép trong 1 cửa sổ nổi trên
+   mọi cửa sổ khác, phòng khi cửa sổ chính của app bị che bởi phần mềm camera.
+4. Bấm **"Bắt đầu ghép tự động"** (hoặc phím `Space`).
+5. Kéo tiêu bản liên tục — kể cả theo kiểu **zigzag** (trái→phải, xuống hàng,
+   phải→trái, ...). App chạy hoàn toàn tự động, **không dừng lại để hỏi xác nhận**:
+   - Khớp tốt → ghép thẳng.
+   - Vùng ít chi tiết, khớp thất bại → **tự ước lượng vị trí** theo hướng di chuyển
+     gần nhất (ngoại suy từ 2 ô trước) rồi tiếp tục, đánh dấu ô đó là "ước lượng"
+     trong manifest xuất ra để biết chỗ nào nên xem lại.
+   - Quay lại gần 1 vùng đã quét trước đó (điển hình khi zigzag) → tự nhận diện và
+     chỉnh lại theo điểm tham chiếu cũ, giảm trôi tích luỹ.
 6. Xong thì bấm **"Xuất ảnh ghép (PNG)"** để lấy ảnh toàn cảnh, và/hoặc
    **"Xuất toàn bộ ảnh gốc + manifest (ZIP)"** để lấy lại từng ảnh gốc (dùng để
    đếm/phân loại AFB-WBC) kèm file `manifest.csv` ghi vị trí (toạ độ x,y trong
-   ảnh ghép), thứ tự chụp, và thời điểm chụp của từng ảnh.
+   ảnh ghép), thứ tự chụp, cờ "ước lượng hay không", và thời điểm chụp của từng ảnh.
 
 
 ## Chạy thử (dev)
@@ -76,10 +78,19 @@ Thư mục `dist/` sau khi build có thể triển khai lên bất kỳ static h
   (`captureStream` + `requestPictureInPicture`), được Chrome/Edge desktop hỗ trợ
   tốt nhất. Nếu trình duyệt không hỗ trợ, nút này sẽ tự ẩn/báo không khả dụng,
   không ảnh hưởng đến chức năng ghép ảnh chính.
+- **Không còn bước xác nhận thủ công nào** — mọi ô đều được đặt tự động. Khi
+  không đủ điểm khớp tin cậy (vùng ít chi tiết), app dùng phương án dự phòng:
+  **ngoại suy vị trí theo vector di chuyển giữa 2 ô liền trước** thay vì dừng lại.
+  Đây là đánh đổi có chủ đích theo yêu cầu — ưu tiên luồng quét liên tục, không bị
+  ngắt quãng — nhưng có nghĩa là **một vài ô ở vùng khó có thể bị đặt sai vị trí**
+  mà không có cảnh báo chặn luồng. Các ô này được đánh dấu `estimated=1` trong
+  `manifest.csv` khi xuất zip, để biết chỗ nào nên kiểm tra lại thủ công nếu cần.
+  Cơ chế tự chỉnh trôi theo điểm tham chiếu (mục trên) vẫn hoạt động song song và
+  thường sửa lại được phần lớn sai lệch này khi quét quay lại gần đó.
 - Ảnh ghép ra chỉ nên dùng để minh hoạ/toàn cảnh; việc đếm/phân loại vẫn nên làm
   trên từng ảnh gốc. Mỗi ảnh gốc được giữ nguyên trong bộ nhớ trình duyệt suốt
-  phiên làm việc (dạng `Blob` nhị phân — nhẹ hơn base64 khoảng 25%, thay cho
-  cách lưu `dataURL` trước đây) để phục vụ "Hoàn tác ô cuối" và xuất zip.
+  phiên làm việc (dạng `Blob` nhị phân — nhẹ hơn base64 khoảng 25%) để phục vụ
+  "Hoàn tác ô cuối" và xuất zip.
   **Lưu ý cho lame ~300 ô (chuẩn WHO):** tuỳ độ phân giải camera, tổng dung
   lượng ảnh gốc giữ trong RAM có thể lên tới vài trăm MB — vẫn ổn với hầu hết
   máy tính, nhưng nếu thấy trình duyệt chậm/giật giữa chừng, hãy xuất zip theo
