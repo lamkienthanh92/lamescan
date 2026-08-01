@@ -61,18 +61,17 @@ Thư mục `dist/` sau khi build có thể triển khai lên bất kỳ static h
   dấu "có thể mờ" — hiện số lượng ở khối Trạng thái, và liệt kê chi tiết trong
   panel "Ô đã chụp". Đây là ngưỡng tương đối, tự thích nghi theo từng phiên
   quét, không phải một con số cố định.
-- **Xác định lại vị trí khi tiếp tục phiên (relocalization).** Sau khi "Tiếp
-  tục phiên cũ" hoặc "Nhập lại từ ZIP" (không phải mỗi lần bấm "Bắt đầu ghép tự
-  động" trong cùng 1 phiên — việc đó chỉ dùng cơ chế ước lượng/điểm neo sẵn có,
-  nhẹ hơn nhiều), app **không mặc định** là vị trí vật lý hiện tại vẫn liền
-  mạch với ô cuối cùng đã lưu. Ô đầu tiên chụp sau đó sẽ được dò khớp với
-  **toàn bộ** các ô đã có (không chỉ ô cuối) để xác nhận đúng vị trí trước khi
-  cho phép ghép tiếp — tránh tình trạng khớp nhầm vào ô lân cận có vân/kết cấu
-  giống nhau (dễ gặp với mô có sợi lặp lại) rồi dán chồng sai chỗ. Nếu không
-  xác định được sau 6 lần thử, app tự dừng thử lại (tránh
-  quét lặp vô hạn) và quay về ghép bình thường kèm cảnh báo — lúc đó nên dùng
-  "Chụp lại" trong panel "Ô đã chụp" để sửa đúng 1 ô, hoặc kiểm tra đang đúng
-  lame/vùng cũ.
+- **Định vị thủ công (khi tiếp tục phiên).** Sau khi "Tiếp tục phiên cũ" hoặc
+  "Nhập lại từ ZIP", app **không** tự động dò khớp toàn bộ tile set nữa (bản
+  cũ làm vậy — quá nhạy, hễ thấy vân/kết cấu giống là quét lại từ đầu, rất tốn
+  thời gian). Thay vào đó: bấm **"Định vị thủ công"**, **bấm vào đúng điểm**
+  trên ảnh ghép cần tiếp tục (vùng thiếu, hoặc chỗ cần chụp bù) — hiện 1 dấu
+  khoanh tại đó — rồi tìm và ướm đúng vị trí đó dưới kính hiển vi, cuối cùng
+  bấm **"Xác nhận vị trí"**. App khi đó chỉ so khớp với **8 ô gần điểm bạn vừa
+  chọn nhất** (không phải toàn bộ) — nhanh và chính xác hơn nhiều vì đã có gợi
+  ý vị trí từ chính bạn. Nếu không dùng tính năng này, app vẫn hoạt động bình
+  thường theo mặc định: tiếp tục nối từ ô cuối cùng, dùng cơ chế ước lượng +
+  điểm neo sẵn có như lúc quét ban đầu.
 - **Cache đặc trưng vĩnh viễn theo từng ô (tăng tốc).** Trước đây, mỗi khi cần
   so khớp với 1 ô cũ (điểm neo zigzag, xác định lại vị trí, chụp lại 1 ô), app
   giải mã lại ảnh PNG + tính lại đặc trưng ORB **từ đầu mỗi lần**, dù ô đó có

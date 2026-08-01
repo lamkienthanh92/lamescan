@@ -23,7 +23,6 @@ const REBUILD_MAX_MS = 8000; // ...or longer than this since the last repaint, i
 const SHARPNESS_HISTORY_SIZE = 30; // recent "good" tiles used as the running focus baseline
 const SHARPNESS_MIN_SAMPLES = 5; // don't flag anything until we have a baseline
 const SHARPNESS_BLUR_RATIO = 0.4; // flag a tile if its sharpness < 40% of the recent median
-const RELOC_MAX_ATTEMPTS = 6; // give up auto-retrying relocalization after this many failed full searches
 
 function tileBBox(transform, w, h) {
   return bboxOf(cornersOf(transform, w, h));
@@ -94,6 +93,9 @@ export default function App() {
   const [recapturingIndex, setRecapturingIndex] = useState(null);
   const [zCaptureIndex, setZCaptureIndex] = useState(null);
   const [zLayers, setZLayers] = useState([]);
+  const [targetMode, setTargetMode] = useState(false);
+  const [targetWorld, setTargetWorld] = useState(null); // {x,y} in world coords, or null
+  const [targetConfirming, setTargetConfirming] = useState(false);
 
   const videoRef = useRef(null);
   const pipVideoRef = useRef(null);
@@ -119,9 +121,7 @@ export default function App() {
     lastRebuildTileCount: 0,
     lastRebuildTime: 0,
     sharpnessHistory: [],
-    needsRelocalization: false,
-    lastRelocAttempt: 0,
-    relocAttempts: 0,
+    activeRefIndex: null, // set by manual "confirm target" positioning; overrides the default "chain from last tile"
   });
 
   const uiRef = useRef({ cvReady: false, capturing: false });
@@ -166,13 +166,12 @@ export default function App() {
         (c.adjacency[e.b] ||= []).push(e);
       }
       c.sharpnessHistory = tiles.filter((t) => !t.blurry && t.sharpness).map((t) => t.sharpness).slice(-SHARPNESS_HISTORY_SIZE);
-      c.needsRelocalization = true;
-      c.relocAttempts = 0;
+      c.activeRefIndex = null;
       setBlurryCount(tiles.filter((t) => t.blurry).length);
       setResumePrompt(null);
       setMatchInfo({ text: `Đang khôi phục ${tiles.length} ô từ phiên trước…`, kind: 'idle' });
       await rebuildMosaic();
-      setMatchInfo({ text: `Đã khôi phục ${tiles.length} ô. Kéo tiêu bản để app tự xác định lại vị trí trước khi ghép tiếp.`, kind: 'ok' });
+      setMatchInfo({ text: `Đã khôi phục ${tiles.length} ô. Bấm "Định vị thủ công", chọn điểm cần tiếp tục trên ảnh ghép, rồi xác nhận trước khi quét tiếp — hoặc bấm "Bắt đầu ghép tự động" luôn nếu chắc chắn vẫn đang ở cuối vùng đã quét.`, kind: 'ok' });
     } catch (e) {
       setMatchInfo({ text: 'Không thể khôi phục phiên trước: ' + e.message, kind: 'warn' });
       setResumePrompt(null);
@@ -546,13 +545,14 @@ export default function App() {
         mat.delete();
         c.autoFails = 0;
         c.lastRebuildTileCount = 1;
+        c.activeRefIndex = 0;
         c.lastRebuildTime = Date.now();
         setTileCount(1);
         setMatchInfo({ text: 'Ô nền (#1) đã đặt — kéo tiêu bản để tiếp tục.', kind: 'ok' });
         return;
       }
 
-      let prevIndex = c.tiles.length - 1;
+      let prevIndex = c.activeRefIndex !== null ? c.activeRefIndex : c.tiles.length - 1;
       let prevTile = c.tiles[prevIndex];
       const prevFeat = await getTileFeatures(prevTile);
       const featNew = computeFeatures(mat);
@@ -571,64 +571,6 @@ export default function App() {
           await rebuildMosaic();
         }
       };
-
-      // After resuming a session (continue from IndexedDB, or import from a
-      // ZIP), we cannot assume the physical slide is still wherever the last
-      // saved tile left off — the microscope/slide may well have moved in the
-      // meantime. Blindly chain-matching against "the last tile" in that case
-      // risks a confident-looking but wrong match (especially on repetitive
-      // textures like muscle/collagen fibers), silently pasting the new run
-      // onto the wrong spot. So the first tile after any resume must instead
-      // re-locate itself against the WHOLE existing tile set before anything
-      // gets integrated.
-      if (c.needsRelocalization) {
-        if (m.ok) {
-          c.needsRelocalization = false; // still right where we left off — cheap common case
-        } else {
-          const now = Date.now();
-          if (now - c.lastRelocAttempt < 800) {
-            featNew.kp.delete();
-            featNew.desc.delete();
-            mat.delete();
-            return;
-          }
-          c.lastRelocAttempt = now;
-          c.relocAttempts += 1;
-          setMatchInfo({ text: 'Đang xác định lại vị trí hiện tại so với phiên trước…', kind: 'idle' });
-          let best = null;
-          for (let idx = c.tiles.length - 1; idx >= 0; idx--) {
-            if (idx === prevIndex) continue; // already tried above
-            const cand = c.tiles[idx];
-            const candFeat = await getTileFeatures(cand);
-            const mm = matchTiles(featNew.kp, featNew.desc, candFeat.kp, candFeat.desc);
-            if (mm.ok && (!best || mm.inliers > best.m.inliers)) best = { index: idx, m: mm };
-          }
-          if (!best) {
-            featNew.kp.delete();
-            featNew.desc.delete();
-            mat.delete();
-            if (c.relocAttempts >= RELOC_MAX_ATTEMPTS) {
-              c.needsRelocalization = false; // give up auto-retrying — avoid spinning forever
-              setMatchInfo({
-                text: 'Không thể tự xác định vị trí sau nhiều lần thử. Đang tiếp tục ghép bình thường — kiểm tra kỹ ảnh ghép, hoặc dùng "Chụp lại" nếu sai chỗ.',
-                kind: 'warn',
-              });
-            } else {
-              setMatchInfo({
-                text: `Không xác định được vị trí hiện tại so với phiên trước (lần ${c.relocAttempts}/${RELOC_MAX_ATTEMPTS}). Dùng "Chụp lại" để sửa đúng 1 ô, hoặc kiểm tra bạn đang ở đúng lame/vùng cũ.`,
-                kind: 'warn',
-              });
-            }
-            return; // keep needsRelocalization=true (unless just gave up above) — retry next tick
-          }
-          prevIndex = best.index;
-          prevTile = c.tiles[prevIndex];
-          m = best.m;
-          c.needsRelocalization = false;
-          c.relocAttempts = 0;
-          setMatchInfo({ text: `Đã xác định lại vị trí — khớp với ô #${prevIndex + 1}.`, kind: 'ok' });
-        }
-      }
 
       if (!m.ok) {
         // Low-texture / motion-blur frame — guess from recent motion instead of stopping.
@@ -661,6 +603,7 @@ export default function App() {
             addEdge(c.edges, c.adjacency, prevIndex, newIndex, dx, dy, GUESS_EDGE_WEIGHT);
             persistMeta();
             c.autoFails = 0;
+            c.activeRefIndex = newIndex;
             await relaxAndMaybeRebuild();
             setTileCount(c.tiles.length);
             setMatchInfo({ text: 'Vùng ít chi tiết — đã ước lượng vị trí theo hướng di chuyển gần nhất.' + (sharp.blurry ? ' (ô này có thể bị mờ)' : ''), kind: 'warn' });
@@ -711,6 +654,7 @@ export default function App() {
       addEdge(c.edges, c.adjacency, prevIndex, newIndex, transform[2] - prevTile.transform[2], transform[5] - prevTile.transform[5], m.inliers);
       mat.delete();
       c.autoFails = 0;
+      c.activeRefIndex = newIndex;
 
       // Zigzag/raster loop-closure: if this frame's provisional world position
       // overlaps a tile placed much earlier (e.g. the row above, on the way back),
@@ -758,12 +702,6 @@ export default function App() {
   const startAuto = () => {
     if (autoTimerRef.current || !uiRef.current.capturing) return;
     cv_.current.autoFails = 0;
-    // Note: needsRelocalization is intentionally NOT set here. A routine
-    // stop/start within the same live session (e.g. pausing between zigzag
-    // rows) doesn't need the expensive full-tileset search — extrapolation +
-    // the cheap anchor/loop-closure check already handle that case. Full
-    // relocalization is reserved for continueSession()/importFromZip(), where
-    // the physical position genuinely can't be assumed.
     setMatchInfo({ text: 'Đang ghép tự động — kéo tiêu bản dưới kính hiển vi.', kind: 'ok' });
     autoTimerRef.current = setInterval(() => {
       autoTickRef.current();
@@ -782,6 +720,107 @@ export default function App() {
   // Re-verifies a single tile against its immediate neighbors (both before and
   // after it in the sequence) and replaces it in place — no need to undo
   // everything captured after it, unlike a plain "undo last".
+  // ---- manual targeting: click a point on the mosaic, then confirm alignment ----
+  // Replaces the old automatic "search everything" relocalization: the user
+  // already knows visually where the gap/point of interest is, so the search
+  // only needs to check tiles near THAT point — fast and much less prone to
+  // false-positive matches on repetitive textures.
+  const onMosaicClick = (e) => {
+    if (!targetMode || !mosaicCanvasRef.current) return;
+    const canvas = mosaicCanvasRef.current;
+    const rect = canvas.getBoundingClientRect();
+    const scaleX = canvas.width / rect.width;
+    const scaleY = canvas.height / rect.height;
+    const canvasX = (e.clientX - rect.left) * scaleX;
+    const canvasY = (e.clientY - rect.top) * scaleY;
+    const c = cv_.current;
+    setTargetWorld({ x: canvasX - c.originX, y: canvasY - c.originY });
+  };
+
+  const clearTarget = () => {
+    setTargetWorld(null);
+  };
+
+  const toggleTargetMode = () => {
+    setTargetMode((v) => !v);
+    setTargetWorld(null);
+  };
+
+  const confirmTarget = async () => {
+    const c = cv_.current;
+    if (!targetWorld || !uiRef.current.capturing || c.busy || targetConfirming) return;
+    setTargetConfirming(true);
+    c.busy = true;
+    try {
+      setMatchInfo({ text: 'Đang so khớp quanh vị trí đã chọn…', kind: 'idle' });
+      const { mat, w, h, blobPromise } = grabVideoFrame();
+      const featNew = computeFeatures(mat);
+
+      // Only check the tiles nearest the clicked point (by bbox-center distance)
+      // — not the whole tile set.
+      const NEAR_K = 8;
+      const nearest = c.tiles
+        .map((t, i) => {
+          const cx = (t.bbox.minX + t.bbox.maxX) / 2;
+          const cy = (t.bbox.minY + t.bbox.maxY) / 2;
+          return { i, d: Math.hypot(cx - targetWorld.x, cy - targetWorld.y) };
+        })
+        .sort((a, b) => a.d - b.d)
+        .slice(0, NEAR_K);
+
+      let best = null;
+      for (const { i } of nearest) {
+        const cand = c.tiles[i];
+        const candFeat = await getTileFeatures(cand);
+        const mm = matchTiles(featNew.kp, featNew.desc, candFeat.kp, candFeat.desc);
+        if (mm.ok && (!best || mm.inliers > best.m.inliers)) best = { index: i, m: mm };
+      }
+
+      if (!best) {
+        featNew.kp.delete();
+        featNew.desc.delete();
+        mat.delete();
+        setMatchInfo({ text: 'Không khớp được với vùng quanh điểm đã chọn — chỉnh lại kính hiển vi rồi thử lại, hoặc chọn điểm khác.', kind: 'warn' });
+        return;
+      }
+
+      const refTile = c.tiles[best.index];
+      const transform = matMul3(refTile.transform, best.m.H);
+      const newIndex = c.tiles.length;
+      const blob = await blobPromise;
+      const sharp = evaluateSharpness(mat);
+      growCanvasIfNeeded(transform, w, h);
+      composite(mat, transform, w, h, c.mosaicMat);
+      paintCanvas(c.mosaicMat);
+      const newTile = {
+        transform, w, h, blob, bbox: tileBBox(transform, w, h), capturedAt: Date.now(),
+        renderedTx: transform[2], renderedTy: transform[5], sharpness: sharp.value, blurry: sharp.blurry,
+      };
+      c.tiles.push(newTile);
+      newTile._kp = featNew.kp;
+      newTile._desc = featNew.desc;
+      persistTile(newIndex, newTile);
+      if (sharp.blurry) setBlurryCount((n) => n + 1);
+      addEdge(c.edges, c.adjacency, best.index, newIndex, transform[2] - refTile.transform[2], transform[5] - refTile.transform[5], best.m.inliers);
+      persistMeta();
+      c.autoFails = 0;
+      c.activeRefIndex = newIndex; // continuous scanning will now chain from here
+      relax(c.tiles, c.adjacency, 0, RELAX_ITERS_PER_TICK);
+      setTileCount(c.tiles.length);
+      setTargetMode(false);
+      setTargetWorld(null);
+      setMatchInfo({
+        text: `Đã xác nhận vị trí — khớp với ô #${best.index + 1} (${best.m.inliers} điểm nội). Sẵn sàng "Bắt đầu ghép tự động" để tiếp tục.`,
+        kind: 'ok',
+      });
+    } catch (e) {
+      setMatchInfo({ text: 'Xác nhận vị trí thất bại: ' + e.message, kind: 'warn' });
+    } finally {
+      c.busy = false;
+      setTargetConfirming(false);
+    }
+  };
+
   const recaptureTile = async (index) => {
     const c = cv_.current;
     if (c.busy || !uiRef.current.capturing) return;
@@ -1004,7 +1043,7 @@ export default function App() {
     c.lastRebuildTileCount = 0;
     c.lastRebuildTime = 0;
     c.sharpnessHistory = [];
-    c.needsRelocalization = false;
+    c.activeRefIndex = null;
     setBlurryCount(0);
     db.clearAll().catch(() => {});
     setTileCount(0);
@@ -1143,8 +1182,7 @@ export default function App() {
       freeAllTileFeatures(c.tiles);
       c.tiles = tiles;
       c.sharpnessHistory = tiles.filter((t) => !t.blurry && t.sharpness).map((t) => t.sharpness).slice(-SHARPNESS_HISTORY_SIZE);
-      c.needsRelocalization = true;
-      c.relocAttempts = 0;
+      c.activeRefIndex = null;
       setBlurryCount(tiles.filter((t) => t.blurry).length);
 
       await rebuildMosaic();
@@ -1154,7 +1192,7 @@ export default function App() {
       for (let i = 0; i < tiles.length; i++) persistTile(i, tiles[i]);
       persistMeta();
 
-      setMatchInfo({ text: `Đã nhập lại ${tiles.length} ô từ file ZIP. Chọn cửa sổ nguồn, bấm "Bắt đầu ghép tự động" rồi kéo tới gần vùng cũ để app tự xác định lại vị trí.`, kind: 'ok' });
+      setMatchInfo({ text: `Đã nhập lại ${tiles.length} ô từ file ZIP. Chọn cửa sổ nguồn, bấm "Định vị thủ công" và chọn đúng điểm cần tiếp tục trên ảnh ghép trước khi quét tiếp.`, kind: 'ok' });
     } catch (e) {
       setMatchInfo({ text: 'Nhập file thất bại: ' + e.message, kind: 'warn' });
     }
@@ -1301,6 +1339,35 @@ export default function App() {
               Ảnh ghép sẽ tự vẽ lại định kỳ khi có điều chỉnh đáng kể. Vùng ít chi tiết sẽ
               được ước lượng theo hướng di chuyển gần nhất thay vì dừng lại hỏi bạn.
             </div>
+          </div>
+
+          <div className="block" style={{ borderColor: targetMode ? 'var(--amber)' : 'var(--line)' }}>
+            <h2>Định vị thủ công (khi tiếp tục phiên)</h2>
+            {!targetMode ? (
+              <button onClick={toggleTargetMode} disabled={tileCount === 0 || autoRunning}>
+                Định vị thủ công
+              </button>
+            ) : (
+              <>
+                <div className="note">
+                  Bấm vào đúng điểm cần tiếp tục trên ảnh ghép bên phải (vùng còn thiếu, hoặc
+                  chỗ cần chụp bù). Sau đó tìm và ướm đúng vị trí đó dưới kính hiển vi, rồi bấm
+                  "Xác nhận vị trí".
+                </div>
+                <div style={{ height: 8 }} />
+                <div className="row">
+                  <button
+                    className="primary"
+                    onClick={confirmTarget}
+                    disabled={!targetWorld || !capturing || targetConfirming}
+                  >
+                    {targetConfirming ? 'Đang xác nhận…' : 'Xác nhận vị trí'}
+                  </button>
+                  <button onClick={clearTarget} disabled={!targetWorld}>Bỏ chọn điểm</button>
+                  <button className="ghost" onClick={toggleTargetMode}>Thoát</button>
+                </div>
+              </>
+            )}
           </div>
 
           <div className="block">
@@ -1466,11 +1533,24 @@ export default function App() {
               </div>
             )}
             <div className="stage-frame" style={{ display: tileCount > 0 ? 'block' : 'none' }}>
-              <canvas ref={mosaicCanvasRef}></canvas>
+              <canvas
+                ref={mosaicCanvasRef}
+                onClick={onMosaicClick}
+                style={{ cursor: targetMode ? 'crosshair' : 'default' }}
+              ></canvas>
               <div className="tick tl"></div>
               <div className="tick tr"></div>
               <div className="tick bl"></div>
               <div className="tick br"></div>
+              {targetWorld && (
+                <div
+                  className="target-marker"
+                  style={{
+                    left: targetWorld.x + cv_.current.originX - 16,
+                    top: targetWorld.y + cv_.current.originY - 16,
+                  }}
+                ></div>
+              )}
             </div>
           </div>
           <div className="footer-bar mono">
