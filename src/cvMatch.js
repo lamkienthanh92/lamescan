@@ -480,26 +480,14 @@ export function matchTiles(
       return { ok: false, inliers: best ? best.inliers : 0, total: pts.length };
     }
 
-    // Second, independent opinion: pixel cross-correlation on whole edge
-    // strips, not keypoints. Only cross-checked when the caller supplied the
-    // downscaled tile copies — optional so callers that don't have them yet
-    // (e.g. cache misses recomputed without both sides available) still work,
-    // just without this extra safety net.
-    let finalT = best.t;
-    if (newSmall && prevSmall) {
-      const origDim = best.axis === 'x' ? tileW : tileH;
-      const cc = origDim ? crossCorrelateAxis(newSmall, prevSmall, best.axis, best.t, origDim) : null;
-      const AGREEMENT_PX = 12;
-      const MIN_SCORE = 0.4;
-      if (!cc || cc.score < MIN_SCORE || Math.abs(cc.t - best.t) > AGREEMENT_PX) {
-        return { ok: false, inliers: best.inliers, total: pts.length, disagreement: true };
-      }
-      // Both agree — average for a touch more precision than either alone.
-      finalT = (best.t + cc.t) / 2;
-    }
-
+    // NOTE: an earlier version cross-checked `best.t` here against an
+    // independent pixel cross-correlation (crossCorrelateAxis) and rejected
+    // on disagreement. Pulled back out — untestable without a real browser,
+    // and it turned out to reject almost everything in practice, stalling
+    // the scan at the first tile. The function is left defined below in case
+    // it's worth debugging and re-enabling later, but nothing calls it now.
     const H =
-      best.axis === 'x' ? [1, 0, finalT, 0, 1, 0, 0, 0, 1] : [1, 0, 0, 0, 1, finalT, 0, 0, 1];
+      best.axis === 'x' ? [1, 0, best.t, 0, 1, 0, 0, 0, 1] : [1, 0, 0, 0, 1, best.t, 0, 0, 1];
     return { ok: true, inliers: best.inliers, total: pts.length, H };
   }
 
