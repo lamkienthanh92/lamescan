@@ -15,10 +15,10 @@ const AUTO_MOVE_MIN_RATIO = 0.025; // ...as a fraction of frame width, whichever
 const ANCHOR_EXCLUDE_COUNT = 8; // don't treat the last N tiles as "revisits" — they're just normal chain overlap
 const ANCHOR_MIN_TILES = ANCHOR_EXCLUDE_COUNT + 2;
 const EXTRAPOLATE_MIN_PX = 3; // minimum recent motion before it's worth extrapolating a guess
-const RELAX_ITERS_PER_TICK = 6; // small warm-started relaxation pass, run every tick
+const RELAX_ITERS_PER_TICK = 20; // small warm-started relaxation pass, run every tick — needs more than a handful now that rotation is solved too (coupled rotation+translation converges slower than translation alone), still cheap since it's plain arithmetic over edges
 const GUESS_EDGE_WEIGHT = 1; // low confidence for extrapolated (unmatched) placements
 const MAX_CONSECUTIVE_GUESSES = 2; // stop auto-accepting guesses after this many in a row without a real match confirming them
-const REBUILD_DRIFT_PX = 6; // repaint the mosaic once any already-painted tile drifts this much
+const REBUILD_DRIFT_PX = 20; // repaint the mosaic once any already-painted tile drifts this much — a few px of residual jitter from iterative relax isn't worth a full expensive repaint; only real loop-closure corrections should trigger one
 const REBUILD_MIN_TILES = 25; // ...but don't repaint more often than every N new tiles
 const REBUILD_MAX_MS = 8000; // ...or longer than this since the last repaint, if dirty
 const SHARPNESS_HISTORY_SIZE = 30; // recent "good" tiles used as the running focus baseline
@@ -712,6 +712,14 @@ export default function App() {
           (c.tiles.length - c.lastRebuildTileCount >= REBUILD_MIN_TILES || Date.now() - c.lastRebuildTime >= REBUILD_MAX_MS);
         if (dueForRebuild) {
           await rebuildMosaic();
+          // A full repaint can take a while (every tile is re-warped/re-blended
+          // from scratch), during which live frames are silently skipped (autoTick
+          // bails out early while c.busy is set) — the slide may have moved well
+          // past where matching was left off by the time this finishes. Treat it
+          // the same as an explicit pause: require one genuine match before
+          // trusting extrapolation again, instead of risking a bad guess anchor.
+          c.justResumed = true;
+          c.consecutiveGuesses = 0;
         }
       };
 
