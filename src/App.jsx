@@ -354,7 +354,13 @@ export default function App() {
     // painted content is gradual. Where there's no existing content at all
     // (targetMask empty), the formula collapses back to full opacity — brand
     // new mosaic area is still painted at full strength, nothing changes there.
-    const FEATHER_PX = 30;
+    // Kept narrow on purpose: matching is never pixel-perfect, so blending
+    // over a wide band mixes two slightly-misregistered copies of the same
+    // structures — visible as blur/ghosting at the seam. A few px is enough
+    // to erase the hard 1px cutoff from erosion above without exposing that
+    // misregistration; color/exposure mismatch itself is already handled by
+    // gain compensation above, so feathering isn't carrying that job too.
+    const FEATHER_PX = 8;
     const dist = track(new cv.Mat());
     cv.distanceTransform(mask, dist, cv.DIST_L2, 3);
     const feather = track(new cv.Mat());
