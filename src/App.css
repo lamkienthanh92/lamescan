@@ -76,6 +76,22 @@
 }
 .crop-box.dragging{border-color:#fff;background:#ffffff22;}
 
+.nav-box{
+  position:absolute;border:1.5px dashed #F2B84B;box-sizing:border-box;
+  pointer-events:none;border-radius:3px;
+}
+.ghost-strip{
+  position:absolute;overflow:hidden;box-sizing:border-box;
+  pointer-events:none;outline:1px solid #F2B84Ba0;
+}
+.ghost-strip img{
+  position:absolute;display:block;opacity:0.42;filter:saturate(0.7);
+}
+.ghost-strip .ghost-label{
+  position:absolute;left:4px;top:2px;font-size:9px;color:#fff;background:#00000077;
+  padding:1px 6px;border-radius:8px;pointer-events:none;white-space:nowrap;
+}
+
 button{
   font-family:inherit;font-size:13px;font-weight:600;
   border-radius:7px;padding:9px 12px;cursor:pointer;

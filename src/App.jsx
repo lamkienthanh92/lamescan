@@ -89,6 +89,20 @@ export default function App() {
   const [resumePrompt, setResumePrompt] = useState(null); // {count} | null
   const [blurryCount, setBlurryCount] = useState(0);
   const [cropAuto, setCropAuto] = useState(false); // true when the current cropBox came from auto-vignette-detection
+  const [ghostUrl, setGhostUrl] = useState(null); // object URL of the current reference tile's image, for the nav ghost overlay
+  useEffect(() => {
+    const c = cv_.current;
+    const idx = c.activeRefIndex !== null ? c.activeRefIndex : c.tiles.length - 1;
+    const tile = idx >= 0 ? c.tiles[idx] : null;
+    if (!tile) {
+      setGhostUrl(null);
+      return;
+    }
+    const url = URL.createObjectURL(tile.blob);
+    setGhostUrl(url);
+    return () => URL.revokeObjectURL(url);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tileCount]);
   const [showTilePanel, setShowTilePanel] = useState(false);
   const [tilePanelShowAll, setTilePanelShowAll] = useState(false);
   const [tilePanelVersion, setTilePanelVersion] = useState(0); // bump to force the panel list to re-render
@@ -648,6 +662,83 @@ export default function App() {
       width: cropBox.w * content.scale,
       height: cropBox.h * content.scale,
     };
+  })();
+
+  // ---- navigation aid: outer guide frame + "ghost" of the last tile's
+  // leading edge, both drawn live on the video while scanning ----
+  // Inner frame = the crop box above (what's actually used for matching).
+  // Outer frame here is a purely visual guide, expanded around it, with a
+  // translucent ghost of the edge of the last captured tile pinned to
+  // whichever side you're moving toward — drag until the live picture there
+  // visually lines up with the ghost, and you know there's enough overlap
+  // for the next capture to match. No pixel-precise tracking involved, this
+  // is just an eyeballing aid — the actual matching still runs independently
+  // on the captured frame afterward.
+  const NAV_MARGIN_FRAC = 0.35; // outer frame = crop box expanded by this fraction on each side
+  const GHOST_STRIP_FRAC = 0.3; // how much of the last tile's edge is shown as a ghost
+  const navOverlay = (() => {
+    if (!capturing || !videoRef.current || !previewContainerRef.current || !videoRef.current.videoWidth) return null;
+    const content = getVideoContentRect(previewContainerRef.current, videoRef.current);
+    const base = cropBox
+      ? { x: cropBox.x, y: cropBox.y, w: cropBox.w, h: cropBox.h }
+      : { x: 0, y: 0, w: videoRef.current.videoWidth, h: videoRef.current.videoHeight };
+    const mx = base.w * NAV_MARGIN_FRAC;
+    const my = base.h * NAV_MARGIN_FRAC;
+    const outerNative = { x: base.x - mx, y: base.y - my, w: base.w + mx * 2, h: base.h + my * 2 };
+    const outerStyle = {
+      left: content.x + outerNative.x * content.scale,
+      top: content.y + outerNative.y * content.scale,
+      width: outerNative.w * content.scale,
+      height: outerNative.h * content.scale,
+    };
+
+    // Direction from the last real step, so we know which edge of the last
+    // tile to ghost and which side of the outer frame to pin it to.
+    const c = cv_.current;
+    const refIdx = c.activeRefIndex !== null ? c.activeRefIndex : c.tiles.length - 1;
+    const refTile = refIdx >= 0 ? c.tiles[refIdx] : null;
+    let dir = null;
+    if (refTile && refIdx >= 1) {
+      const prev2 = c.tiles[refIdx - 1];
+      const dx = refTile.transform[2] - prev2.transform[2];
+      const dy = refTile.transform[5] - prev2.transform[5];
+      if (Math.abs(dx) >= 1 || Math.abs(dy) >= 1) {
+        dir = Math.abs(dy) >= Math.abs(dx) ? { axis: 'y', sign: dy >= 0 ? 1 : -1 } : { axis: 'x', sign: dx >= 0 ? 1 : -1 };
+      }
+    }
+    return { outerStyle, refTile, dir };
+  })();
+
+  const ghostOverlay = (() => {
+    if (!navOverlay || !navOverlay.refTile || !navOverlay.dir || !ghostUrl) return null;
+    const { refTile, dir, outerStyle } = navOverlay;
+    const content = getVideoContentRect(previewContainerRef.current, videoRef.current);
+    const tileCssW = refTile.w * content.scale;
+    const tileCssH = refTile.h * content.scale;
+
+    let wrapStyle, imgStyle, label;
+    if (dir.axis === 'y') {
+      const stripCssH = tileCssH * GHOST_STRIP_FRAC;
+      wrapStyle = {
+        left: outerStyle.left + (outerStyle.width - tileCssW) / 2,
+        width: tileCssW,
+        height: stripCssH,
+        top: dir.sign >= 0 ? outerStyle.top : outerStyle.top + outerStyle.height - stripCssH,
+      };
+      imgStyle = { width: tileCssW, height: tileCssH, left: 0, top: dir.sign >= 0 ? -(tileCssH - stripCssH) : 0 };
+      label = dir.sign >= 0 ? 'Mép dưới, lần chụp trước' : 'Mép trên, lần chụp trước';
+    } else {
+      const stripCssW = tileCssW * GHOST_STRIP_FRAC;
+      wrapStyle = {
+        top: outerStyle.top + (outerStyle.height - tileCssH) / 2,
+        height: tileCssH,
+        width: stripCssW,
+        left: dir.sign >= 0 ? outerStyle.left : outerStyle.left + outerStyle.width - stripCssW,
+      };
+      imgStyle = { width: tileCssW, height: tileCssH, top: 0, left: dir.sign >= 0 ? -(tileCssW - stripCssW) : 0 };
+      label = dir.sign >= 0 ? 'Mép phải, lần chụp trước' : 'Mép trái, lần chụp trước';
+    }
+    return { wrapStyle, imgStyle, label };
   })();
 
   const grabVideoFrame = () => {
@@ -1503,6 +1594,13 @@ export default function App() {
                   Bấm "Chọn cửa sổ" bên dưới, rồi chọn đúng cửa sổ phần mềm camera kính hiển vi.
                 </div>
               )}
+              {navOverlay && <div className="nav-box" style={navOverlay.outerStyle}></div>}
+              {ghostOverlay && (
+                <div className="ghost-strip" style={ghostOverlay.wrapStyle}>
+                  <img src={ghostUrl} style={ghostOverlay.imgStyle} alt="" />
+                  <span className="ghost-label">{ghostOverlay.label}</span>
+                </div>
+              )}
               {cropOverlayStyle && <div className="crop-box" style={cropOverlayStyle}></div>}
               {dragRect && (
                 <div className="crop-box dragging" style={{ left: dragRect.x, top: dragRect.y, width: dragRect.w, height: dragRect.h }}></div>
@@ -1530,6 +1628,12 @@ export default function App() {
                   {cropAuto && cropBox
                     ? 'Đã tự động chọn vùng nhìn (loại bỏ viền tối quanh thị kính) — kéo chuột lại nếu cần chỉnh.'
                     : 'Kéo chuột trực tiếp trên khung xem trước để chọn 1 vùng nhỏ cần quét (không bắt buộc dùng cả cửa sổ). Không chọn gì thì dùng toàn khung.'}
+                </div>
+                <div className="note" style={{ marginTop: 6 }}>
+                  Khung <b>xanh lá đứt nét</b> (trong) = vùng thật sự dùng để ghép ảnh.
+                  Khung <b>vàng đứt nét</b> (ngoài) chỉ để định hướng: mảng mờ vàng dán vào
+                  đó là mép ảnh của lần chụp trước, theo đúng hướng bạn vừa kéo — cứ kéo tới
+                  khi hình sống chồng khớp lên mảng mờ đó là đủ độ chồng lấn.
                 </div>
               </>
             )}
