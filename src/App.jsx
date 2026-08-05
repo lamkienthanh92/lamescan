@@ -277,27 +277,135 @@ export default function App() {
     const Tmat = cv.matFromArray(3, 3, cv.CV_64FC1, Tc);
     const warped = new cv.Mat();
     cv.warpPerspective(mat, warped, Tmat, new cv.Size(c.w, c.h), cv.INTER_LINEAR, cv.BORDER_CONSTANT, new cv.Scalar());
-    const channels = new cv.MatVector();
-    cv.split(warped, channels);
-    const alpha = channels.get(3);
-    const mask = new cv.Mat();
+    Tmat.delete();
+
+    // Every cv.Mat/MatVector allocated below gets pushed here and deleted once
+    // at the end — with this many temporaries, tracking deletes inline is
+    // error-prone and this runs on every captured tile, so leaks add up fast.
+    const trash = [warped];
+    const track = (m) => { trash.push(m); return m; };
+
+    // Bound the blending work to this tile's own footprint in canvas
+    // coordinates, not the whole (possibly huge) mosaic, so cost stays
+    // proportional to tile size regardless of how large the scan has grown.
+    const corners = cornersOf(Tc, tw, th);
+    const { minX, minY, maxX, maxY } = bboxOf(corners);
+    const rx = Math.max(0, Math.floor(minX));
+    const ry = Math.max(0, Math.floor(minY));
+    const rw = Math.min(c.w, Math.ceil(maxX)) - rx;
+    const rh = Math.min(c.h, Math.ceil(maxY)) - ry;
+    if (rw <= 0 || rh <= 0) { warped.delete(); return; }
+    const rect = new cv.Rect(rx, ry, rw, rh);
+    const warpedRoi = track(warped.roi(rect));
+    const targetRoi = track(targetMat.roi(rect));
+
+    const channels = track(new cv.MatVector());
+    cv.split(warpedRoi, channels);
+    const [srcB, srcG, srcR, srcA] = [0, 1, 2, 3].map((i) => track(channels.get(i)));
+    const mask = track(new cv.Mat());
     // Only trust fully-opaque pixels: near the tile's edge, linear interpolation
     // blends real content with the transparent (black) border, which darkens
     // those pixels even though their alpha isn't quite zero. A loose threshold
     // let that blended ring through, showing up as a thin dark seam at every
     // tile boundary.
-    cv.threshold(alpha, mask, 250, 255, cv.THRESH_BINARY);
+    cv.threshold(srcA, mask, 250, 255, cv.THRESH_BINARY);
     // Erode a couple more pixels off the valid region as a safety margin, in
     // case of small misregistration at the boundary too.
-    const kernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(3, 3));
-    cv.erode(mask, mask, kernel, new cv.Point(-1, -1), 2);
-    kernel.delete();
-    warped.copyTo(targetMat, mask);
-    Tmat.delete();
-    warped.delete();
-    channels.delete();
-    alpha.delete();
-    mask.delete();
+    const eKernel = track(cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(3, 3)));
+    cv.erode(mask, mask, eKernel, new cv.Point(-1, -1), 2);
+
+    const targetChannels = track(new cv.MatVector());
+    cv.split(targetRoi, targetChannels);
+    const [dstB, dstG, dstR, dstA] = [0, 1, 2, 3].map((i) => track(targetChannels.get(i)));
+    const targetMask = track(new cv.Mat());
+    cv.threshold(dstA, targetMask, 250, 255, cv.THRESH_BINARY);
+
+    const overlapMask = track(new cv.Mat());
+    cv.bitwise_and(mask, targetMask, overlapMask);
+    const overlapCount = cv.countNonZero(overlapMask);
+    const MIN_OVERLAP_PX = 400; // below this, per-channel means are too noisy to trust
+
+    // ---- exposure/color gain compensation ----
+    // Where this tile overlaps content already painted, nudge its brightness
+    // per channel to match what's already there before blending it in — the
+    // camera commonly auto-adjusts exposure/white-balance slightly frame to
+    // frame, and without this a tile boundary shows up as a hard visible seam.
+    const srcChans = [srcB, srcG, srcR];
+    const dstChans = [dstB, dstG, dstR];
+    if (overlapCount > MIN_OVERLAP_PX) {
+      for (let i = 0; i < 3; i++) {
+        const srcMean = cv.mean(srcChans[i], overlapMask)[0];
+        const dstMean = cv.mean(dstChans[i], overlapMask)[0];
+        if (srcMean > 1) {
+          // Clamp: correct real exposure drift, not gross mismatches — those
+          // more likely mean a bad overlap match than a lighting difference.
+          const gain = Math.min(1.6, Math.max(0.6, dstMean / srcMean));
+          srcChans[i].convertTo(srcChans[i], -1, gain, 0);
+        }
+      }
+    }
+
+    // ---- feather blend at the seam ----
+    // Fade this tile in near its own edges (by distance from the mask
+    // boundary) instead of a hard cutoff, so the transition into already-
+    // painted content is gradual. Where there's no existing content at all
+    // (targetMask empty), the formula collapses back to full opacity — brand
+    // new mosaic area is still painted at full strength, nothing changes there.
+    const FEATHER_PX = 30;
+    const dist = track(new cv.Mat());
+    cv.distanceTransform(mask, dist, cv.DIST_L2, 3);
+    const feather = track(new cv.Mat());
+    dist.convertTo(feather, cv.CV_32F, 1 / FEATHER_PX, 0);
+    cv.threshold(feather, feather, 1, 1, cv.THRESH_TRUNC); // clamp to <= 1
+
+    const maskF = track(new cv.Mat());
+    mask.convertTo(maskF, cv.CV_32F, 1 / 255);
+    const targetMaskF = track(new cv.Mat());
+    targetMask.convertTo(targetMaskF, cv.CV_32F, 1 / 255);
+    const onesSingle = track(new cv.Mat(feather.rows, feather.cols, cv.CV_32F, new cv.Scalar(1)));
+    const oneMinusFeather = track(new cv.Mat());
+    cv.subtract(onesSingle, feather, oneMinusFeather);
+    const oneMinusTargetMaskF = track(new cv.Mat());
+    cv.subtract(onesSingle, targetMaskF, oneMinusTargetMaskF);
+
+    // blendAlpha = feather + (1-feather)*(1-targetMaskF), then masked to this tile's footprint.
+    const term = track(new cv.Mat());
+    cv.multiply(oneMinusFeather, oneMinusTargetMaskF, term);
+    const blendAlpha = track(new cv.Mat());
+    cv.add(feather, term, blendAlpha);
+    cv.multiply(blendAlpha, maskF, blendAlpha);
+    const oneMinusAlpha = track(new cv.Mat());
+    cv.subtract(onesSingle, blendAlpha, oneMinusAlpha);
+
+    const outChannels = track(new cv.MatVector());
+    for (let i = 0; i < 3; i++) {
+      const s32 = track(new cv.Mat());
+      srcChans[i].convertTo(s32, cv.CV_32F);
+      const d32 = track(new cv.Mat());
+      dstChans[i].convertTo(d32, cv.CV_32F);
+      const a = track(new cv.Mat());
+      cv.multiply(s32, blendAlpha, a);
+      const b = track(new cv.Mat());
+      cv.multiply(d32, oneMinusAlpha, b);
+      const sum = track(new cv.Mat());
+      cv.add(a, b, sum);
+      const outCh = track(new cv.Mat());
+      sum.convertTo(outCh, cv.CV_8U);
+      outChannels.push_back(outCh);
+    }
+    // Alpha channel of the result: stay opaque wherever this tile is opaque
+    // OR the mosaic already had content there.
+    const outAlpha = track(new cv.Mat());
+    cv.max(mask, dstA, outAlpha);
+    outChannels.push_back(outAlpha);
+
+    const blended = track(new cv.Mat());
+    cv.merge(outChannels, blended);
+    // Only actually touch pixels this tile's (eroded) mask covers — outside
+    // that, the mosaic is left exactly as it was.
+    blended.copyTo(targetRoi, mask);
+
+    trash.forEach((m) => m.delete());
   }, []);
 
   const blobToMat = useCallback(async (blob) => {
