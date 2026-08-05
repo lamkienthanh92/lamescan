@@ -193,66 +193,10 @@ function fitAxisTranslation(pts, axis, threshold) {
   return { inliers: best.inliers, t: vals.length ? vals[Math.floor(vals.length / 2)] : best.t };
 }
 
-// Returns { ok, inliers, total, H? } where H is a flat 3x3 row-major array
-// mapping points from the "new" tile's pixel space into the "prev" tile's pixel space.
-//
-// `axisLock`: the caller confirms the physical stage/slide only ever moves
-// along a single axis at a time (pure X or pure Y, never diagonal, and no
-// rotation) between the two frames being matched — true for consecutive-
-// capture matches, but NOT for anchor/loop-closure or manual relocalization
-// matches, where the two tiles can be far apart in the scan and legitimately
-// offset/rotated relative to each other. When set, this bypasses the general
-// similarity-transform RANSAC entirely and fits a constrained "translation
-// along one fixed axis only" model instead (see fitAxisTranslation above) —
-// baking the axis-only, non-rotating assumption into which points get to
-// vote as inliers in the first place, not just clamping the result afterward.
-export function matchTiles(kpNew, descNew, kpPrev, descPrev, { axisLock = false } = {}) {
-  if (descNew.rows < 4 || descPrev.rows < 4) return { ok: false, inliers: 0, total: 0 };
-
-  const bf = new cv.BFMatcher(cv.NORM_HAMMING, true);
-  const matches = new cv.DMatchVector();
-  bf.match(descNew, descPrev, matches);
-  const n = matches.size();
-  if (n < 8) {
-    bf.delete();
-    matches.delete();
-    return { ok: false, inliers: 0, total: n };
-  }
-
-  const arr = [];
-  for (let i = 0; i < n; i++) arr.push(matches.get(i));
-  arr.sort((a, b) => a.distance - b.distance);
-  // Cap how many matches we feed the estimator: keeping only the best matches
-  // (rather than up to 60% of all of them) keeps obviously-bad far-distance
-  // matches out of the pool RANSAC has to sift through.
-  const keep = arr.slice(0, Math.min(200, Math.max(20, Math.floor(n * 0.5))));
-
-  if (axisLock) {
-    const pts = keep.map((m) => {
-      const p1 = kpNew.get(m.queryIdx).pt;
-      const p2 = kpPrev.get(m.trainIdx).pt;
-      return [p1.x, p1.y, p2.x, p2.y];
-    });
-    bf.delete();
-    matches.delete();
-    const AXIS_THRESH_PX = 5;
-    const rx = fitAxisTranslation(pts, 'x', AXIS_THRESH_PX);
-    const ry = fitAxisTranslation(pts, 'y', AXIS_THRESH_PX);
-    const best =
-      rx && ry ? (rx.inliers >= ry.inliers ? { axis: 'x', ...rx } : { axis: 'y', ...ry })
-      : rx ? { axis: 'x', ...rx }
-      : ry ? { axis: 'y', ...ry }
-      : null;
-    const ratio = best ? best.inliers / pts.length : 0;
-    // Same acceptance bar as the general path below, for consistent behavior.
-    if (!best || best.inliers < 15 || ratio < 0.25) {
-      return { ok: false, inliers: best ? best.inliers : 0, total: pts.length };
-    }
-    const H =
-      best.axis === 'x' ? [1, 0, best.t, 0, 1, 0, 0, 0, 1] : [1, 0, 0, 0, 1, best.t, 0, 0, 1];
-    return { ok: true, inliers: best.inliers, total: pts.length, H };
-  }
-
+// The general (unconstrained rotation + uniform scale + translation) RANSAC
+// fit — used both as the only path for non-axisLock matches, and as a
+// fallback for axisLock matches when neither pure-axis hypothesis fits.
+function estimateGeneralTransform(keep, kpNew, kpPrev) {
   const src = [];
   const dst = [];
   keep.forEach((m) => {
@@ -271,8 +215,6 @@ export function matchTiles(kpNew, descNew, kpPrev, descPrev, { axisLock = false 
     srcMat.delete();
     dstMat.delete();
     inlierMask.delete();
-    bf.delete();
-    matches.delete();
     return { ok: false, inliers: 0, total: keep.length, unsupported: true };
   }
 
@@ -292,8 +234,6 @@ export function matchTiles(kpNew, descNew, kpPrev, descPrev, { axisLock = false 
     srcMat.delete();
     dstMat.delete();
     inlierMask.delete();
-    bf.delete();
-    matches.delete();
     return { ok: false, inliers: 0, total: keep.length };
   }
 
@@ -319,8 +259,77 @@ export function matchTiles(kpNew, descNew, kpPrev, descPrev, { axisLock = false 
   srcMat.delete();
   dstMat.delete();
   inlierMask.delete();
+  return result;
+}
+
+// Returns { ok, inliers, total, H? } where H is a flat 3x3 row-major array
+// mapping points from the "new" tile's pixel space into the "prev" tile's pixel space.
+//
+// `axisLock`: the caller confirms the physical stage/slide *normally* moves
+// along a single axis at a time (pure X or pure Y, never diagonal, and no
+// rotation) between the two frames being matched — true for consecutive-
+// capture matches, but NOT for anchor/loop-closure or manual relocalization
+// matches, where the two tiles can be far apart in the scan and legitimately
+// offset/rotated relative to each other. When set, this first tries fitting a
+// constrained "translation along one fixed axis only" model (see
+// fitAxisTranslation above) — baking the axis-only assumption into which
+// points get to vote as inliers in the first place, which is what actually
+// defeats repetitive-texture aliasing, not just clamping the result after.
+// If NEITHER axis fits well, this falls back to the general unconstrained fit
+// for that one match — the moment of switching from scanning along Y to
+// scanning along X inherently produces one or two genuinely diagonal frames
+// while the hand/stage is mid-turn, and hard-rejecting those would stall the
+// whole scan waiting for a manual fix instead of just accepting that one
+// transitional step as the (real, if temporarily off-axis) motion it is.
+export function matchTiles(kpNew, descNew, kpPrev, descPrev, { axisLock = false } = {}) {
+  if (descNew.rows < 4 || descPrev.rows < 4) return { ok: false, inliers: 0, total: 0 };
+
+  const bf = new cv.BFMatcher(cv.NORM_HAMMING, true);
+  const matches = new cv.DMatchVector();
+  bf.match(descNew, descPrev, matches);
+  const n = matches.size();
+  if (n < 8) {
+    bf.delete();
+    matches.delete();
+    return { ok: false, inliers: 0, total: n };
+  }
+
+  const arr = [];
+  for (let i = 0; i < n; i++) arr.push(matches.get(i));
+  arr.sort((a, b) => a.distance - b.distance);
+  // Cap how many matches we feed the estimator: keeping only the best matches
+  // (rather than up to 60% of all of them) keeps obviously-bad far-distance
+  // matches out of the pool RANSAC has to sift through.
+  const keep = arr.slice(0, Math.min(200, Math.max(20, Math.floor(n * 0.5))));
   bf.delete();
   matches.delete();
-  return result;
+
+  if (axisLock) {
+    const pts = keep.map((m) => {
+      const p1 = kpNew.get(m.queryIdx).pt;
+      const p2 = kpPrev.get(m.trainIdx).pt;
+      return [p1.x, p1.y, p2.x, p2.y];
+    });
+    const AXIS_THRESH_PX = 5;
+    const rx = fitAxisTranslation(pts, 'x', AXIS_THRESH_PX);
+    const ry = fitAxisTranslation(pts, 'y', AXIS_THRESH_PX);
+    const best =
+      rx && ry ? (rx.inliers >= ry.inliers ? { axis: 'x', ...rx } : { axis: 'y', ...ry })
+      : rx ? { axis: 'x', ...rx }
+      : ry ? { axis: 'y', ...ry }
+      : null;
+    const ratio = best ? best.inliers / pts.length : 0;
+    if (best && best.inliers >= 15 && ratio >= 0.25) {
+      const H =
+        best.axis === 'x' ? [1, 0, best.t, 0, 1, 0, 0, 0, 1] : [1, 0, 0, 0, 1, best.t, 0, 0, 1];
+      return { ok: true, inliers: best.inliers, total: pts.length, H };
+    }
+    // Neither pure axis explains the motion well — likely a genuine
+    // direction-change frame. Fall back to the unconstrained fit rather than
+    // rejecting outright.
+    return estimateGeneralTransform(keep, kpNew, kpPrev);
+  }
+
+  return estimateGeneralTransform(keep, kpNew, kpPrev);
 }
 
