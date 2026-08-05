@@ -924,21 +924,21 @@ export default function App() {
     try {
       const { mat, w, h, blobPromise } = grabVideoFrame();
 
-      // Rough placeholder position — just to the right of the whole mosaic's
-      // current bounding box, with a small gap. Not a real match: purely so
-      // the live view shows roughly where this new strip sits relative to
-      // what's already been scanned, per your earlier request. Anchor-search
-      // (below, already running on every tile once c.tiles.length passes
-      // ANCHOR_MIN_TILES — trivially true here since a prior strip exists)
-      // will pull it into its true position once it drags into real overlap.
-      let minX = Infinity, minY = Infinity, maxX = -Infinity;
-      for (const t of c.tiles) {
-        minX = Math.min(minX, t.bbox.minX);
-        minY = Math.min(minY, t.bbox.minY);
-        maxX = Math.max(maxX, t.bbox.maxX);
-      }
+      // Rough placeholder position — right next to the LAST tile you actually
+      // captured (not the whole mosaic's bounding box). For a zigzag/
+      // boustrophedon scan the next strip doesn't necessarily start back at
+      // the top — it starts wherever you just stopped, going up or down
+      // depending on which way the zigzag is heading — so anchoring to the
+      // most recent tile's own position is the only assumption that holds
+      // regardless of direction. Not a real match: purely so the live view
+      // shows roughly where this new strip sits relative to what's already
+      // been scanned. Anchor-search (below, already running on every tile
+      // once c.tiles.length passes ANCHOR_MIN_TILES — trivially true here
+      // since a prior strip exists) will pull it into its true position once
+      // it drags into real overlap.
+      const lastTile = c.tiles[c.tiles.length - 1];
       const STRIP_GAP_PX = 40;
-      const transform = translateM(maxX + STRIP_GAP_PX, minY);
+      const transform = translateM(lastTile.bbox.maxX + STRIP_GAP_PX, lastTile.bbox.minY);
 
       growCanvasIfNeeded(transform, w, h);
       composite(mat, transform, w, h, c.mosaicMat);
