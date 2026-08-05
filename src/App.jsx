@@ -907,6 +907,75 @@ export default function App() {
     setAutoRunning(false);
   };
 
+  // ---- new strip: start a fresh, independent chain in the same mosaic ----
+  // For a straight axis-only scan, a long chain of consecutive matches with no
+  // loop-closure has nothing to reconcile a per-step estimation error against
+  // (see the earlier drift discussion) — deliberately restarting the chain at
+  // each new row/column and letting the anchor/loop-closure mechanism (which
+  // already runs on every tile once enough tiles exist) tie the strips
+  // together avoids that entirely: each strip's own axisLock chain never gets
+  // long enough to drift, and connecting strips is a free-form (non-axis-
+  // locked) match with much more image content to work from than a single tile.
+  const startNewStrip = async () => {
+    const c = cv_.current;
+    if (!uiRef.current.capturing || c.busy || c.tiles.length === 0) return;
+    stopAuto();
+    c.busy = true;
+    try {
+      const { mat, w, h, blobPromise } = grabVideoFrame();
+
+      // Rough placeholder position — just to the right of the whole mosaic's
+      // current bounding box, with a small gap. Not a real match: purely so
+      // the live view shows roughly where this new strip sits relative to
+      // what's already been scanned, per your earlier request. Anchor-search
+      // (below, already running on every tile once c.tiles.length passes
+      // ANCHOR_MIN_TILES — trivially true here since a prior strip exists)
+      // will pull it into its true position once it drags into real overlap.
+      let minX = Infinity, minY = Infinity, maxX = -Infinity;
+      for (const t of c.tiles) {
+        minX = Math.min(minX, t.bbox.minX);
+        minY = Math.min(minY, t.bbox.minY);
+        maxX = Math.max(maxX, t.bbox.maxX);
+      }
+      const STRIP_GAP_PX = 40;
+      const transform = translateM(maxX + STRIP_GAP_PX, minY);
+
+      growCanvasIfNeeded(transform, w, h);
+      composite(mat, transform, w, h, c.mosaicMat);
+      paintCanvas(c.mosaicMat);
+      const blob = await blobPromise;
+      const sharp = evaluateSharpness(mat);
+      const newIndex = c.tiles.length;
+      const stripTile = {
+        transform, w, h, blob, bbox: tileBBox(transform, w, h), capturedAt: Date.now(),
+        renderedTx: transform[2], renderedTy: transform[5], sharpness: sharp.value, blurry: sharp.blurry,
+        estimated: true, // provisional placement — not yet confirmed by any match
+      };
+      c.tiles.push(stripTile);
+      persistTile(newIndex, stripTile);
+      if (sharp.blurry) setBlurryCount((n) => n + 1);
+      const feat = computeFeatures(mat);
+      stripTile._kp = feat.kp;
+      stripTile._desc = feat.desc;
+      mat.delete();
+      // Deliberately no edge added here — this tile starts a new, independent
+      // chain, disconnected from the pose graph until an anchor match (or
+      // manual positioning) ties it back to the rest of the mosaic.
+      c.activeRefIndex = newIndex;
+      c.autoFails = 0;
+      c.justResumed = true; // require one real match before this new strip's own chain starts guessing
+      c.consecutiveGuesses = 0;
+      persistMeta();
+      setTileCount(c.tiles.length);
+      setMatchInfo({
+        text: `Đã bắt đầu dải mới (ô #${newIndex + 1}) — vị trí tạm thời, sẽ tự khớp lại khi bạn quét vào vùng chồng lấn với phần đã có. Bấm "Bắt đầu ghép tự động" để tiếp tục.`,
+        kind: 'ok',
+      });
+    } finally {
+      c.busy = false;
+    }
+  };
+
   // Re-verifies a single tile against its immediate neighbors (both before and
   // after it in the sequence) and replaces it in place — no need to undo
   // everything captured after it, unlike a plain "undo last".
@@ -1533,6 +1602,15 @@ export default function App() {
               vùng đã quét trước đó, để giảm trôi tích luỹ ở các đường quét dài/zigzag.
               Ảnh ghép sẽ tự vẽ lại định kỳ khi có điều chỉnh đáng kể. Vùng ít chi tiết sẽ
               được ước lượng theo hướng di chuyển gần nhất thay vì dừng lại hỏi bạn.
+            </div>
+            <div style={{ height: 8 }} />
+            <button onClick={startNewStrip} disabled={!cvReady || !capturing || tileCount === 0}>
+              Dải mới (đổi hướng quét)
+            </button>
+            <div className="note" style={{ marginTop: 6 }}>
+              Dùng khi bạn sắp đổi trục quét (vd hết 1 cột theo Y, chuẩn bị quét cột X mới).
+              App đặt 1 ô mốc mới ở vị trí tạm bên cạnh phần đã quét, rồi bạn quét tiếp dải
+              mới bình thường — dải mới sẽ tự "hút" vào đúng vị trí khi chồng lấn phần cũ.
             </div>
           </div>
 
