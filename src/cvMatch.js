@@ -117,6 +117,10 @@ export function detectVignetteRect(mat) {
   return { x: left, y: top, w: right - left, h: bottom - top };
 }
 
+// Longer-side target for the downscaled grayscale copy kept for the
+// independent pixel cross-correlation check (see crossCorrelateAxis below).
+const CROSSCHECK_MAX_DIM = 300;
+
 export function computeFeatures(mat) {
   const gray = new cv.Mat();
   cv.cvtColor(mat, gray, cv.COLOR_RGBA2GRAY);
@@ -125,10 +129,22 @@ export function computeFeatures(mat) {
   const desc = new cv.Mat();
   const none = new cv.Mat();
   orb.detectAndCompute(gray, none, kp, desc);
-  gray.delete();
   none.delete();
   orb.delete();
-  return { kp, desc };
+
+  // A small downscaled grayscale copy, kept purely so matchTiles can run an
+  // independent (non-keypoint) pixel cross-correlation check — cheap to
+  // store and cheap to matchTemplate on, and computed here so it costs no
+  // extra image decode beyond what ORB already needed.
+  const scale = CROSSCHECK_MAX_DIM / Math.max(gray.cols, gray.rows);
+  const small = new cv.Mat();
+  if (scale < 1) {
+    cv.resize(gray, small, new cv.Size(Math.round(gray.cols * scale), Math.round(gray.rows * scale)), 0, 0, cv.INTER_AREA);
+  } else {
+    gray.copyTo(small);
+  }
+  gray.delete();
+  return { kp, desc, small };
 }
 
 // Laplacian variance: a standard, cheap focus/blur metric. Higher = sharper.
@@ -151,6 +167,63 @@ export function computeSharpness(mat) {
   return variance;
 }
 
+// Independent, non-ORB confirmation of an axis translation estimate:
+// template-matches a strip of raw pixel intensities from the leading edge of
+// the new tile against a wider strip of the previous tile covering the range
+// that edge should fall within, given the ORB-based estimate `t`'s direction.
+// Because this is a completely different signal (pixel correlation, not
+// keypoint descriptors), it isn't fooled by the exact repetitive-texture
+// ambiguity that can trip up ORB in the same way — so requiring the two to
+// agree is a genuine second, independent opinion, not just the same idea run
+// twice. Works on the small downscaled copy from computeFeatures; `origDim`
+// (the real tile height for axis='y', width for axis='x') is used to scale
+// the result back into the same pixel units as the ORB estimate.
+function crossCorrelateAxis(newSmall, prevSmall, axis, t, origDim) {
+  const w = newSmall.cols, h = newSmall.rows;
+  const dim = axis === 'y' ? h : w;
+  const TEMPLATE_FRAC = 0.22;
+  const SEARCH_FRAC = 0.6;
+  const templateLen = Math.max(6, Math.round(dim * TEMPLATE_FRAC));
+  const searchLen = Math.max(templateLen + 4, Math.round(dim * SEARCH_FRAC));
+  if (templateLen >= searchLen || searchLen > dim) return null;
+
+  let templateRoi, searchRoi, searchStart;
+  if (axis === 'y') {
+    if (t > 0) {
+      templateRoi = new cv.Rect(0, 0, w, templateLen);
+      searchStart = h - searchLen;
+      searchRoi = new cv.Rect(0, searchStart, w, searchLen);
+    } else {
+      templateRoi = new cv.Rect(0, h - templateLen, w, templateLen);
+      searchStart = 0;
+      searchRoi = new cv.Rect(0, 0, w, searchLen);
+    }
+  } else {
+    if (t > 0) {
+      templateRoi = new cv.Rect(0, 0, templateLen, h);
+      searchStart = w - searchLen;
+      searchRoi = new cv.Rect(searchStart, 0, searchLen, h);
+    } else {
+      templateRoi = new cv.Rect(w - templateLen, 0, templateLen, h);
+      searchStart = 0;
+      searchRoi = new cv.Rect(0, 0, searchLen, h);
+    }
+  }
+
+  const template = newSmall.roi(templateRoi);
+  const search = prevSmall.roi(searchRoi);
+  const result = new cv.Mat();
+  cv.matchTemplate(search, template, result, cv.TM_CCOEFF_NORMED);
+  const mm = cv.minMaxLoc(result);
+  result.delete();
+  template.delete();
+  search.delete();
+
+  const off = axis === 'y' ? mm.maxLoc.y : mm.maxLoc.x;
+  const tSmall = t > 0 ? searchStart + off : searchStart + off - (dim - templateLen);
+  return { t: tSmall * (origDim / dim), score: mm.maxVal };
+}
+
 // Exhaustive (not random-sampled — the point count is capped low enough that
 // this is cheap and deterministic) 1-parameter robust fit for "pure
 // translation along one fixed axis, no rotation/scale": tries every point's
@@ -166,7 +239,7 @@ export function computeSharpness(mat) {
 // do NOT agree once perpendicular displacement is required to be ~zero — so
 // they're excluded from consideration here, rather than accepted and only
 // corrected after the fact.
-function fitAxisTranslation(pts, axis, threshold, expectedT) {
+function fitAxisTranslation(pts, axis, threshold, expectedT, maxDeviation) {
   const n = pts.length;
   // Score every seed candidate's inlier support (not just track a running
   // best) — repetitive/striped texture reliably produces several distinct,
@@ -181,6 +254,12 @@ function fitAxisTranslation(pts, axis, threshold, expectedT) {
   for (let seed = 0; seed < n; seed++) {
     const [sx, sy, dx0, dy0] = pts[seed];
     const t = axis === 'x' ? dx0 - sx : dy0 - sy;
+    // Hard bound, not just a preference: a candidate whose offset is wildly
+    // outside where recent motion says it should be is never even entered
+    // into consideration, regardless of how many points happen to agree with
+    // it — this is what actually stops a distant, well-supported repeated-
+    // stripe cluster from ever winning, rather than merely being disfavored.
+    if (expectedT != null && maxDeviation != null && Math.abs(t - expectedT) > maxDeviation) continue;
     let inliers = 0;
     for (let i = 0; i < n; i++) {
       const [x, y, dx1, dy1] = pts[i];
@@ -307,13 +386,26 @@ function estimateGeneralTransform(keep, kpNew, kpPrev) {
 //
 // `expectedDX`/`expectedDY`: the caller's best guess (typically extrapolated
 // from the last one or two real steps) of how far this step should have
-// moved along each axis. Used only to break ties among comparably-supported
-// translation candidates within fitAxisTranslation — on strongly repetitive
-// texture (parallel fiber bundles etc.) there's often more than one
-// plausible-looking offset a stripe-period apart, and inlier count alone
-// can't distinguish the real one from an aliased neighbor. Optional — pass
-// nothing and the fit falls back to plain highest-vote-count, as before.
-export function matchTiles(kpNew, descNew, kpPrev, descPrev, { axisLock = false, expectedDX = null, expectedDY = null } = {}) {
+// moved along each axis. Used two ways: as a hard bound (candidates too far
+// from it are never considered at all, see fitAxisTranslation) when
+// `tileW`/`tileH` are also given, and as a tie-breaker for which axis to
+// trust. On strongly repetitive texture (parallel fiber bundles etc.)
+// there's often more than one plausible-looking offset a stripe-period
+// apart, and inlier count alone can't distinguish the real one from an
+// aliased neighbor. All optional — omit them and the fit falls back to
+// plain highest-vote-count with no window, as before.
+//
+// `newSmall`/`prevSmall`/`tileW`/`tileH`: when all four are given, an
+// accepted axis fit is additionally cross-checked against an independent,
+// non-keypoint pixel correlation (see crossCorrelateAxis) — the match is
+// only accepted if both agree. This is the "two independent frames must
+// agree" consensus check: ORB keypoint matching and whole-strip pixel
+// correlation fail in different ways, so requiring both catches mistakes
+// neither alone reliably would.
+export function matchTiles(
+  kpNew, descNew, kpPrev, descPrev,
+  { axisLock = false, expectedDX = null, expectedDY = null, newSmall = null, prevSmall = null, tileW = null, tileH = null } = {}
+) {
   if (descNew.rows < 4 || descPrev.rows < 4) return { ok: false, inliers: 0, total: 0 };
 
   const bf = new cv.BFMatcher(cv.NORM_HAMMING, true);
@@ -343,19 +435,71 @@ export function matchTiles(kpNew, descNew, kpPrev, descPrev, { axisLock = false,
       return [p1.x, p1.y, p2.x, p2.y];
     });
     const AXIS_THRESH_PX = 5;
-    const rx = fitAxisTranslation(pts, 'x', AXIS_THRESH_PX, expectedDX);
-    const ry = fitAxisTranslation(pts, 'y', AXIS_THRESH_PX, expectedDY);
-    const best =
-      rx && ry ? (rx.inliers >= ry.inliers ? { axis: 'x', ...rx } : { axis: 'y', ...ry })
-      : rx ? { axis: 'x', ...rx }
-      : ry ? { axis: 'y', ...ry }
-      : null;
+    // Half the tile's own dimension is a generous window — genuine matches
+    // need real overlap to work at all, so the true offset is essentially
+    // never more than about half the tile size, while a repeated-stripe
+    // alias is typically much further away than that.
+    const maxDevX = tileW != null ? tileW * 0.5 : null;
+    const maxDevY = tileH != null ? tileH * 0.5 : null;
+    const rx = fitAxisTranslation(pts, 'x', AXIS_THRESH_PX, expectedDX, maxDevX);
+    const ry = fitAxisTranslation(pts, 'y', AXIS_THRESH_PX, expectedDY, maxDevY);
+    // Which axis to trust when BOTH hypotheses find a plausible fit. Naively
+    // taking whichever has more inliers sounds reasonable, but ties (or near-
+    // ties from a noisy/low-texture frame) need a tie-break rule — and
+    // "highest wins, ties go to X" quietly favors X on every near-tie. Over a
+    // long straight-down (pure Y) scan, that alone is enough to occasionally
+    // misclassify a step as X motion and nudge the whole scan sideways one
+    // small step at a time — exactly the kind of slow systematic drift that's
+    // easy to miss until much later. Bias toward whichever axis recent motion
+    // predicts instead, requiring a real inlier lead (not just any lead) for
+    // the other axis to override it.
+    let best;
+    if (rx && ry) {
+      const expectedAxis =
+        expectedDX != null && expectedDY != null
+          ? (Math.abs(expectedDY) >= Math.abs(expectedDX) ? 'y' : 'x')
+          : null;
+      if (!expectedAxis) {
+        best = rx.inliers >= ry.inliers ? { axis: 'x', ...rx } : { axis: 'y', ...ry };
+      } else {
+        const SWITCH_MARGIN = 1.15; // the other axis needs >=15% more inliers to override the expected one
+        best =
+          expectedAxis === 'y'
+            ? (rx.inliers > ry.inliers * SWITCH_MARGIN ? { axis: 'x', ...rx } : { axis: 'y', ...ry })
+            : (ry.inliers > rx.inliers * SWITCH_MARGIN ? { axis: 'y', ...ry } : { axis: 'x', ...rx });
+      }
+    } else if (rx) {
+      best = { axis: 'x', ...rx };
+    } else if (ry) {
+      best = { axis: 'y', ...ry };
+    } else {
+      best = null;
+    }
     const ratio = best ? best.inliers / pts.length : 0;
     if (!best || best.inliers < 15 || ratio < 0.25) {
       return { ok: false, inliers: best ? best.inliers : 0, total: pts.length };
     }
+
+    // Second, independent opinion: pixel cross-correlation on whole edge
+    // strips, not keypoints. Only cross-checked when the caller supplied the
+    // downscaled tile copies — optional so callers that don't have them yet
+    // (e.g. cache misses recomputed without both sides available) still work,
+    // just without this extra safety net.
+    let finalT = best.t;
+    if (newSmall && prevSmall) {
+      const origDim = best.axis === 'x' ? tileW : tileH;
+      const cc = origDim ? crossCorrelateAxis(newSmall, prevSmall, best.axis, best.t, origDim) : null;
+      const AGREEMENT_PX = 12;
+      const MIN_SCORE = 0.4;
+      if (!cc || cc.score < MIN_SCORE || Math.abs(cc.t - best.t) > AGREEMENT_PX) {
+        return { ok: false, inliers: best.inliers, total: pts.length, disagreement: true };
+      }
+      // Both agree — average for a touch more precision than either alone.
+      finalT = (best.t + cc.t) / 2;
+    }
+
     const H =
-      best.axis === 'x' ? [1, 0, best.t, 0, 1, 0, 0, 0, 1] : [1, 0, 0, 0, 1, best.t, 0, 0, 1];
+      best.axis === 'x' ? [1, 0, finalT, 0, 1, 0, 0, 0, 1] : [1, 0, 0, 0, 1, finalT, 0, 0, 1];
     return { ok: true, inliers: best.inliers, total: pts.length, H };
   }
 

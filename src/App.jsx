@@ -478,12 +478,13 @@ export default function App() {
   // re-running ORB detection from scratch, every single time, even for tiles
   // checked repeatedly (e.g. a busy anchor spot revisited across a zigzag).
   const getTileFeatures = async (tile) => {
-    if (tile._kp && tile._desc) return { kp: tile._kp, desc: tile._desc };
+    if (tile._kp && tile._desc && tile._small) return { kp: tile._kp, desc: tile._desc, small: tile._small };
     const mat = await blobToMat(tile.blob);
     const feat = computeFeatures(mat);
     mat.delete();
     tile._kp = feat.kp;
     tile._desc = feat.desc;
+    tile._small = feat.small;
     return feat;
   };
 
@@ -498,6 +499,10 @@ export default function App() {
     if (tile._desc) {
       tile._desc.delete();
       tile._desc = null;
+    }
+    if (tile._small) {
+      tile._small.delete();
+      tile._small = null;
     }
   };
 
@@ -691,6 +696,7 @@ export default function App() {
         const baseFeat = computeFeatures(mat);
         baseTile._kp = baseFeat.kp;
         baseTile._desc = baseFeat.desc;
+        baseTile._small = baseFeat.small;
         mat.delete();
         c.autoFails = 0;
         c.lastRebuildTileCount = 1;
@@ -714,7 +720,10 @@ export default function App() {
         expectedDX = prevTile.transform[2] - prev2.transform[2];
         expectedDY = prevTile.transform[5] - prev2.transform[5];
       }
-      let m = matchTiles(featNew.kp, featNew.desc, prevFeat.kp, prevFeat.desc, { axisLock: true, expectedDX, expectedDY });
+      let m = matchTiles(featNew.kp, featNew.desc, prevFeat.kp, prevFeat.desc, {
+        axisLock: true, expectedDX, expectedDY,
+        newSmall: featNew.small, prevSmall: prevFeat.small, tileW: w, tileH: h,
+      });
 
       // Runs the shared warm-started relaxation pass, then checks whether any
       // already-painted tile drifted enough (or enough time/tiles have passed)
@@ -770,6 +779,7 @@ export default function App() {
             c.tiles.push(guessTile);
             guessTile._kp = featNew.kp;
             guessTile._desc = featNew.desc;
+            guessTile._small = featNew.small;
             persistTile(newIndex, guessTile);
             if (sharp.blurry) setBlurryCount((n) => n + 1);
             // Low-weight edge: a rough guess, easily outweighed by any real match later.
@@ -836,6 +846,7 @@ export default function App() {
       c.tiles.push(newTile);
       newTile._kp = featNew.kp;
       newTile._desc = featNew.desc;
+      newTile._small = featNew.small;
       persistTile(newIndex, newTile);
       if (sharp.blurry) setBlurryCount((n) => n + 1);
       // m.H is already the local match: new tile's offset/rotation expressed in
@@ -998,6 +1009,7 @@ export default function App() {
       c.tiles.push(newTile);
       newTile._kp = featNew.kp;
       newTile._desc = featNew.desc;
+      newTile._small = featNew.small;
       persistTile(newIndex, newTile);
       if (sharp.blurry) setBlurryCount((n) => n + 1);
       addEdge(c.edges, c.adjacency, best.index, newIndex, best.m.H[2], best.m.H[5], angleOf(best.m.H), best.m.inliers);
@@ -1044,7 +1056,10 @@ export default function App() {
         // similar spot, so it's a reasonable tie-breaker on repetitive texture.
         const expectedDX = c.tiles[index].transform[2] - neighbor.transform[2];
         const expectedDY = c.tiles[index].transform[5] - neighbor.transform[5];
-        const mm = matchTiles(featNew.kp, featNew.desc, neighborFeat.kp, neighborFeat.desc, { axisLock: true, expectedDX, expectedDY });
+        const mm = matchTiles(featNew.kp, featNew.desc, neighborFeat.kp, neighborFeat.desc, {
+          axisLock: true, expectedDX, expectedDY,
+          newSmall: featNew.small, prevSmall: neighborFeat.small, tileW: w, tileH: h,
+        });
         if (mm.ok) {
           const t = matMul3(neighbor.transform, mm.H);
           if (!matchedAny) bestTransform = t;
@@ -1074,6 +1089,7 @@ export default function App() {
         renderedTy: undefined,
         _kp: featNew.kp,
         _desc: featNew.desc,
+        _small: featNew.small,
         zstack: undefined,
       };
       if (sharp.blurry) setBlurryCount((n) => n + 1);
@@ -1166,7 +1182,10 @@ export default function App() {
         // similar spot, so it's a reasonable tie-breaker on repetitive texture.
         const expectedDX = c.tiles[index].transform[2] - neighbor.transform[2];
         const expectedDY = c.tiles[index].transform[5] - neighbor.transform[5];
-        const mm = matchTiles(featNew.kp, featNew.desc, neighborFeat.kp, neighborFeat.desc, { axisLock: true, expectedDX, expectedDY });
+        const mm = matchTiles(featNew.kp, featNew.desc, neighborFeat.kp, neighborFeat.desc, {
+          axisLock: true, expectedDX, expectedDY,
+          newSmall: featNew.small, prevSmall: neighborFeat.small, tileW: w, tileH: h,
+        });
         if (mm.ok) {
           const t = matMul3(neighbor.transform, mm.H);
           if (!matchedAny) bestTransform = t;
@@ -1198,6 +1217,7 @@ export default function App() {
         renderedTy: undefined,
         _kp: featNew.kp,
         _desc: featNew.desc,
+        _small: featNew.small,
         zstack: scored.map((l) => ({ blob: l.blob, sharpness: l.sharpness })),
       };
       if (blurryFlag) setBlurryCount((n) => n + 1);
