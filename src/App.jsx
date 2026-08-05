@@ -696,7 +696,7 @@ export default function App() {
       let prevTile = c.tiles[prevIndex];
       const prevFeat = await getTileFeatures(prevTile);
       const featNew = computeFeatures(mat);
-      let m = matchTiles(featNew.kp, featNew.desc, prevFeat.kp, prevFeat.desc);
+      let m = matchTiles(featNew.kp, featNew.desc, prevFeat.kp, prevFeat.desc, { axisLock: true });
 
       // Runs the shared warm-started relaxation pass, then checks whether any
       // already-painted tile drifted enough (or enough time/tiles have passed)
@@ -983,7 +983,7 @@ export default function App() {
       const newEdges = [];
       for (const neighbor of neighbors) {
         const neighborFeat = await getTileFeatures(neighbor);
-        const mm = matchTiles(featNew.kp, featNew.desc, neighborFeat.kp, neighborFeat.desc);
+        const mm = matchTiles(featNew.kp, featNew.desc, neighborFeat.kp, neighborFeat.desc, { axisLock: true });
         if (mm.ok) {
           const t = matMul3(neighbor.transform, mm.H);
           if (!matchedAny) bestTransform = t;
@@ -1100,7 +1100,7 @@ export default function App() {
       const newEdges = [];
       for (const neighbor of neighbors) {
         const neighborFeat = await getTileFeatures(neighbor);
-        const mm = matchTiles(featNew.kp, featNew.desc, neighborFeat.kp, neighborFeat.desc);
+        const mm = matchTiles(featNew.kp, featNew.desc, neighborFeat.kp, neighborFeat.desc, { axisLock: true });
         if (mm.ok) {
           const t = matMul3(neighbor.transform, mm.H);
           if (!matchedAny) bestTransform = t;

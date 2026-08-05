@@ -153,7 +153,19 @@ export function computeSharpness(mat) {
 
 // Returns { ok, inliers, total, H? } where H is a flat 3x3 row-major array
 // mapping points from the "new" tile's pixel space into the "prev" tile's pixel space.
-export function matchTiles(kpNew, descNew, kpPrev, descPrev) {
+//
+// `axisLock`: the caller confirms the physical stage/slide only ever moves
+// along a single axis at a time (pure X or pure Y, never diagonal) between
+// the two frames being matched — true for consecutive-capture matches, but
+// NOT for anchor/loop-closure or manual relocalization matches, where the two
+// tiles can be far apart in the scan and legitimately offset on both axes.
+// When set, whichever translation component is smaller gets forced to exactly
+// zero: on a repetitive/striped texture (parallel fiber bundles, etc.), ORB
+// can alias onto a neighboring identical-looking stripe and produce a
+// plausible-looking but wrong diagonal offset with plenty of RANSAC inlier
+// support — since real motion here is axis-only by construction, any
+// off-axis component is by definition noise, not signal.
+export function matchTiles(kpNew, descNew, kpPrev, descPrev, { axisLock = false } = {}) {
   if (descNew.rows < 4 || descPrev.rows < 4) return { ok: false, inliers: 0, total: 0 };
 
   const bf = new cv.BFMatcher(cv.NORM_HAMMING, true);
@@ -233,6 +245,10 @@ export function matchTiles(kpNew, descNew, kpPrev, descPrev) {
     // findHomography already returns a full 3x3 matrix; the affine estimators
     // return 2x3, which we pad into the same 3x3 homogeneous form.
     const H = method === 'homography' ? a : [a[0], a[1], a[2], a[3], a[4], a[5], 0, 0, 1];
+    if (axisLock) {
+      if (Math.abs(H[2]) >= Math.abs(H[5])) H[5] = 0;
+      else H[2] = 0;
+    }
     result = { ok: true, inliers, total: keep.length, H };
   }
 
