@@ -166,9 +166,18 @@ export function computeSharpness(mat) {
 // do NOT agree once perpendicular displacement is required to be ~zero — so
 // they're excluded from consideration here, rather than accepted and only
 // corrected after the fact.
-function fitAxisTranslation(pts, axis, threshold) {
+function fitAxisTranslation(pts, axis, threshold, expectedT) {
   const n = pts.length;
-  let best = null;
+  // Score every seed candidate's inlier support (not just track a running
+  // best) — repetitive/striped texture reliably produces several distinct,
+  // similarly-well-supported translation clusters: the true match, plus one
+  // for each neighboring stripe it could plausibly have aliased onto, each
+  // roughly a stripe-period apart. Inlier count alone can't tell these
+  // clusters apart (an aliased cluster can legitimately out-vote the true
+  // one on very regular texture) — but recent motion history can, since a
+  // wrong-by-one-stripe offset is never close to what the last couple of
+  // steps predicted, so it's used as a tie-breaker below.
+  const candidates = [];
   for (let seed = 0; seed < n; seed++) {
     const [sx, sy, dx0, dy0] = pts[seed];
     const t = axis === 'x' ? dx0 - sx : dy0 - sy;
@@ -179,9 +188,23 @@ function fitAxisTranslation(pts, axis, threshold) {
       const perp = axis === 'x' ? dy1 - y : dx1 - x;
       if (Math.abs(perp) < threshold && Math.abs(along - t) < threshold) inliers++;
     }
-    if (!best || inliers > best.inliers) best = { inliers, t };
+    candidates.push({ t, inliers });
   }
-  if (!best) return null;
+  if (!candidates.length) return null;
+  const maxInliers = Math.max(...candidates.map((cand) => cand.inliers));
+  if (maxInliers === 0) return null;
+
+  // Candidates within this fraction of the best-supported cluster's vote
+  // count are all "plausible" fits — among those, prefer the one closest to
+  // what recent motion predicted, rather than always taking the single
+  // highest vote count.
+  const CLOSE_ENOUGH_RATIO = 0.85;
+  const pool = candidates.filter((cand) => cand.inliers >= maxInliers * CLOSE_ENOUGH_RATIO);
+  const best =
+    expectedT != null && pool.length > 1
+      ? pool.reduce((a, b) => (Math.abs(b.t - expectedT) < Math.abs(a.t - expectedT) ? b : a))
+      : pool.reduce((a, b) => (b.inliers > a.inliers ? b : a));
+
   const vals = [];
   for (let i = 0; i < n; i++) {
     const [x, y, dx1, dy1] = pts[i];
@@ -281,7 +304,16 @@ function estimateGeneralTransform(keep, kpNew, kpPrev) {
 // exactly while the hand/stage is transitioning between axes may fail to
 // match here and the scan will pause for it (see the caller's guess/
 // "just resumed" handling) rather than silently accepting a diagonal step.
-export function matchTiles(kpNew, descNew, kpPrev, descPrev, { axisLock = false } = {}) {
+//
+// `expectedDX`/`expectedDY`: the caller's best guess (typically extrapolated
+// from the last one or two real steps) of how far this step should have
+// moved along each axis. Used only to break ties among comparably-supported
+// translation candidates within fitAxisTranslation — on strongly repetitive
+// texture (parallel fiber bundles etc.) there's often more than one
+// plausible-looking offset a stripe-period apart, and inlier count alone
+// can't distinguish the real one from an aliased neighbor. Optional — pass
+// nothing and the fit falls back to plain highest-vote-count, as before.
+export function matchTiles(kpNew, descNew, kpPrev, descPrev, { axisLock = false, expectedDX = null, expectedDY = null } = {}) {
   if (descNew.rows < 4 || descPrev.rows < 4) return { ok: false, inliers: 0, total: 0 };
 
   const bf = new cv.BFMatcher(cv.NORM_HAMMING, true);
@@ -311,8 +343,8 @@ export function matchTiles(kpNew, descNew, kpPrev, descPrev, { axisLock = false 
       return [p1.x, p1.y, p2.x, p2.y];
     });
     const AXIS_THRESH_PX = 5;
-    const rx = fitAxisTranslation(pts, 'x', AXIS_THRESH_PX);
-    const ry = fitAxisTranslation(pts, 'y', AXIS_THRESH_PX);
+    const rx = fitAxisTranslation(pts, 'x', AXIS_THRESH_PX, expectedDX);
+    const ry = fitAxisTranslation(pts, 'y', AXIS_THRESH_PX, expectedDY);
     const best =
       rx && ry ? (rx.inliers >= ry.inliers ? { axis: 'x', ...rx } : { axis: 'y', ...ry })
       : rx ? { axis: 'x', ...rx }

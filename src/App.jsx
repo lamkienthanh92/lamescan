@@ -705,7 +705,16 @@ export default function App() {
       let prevTile = c.tiles[prevIndex];
       const prevFeat = await getTileFeatures(prevTile);
       const featNew = computeFeatures(mat);
-      let m = matchTiles(featNew.kp, featNew.desc, prevFeat.kp, prevFeat.desc, { axisLock: true });
+      // Best guess of this step's axis-translation magnitude, from the last
+      // real step — used only to break ties among comparably-supported
+      // candidates on repetitive texture (see matchTiles/fitAxisTranslation).
+      let expectedDX = null, expectedDY = null;
+      if (prevIndex >= 1) {
+        const prev2 = c.tiles[prevIndex - 1];
+        expectedDX = prevTile.transform[2] - prev2.transform[2];
+        expectedDY = prevTile.transform[5] - prev2.transform[5];
+      }
+      let m = matchTiles(featNew.kp, featNew.desc, prevFeat.kp, prevFeat.desc, { axisLock: true, expectedDX, expectedDY });
 
       // Runs the shared warm-started relaxation pass, then checks whether any
       // already-painted tile drifted enough (or enough time/tiles have passed)
@@ -907,75 +916,6 @@ export default function App() {
     setAutoRunning(false);
   };
 
-  // ---- new strip: start a fresh, independent chain in the same mosaic ----
-  // For a straight axis-only scan, a long chain of consecutive matches with no
-  // loop-closure has nothing to reconcile a per-step estimation error against
-  // (see the earlier drift discussion) — deliberately restarting the chain at
-  // each new row/column and letting the anchor/loop-closure mechanism (which
-  // already runs on every tile once enough tiles exist) tie the strips
-  // together avoids that entirely: each strip's own axisLock chain never gets
-  // long enough to drift, and connecting strips is a free-form (non-axis-
-  // locked) match with much more image content to work from than a single tile.
-  const startNewStrip = async () => {
-    const c = cv_.current;
-    if (!uiRef.current.capturing || c.busy || c.tiles.length === 0) return;
-    stopAuto();
-    c.busy = true;
-    try {
-      const { mat, w, h, blobPromise } = grabVideoFrame();
-
-      // Rough placeholder position — right next to the LAST tile you actually
-      // captured (not the whole mosaic's bounding box). For a zigzag/
-      // boustrophedon scan the next strip doesn't necessarily start back at
-      // the top — it starts wherever you just stopped, going up or down
-      // depending on which way the zigzag is heading — so anchoring to the
-      // most recent tile's own position is the only assumption that holds
-      // regardless of direction. Not a real match: purely so the live view
-      // shows roughly where this new strip sits relative to what's already
-      // been scanned. Anchor-search (below, already running on every tile
-      // once c.tiles.length passes ANCHOR_MIN_TILES — trivially true here
-      // since a prior strip exists) will pull it into its true position once
-      // it drags into real overlap.
-      const lastTile = c.tiles[c.tiles.length - 1];
-      const STRIP_GAP_PX = 40;
-      const transform = translateM(lastTile.bbox.maxX + STRIP_GAP_PX, lastTile.bbox.minY);
-
-      growCanvasIfNeeded(transform, w, h);
-      composite(mat, transform, w, h, c.mosaicMat);
-      paintCanvas(c.mosaicMat);
-      const blob = await blobPromise;
-      const sharp = evaluateSharpness(mat);
-      const newIndex = c.tiles.length;
-      const stripTile = {
-        transform, w, h, blob, bbox: tileBBox(transform, w, h), capturedAt: Date.now(),
-        renderedTx: transform[2], renderedTy: transform[5], sharpness: sharp.value, blurry: sharp.blurry,
-        estimated: true, // provisional placement — not yet confirmed by any match
-      };
-      c.tiles.push(stripTile);
-      persistTile(newIndex, stripTile);
-      if (sharp.blurry) setBlurryCount((n) => n + 1);
-      const feat = computeFeatures(mat);
-      stripTile._kp = feat.kp;
-      stripTile._desc = feat.desc;
-      mat.delete();
-      // Deliberately no edge added here — this tile starts a new, independent
-      // chain, disconnected from the pose graph until an anchor match (or
-      // manual positioning) ties it back to the rest of the mosaic.
-      c.activeRefIndex = newIndex;
-      c.autoFails = 0;
-      c.justResumed = true; // require one real match before this new strip's own chain starts guessing
-      c.consecutiveGuesses = 0;
-      persistMeta();
-      setTileCount(c.tiles.length);
-      setMatchInfo({
-        text: `Đã bắt đầu dải mới (ô #${newIndex + 1}) — vị trí tạm thời, sẽ tự khớp lại khi bạn quét vào vùng chồng lấn với phần đã có. Bấm "Bắt đầu ghép tự động" để tiếp tục.`,
-        kind: 'ok',
-      });
-    } finally {
-      c.busy = false;
-    }
-  };
-
   // Re-verifies a single tile against its immediate neighbors (both before and
   // after it in the sequence) and replaces it in place — no need to undo
   // everything captured after it, unlike a plain "undo last".
@@ -1099,7 +1039,12 @@ export default function App() {
       const newEdges = [];
       for (const neighbor of neighbors) {
         const neighborFeat = await getTileFeatures(neighbor);
-        const mm = matchTiles(featNew.kp, featNew.desc, neighborFeat.kp, neighborFeat.desc, { axisLock: true });
+        // Old position is still a good prior for where this tile should be
+        // relative to this neighbor — recapture usually just refines a very
+        // similar spot, so it's a reasonable tie-breaker on repetitive texture.
+        const expectedDX = c.tiles[index].transform[2] - neighbor.transform[2];
+        const expectedDY = c.tiles[index].transform[5] - neighbor.transform[5];
+        const mm = matchTiles(featNew.kp, featNew.desc, neighborFeat.kp, neighborFeat.desc, { axisLock: true, expectedDX, expectedDY });
         if (mm.ok) {
           const t = matMul3(neighbor.transform, mm.H);
           if (!matchedAny) bestTransform = t;
@@ -1216,7 +1161,12 @@ export default function App() {
       const newEdges = [];
       for (const neighbor of neighbors) {
         const neighborFeat = await getTileFeatures(neighbor);
-        const mm = matchTiles(featNew.kp, featNew.desc, neighborFeat.kp, neighborFeat.desc, { axisLock: true });
+        // Old position is still a good prior for where this tile should be
+        // relative to this neighbor — recapture usually just refines a very
+        // similar spot, so it's a reasonable tie-breaker on repetitive texture.
+        const expectedDX = c.tiles[index].transform[2] - neighbor.transform[2];
+        const expectedDY = c.tiles[index].transform[5] - neighbor.transform[5];
+        const mm = matchTiles(featNew.kp, featNew.desc, neighborFeat.kp, neighborFeat.desc, { axisLock: true, expectedDX, expectedDY });
         if (mm.ok) {
           const t = matMul3(neighbor.transform, mm.H);
           if (!matchedAny) bestTransform = t;
@@ -1602,15 +1552,6 @@ export default function App() {
               vùng đã quét trước đó, để giảm trôi tích luỹ ở các đường quét dài/zigzag.
               Ảnh ghép sẽ tự vẽ lại định kỳ khi có điều chỉnh đáng kể. Vùng ít chi tiết sẽ
               được ước lượng theo hướng di chuyển gần nhất thay vì dừng lại hỏi bạn.
-            </div>
-            <div style={{ height: 8 }} />
-            <button onClick={startNewStrip} disabled={!cvReady || !capturing || tileCount === 0}>
-              Dải mới (đổi hướng quét)
-            </button>
-            <div className="note" style={{ marginTop: 6 }}>
-              Dùng khi bạn sắp đổi trục quét (vd hết 1 cột theo Y, chuẩn bị quét cột X mới).
-              App đặt 1 ô mốc mới ở vị trí tạm bên cạnh phần đã quét, rồi bạn quét tiếp dải
-              mới bình thường — dải mới sẽ tự "hút" vào đúng vị trí khi chồng lấn phần cũ.
             </div>
           </div>
 
