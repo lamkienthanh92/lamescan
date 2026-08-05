@@ -28,6 +28,95 @@ function detectMethod() {
   return cachedMethod;
 }
 
+// Tries to find the bright, in-focus viewing area inside a microscope
+// eyepiece/camera frame that has a dark vignette ring around it, and returns
+// the largest axis-aligned rectangle that sits safely inside it — a sensible
+// default crop box so the vignette itself never reaches feature detection.
+//
+// Deliberately simple (brightness-profile scan, not contour/circle fitting):
+// microscope halos are large, low-frequency, and roughly frame-centered, so a
+// coarse scan is both fast and robust to whatever noise/texture sits inside
+// the true viewing circle. Returns null when the frame doesn't look vignetted
+// at all (plain webcam/screen content), so nothing is auto-cropped by mistake.
+export function detectVignetteRect(mat) {
+  const gray = new cv.Mat();
+  cv.cvtColor(mat, gray, cv.COLOR_RGBA2GRAY);
+  const w = gray.cols;
+  const h = gray.rows;
+  const data = gray.data;
+
+  const patch = Math.max(4, Math.round(Math.min(w, h) * 0.03));
+  const avgPatch = (cx, cy) => {
+    let sum = 0, n = 0;
+    const y0 = Math.max(0, cy - patch), y1 = Math.min(h, cy + patch);
+    const x0 = Math.max(0, cx - patch), x1 = Math.min(w, cx + patch);
+    for (let y = y0; y < y1; y++) for (let x = x0; x < x1; x++) { sum += data[y * w + x]; n++; }
+    return n ? sum / n : 0;
+  };
+
+  const centerAvg = avgPatch(w >> 1, h >> 1);
+  const cornerAvg =
+    (avgPatch(0, 0) + avgPatch(w - 1, 0) + avgPatch(0, h - 1) + avgPatch(w - 1, h - 1)) / 4;
+
+  // No clear dark-corner / bright-center contrast → this isn't a vignetted
+  // frame, so don't force a crop on it.
+  if (centerAvg - cornerAvg < 25) {
+    gray.delete();
+    return null;
+  }
+  const thresh = (centerAvg + cornerAvg) / 2;
+
+  // Brightness profile along the horizontal/vertical center bands, so a few
+  // dark or bright specks inside the frame don't skew a single-pixel scan.
+  const bandH = Math.max(1, Math.round(h * 0.1));
+  const yStart = Math.max(0, Math.floor(h / 2 - bandH / 2));
+  const yEnd = Math.min(h, yStart + bandH);
+  const colProfile = new Float64Array(w);
+  for (let x = 0; x < w; x++) {
+    let s = 0;
+    for (let y = yStart; y < yEnd; y++) s += data[y * w + x];
+    colProfile[x] = s / (yEnd - yStart);
+  }
+
+  const bandW = Math.max(1, Math.round(w * 0.1));
+  const xStart = Math.max(0, Math.floor(w / 2 - bandW / 2));
+  const xEnd = Math.min(w, xStart + bandW);
+  const rowProfile = new Float64Array(h);
+  for (let y = 0; y < h; y++) {
+    let s = 0;
+    for (let x = xStart; x < xEnd; x++) s += data[y * w + x];
+    rowProfile[y] = s / (xEnd - xStart);
+  }
+
+  const findEdge = (profile, fromStart) => {
+    const n = profile.length;
+    if (fromStart) {
+      for (let i = 0; i < n; i++) if (profile[i] > thresh) return i;
+      return 0;
+    }
+    for (let i = n - 1; i >= 0; i--) if (profile[i] > thresh) return i;
+    return n - 1;
+  };
+
+  let left = findEdge(colProfile, true);
+  let right = findEdge(colProfile, false);
+  let top = findEdge(rowProfile, true);
+  let bottom = findEdge(rowProfile, false);
+  gray.delete();
+
+  // Sanity check: if the detected "bright area" is tiny, the scan probably
+  // got fooled by something other than a real vignette — bail rather than
+  // handing back a near-empty crop.
+  if (right - left < w * 0.3 || bottom - top < h * 0.3) return null;
+
+  // Shrink inward a bit: the halo's edge is a soft gradient, not a hard line.
+  const shrinkX = Math.round((right - left) * 0.04);
+  const shrinkY = Math.round((bottom - top) * 0.04);
+  left += shrinkX; right -= shrinkX; top += shrinkY; bottom -= shrinkY;
+
+  return { x: left, y: top, w: right - left, h: bottom - top };
+}
+
 export function computeFeatures(mat) {
   const gray = new cv.Mat();
   cv.cvtColor(mat, gray, cv.COLOR_RGBA2GRAY);

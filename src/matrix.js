@@ -20,6 +20,39 @@ export function applyH(M, x, y) {
   return [(M[0] * x + M[1] * y + M[2]) / w, (M[3] * x + M[4] * y + M[5]) / w];
 }
 
+// -- Rotation/scale helpers for similarity transforms (M is assumed to carry
+// no shear/perspective in its linear part: indices 0,1,3,4 = scale*[[cos,-sin],[sin,cos]]).
+
+export function angleOf(M) {
+  return Math.atan2(M[3], M[0]);
+}
+
+export function scaleOf(M) {
+  return Math.hypot(M[0], M[3]);
+}
+
+// Rewrites just the rotation+scale part of M (indices 0,1,3,4) in place from an
+// angle/scale pair, leaving translation (2,5) and the bottom row untouched.
+export function setLinear(M, angle, scale) {
+  const c = Math.cos(angle) * scale;
+  const s = Math.sin(angle) * scale;
+  M[0] = c; M[1] = -s;
+  M[3] = s; M[4] = c;
+}
+
+// Applies just the linear (rotation+scale) part of M to a vector — no translation.
+export function applyLinear(M, x, y) {
+  return [M[0] * x + M[1] * y, M[3] * x + M[4] * y];
+}
+
+// Inverse of applyLinear: given a world-space vector, returns it expressed in
+// M's own (unrotated, unscaled) local frame.
+export function applyInverseLinear(M, x, y) {
+  const scale2 = M[0] * M[0] + M[3] * M[3];
+  if (!scale2) return [0, 0];
+  return [(M[0] * x + M[3] * y) / scale2, (M[1] * x + M[4] * y) / scale2];
+}
+
 export function cornersOf(M, w, h) {
   return [applyH(M, 0, 0), applyH(M, w, 0), applyH(M, w, h), applyH(M, 0, h)];
 }

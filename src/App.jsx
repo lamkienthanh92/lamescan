@@ -2,8 +2,8 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
 import JSZip from 'jszip';
 import './App.css';
-import { IDENT, matMul3, translateM, cornersOf, bboxOf, findAnchorTile } from './matrix.js';
-import { computeFeatures, matchTiles, computeSharpness } from './cvMatch.js';
+import { IDENT, matMul3, translateM, cornersOf, bboxOf, findAnchorTile, angleOf, applyInverseLinear } from './matrix.js';
+import { computeFeatures, matchTiles, computeSharpness, detectVignetteRect } from './cvMatch.js';
 import { addEdge, removeEdgesForTile, relax, maxRenderedDrift } from './graph.js';
 import * as db from './db.js';
 
@@ -87,6 +87,7 @@ export default function App() {
   const [dragRect, setDragRect] = useState(null); // {x,y,w,h} in container CSS px — live drag feedback
   const [resumePrompt, setResumePrompt] = useState(null); // {count} | null
   const [blurryCount, setBlurryCount] = useState(0);
+  const [cropAuto, setCropAuto] = useState(false); // true when the current cropBox came from auto-vignette-detection
   const [showTilePanel, setShowTilePanel] = useState(false);
   const [tilePanelShowAll, setTilePanelShowAll] = useState(false);
   const [tilePanelVersion, setTilePanelVersion] = useState(0); // bump to force the panel list to re-render
@@ -426,6 +427,7 @@ export default function App() {
         streamRef.current = null;
       });
       setCapturing(true);
+      detectVignetteOnStart();
     } catch (e) {
       setMatchInfo({ text: 'Không thể bắt đầu ghi màn hình: ' + e.message, kind: 'warn' });
     }
@@ -436,6 +438,34 @@ export default function App() {
     if (streamRef.current) streamRef.current.getTracks().forEach((t) => t.stop());
     streamRef.current = null;
     setCapturing(false);
+  };
+
+  // Waits for the shared window's video to actually have frames, then runs
+  // vignette detection once and prefills the crop box — only if the user
+  // hasn't already dragged a manual crop in the meantime.
+  const detectVignetteOnStart = () => {
+    let attempts = 0;
+    const tryDetect = () => {
+      const v = videoRef.current;
+      if (cropRef.current) return; // user already picked one manually — don't override
+      if (!v || !v.videoWidth) {
+        if (attempts++ < 120) requestAnimationFrame(tryDetect); // ~2s ceiling at 60fps
+        return;
+      }
+      const wc = document.createElement('canvas');
+      wc.width = v.videoWidth;
+      wc.height = v.videoHeight;
+      wc.getContext('2d').drawImage(v, 0, 0);
+      const mat = cv.imread(wc);
+      const rect = detectVignetteRect(mat);
+      mat.delete();
+      if (rect && !cropRef.current) {
+        cropRef.current = rect;
+        setCropBox(rect);
+        setCropAuto(true);
+      }
+    };
+    requestAnimationFrame(tryDetect);
   };
 
   // ---- crop region selection (drag directly on the live preview) ----
@@ -474,6 +504,7 @@ export default function App() {
     if (box.w > 20 && box.h > 20) {
       cropRef.current = box;
       setCropBox(box);
+      setCropAuto(false);
     }
     setDragRect(null);
   };
@@ -481,6 +512,7 @@ export default function App() {
   const clearCrop = () => {
     cropRef.current = null;
     setCropBox(null);
+    setCropAuto(false);
   };
 
   // Overlay rect (CSS px) representing the currently-locked crop box, recomputed
@@ -600,7 +632,11 @@ export default function App() {
             persistTile(newIndex, guessTile);
             if (sharp.blurry) setBlurryCount((n) => n + 1);
             // Low-weight edge: a rough guess, easily outweighed by any real match later.
-            addEdge(c.edges, c.adjacency, prevIndex, newIndex, dx, dy, GUESS_EDGE_WEIGHT);
+            // dx/dy were extrapolated in world space, so convert into prevTile's own
+            // local frame to match what real edges store; dtheta=0 since a guess
+            // assumes no rotation change.
+            const [gdx, gdy] = applyInverseLinear(prevTile.transform, dx, dy);
+            addEdge(c.edges, c.adjacency, prevIndex, newIndex, gdx, gdy, 0, GUESS_EDGE_WEIGHT);
             persistMeta();
             c.autoFails = 0;
             c.activeRefIndex = newIndex;
@@ -651,7 +687,9 @@ export default function App() {
       newTile._desc = featNew.desc;
       persistTile(newIndex, newTile);
       if (sharp.blurry) setBlurryCount((n) => n + 1);
-      addEdge(c.edges, c.adjacency, prevIndex, newIndex, transform[2] - prevTile.transform[2], transform[5] - prevTile.transform[5], m.inliers);
+      // m.H is already the local match: new tile's offset/rotation expressed in
+      // prevTile's own frame — exactly what the pose graph edge should store.
+      addEdge(c.edges, c.adjacency, prevIndex, newIndex, m.H[2], m.H[5], angleOf(m.H), m.inliers);
       mat.delete();
       c.autoFails = 0;
       c.activeRefIndex = newIndex;
@@ -669,11 +707,8 @@ export default function App() {
           const anchorFeat = await getTileFeatures(anchor);
           const am = matchTiles(featNew.kp, featNew.desc, anchorFeat.kp, anchorFeat.desc);
           if (am.ok) {
-            const anchorTransform = matMul3(anchor.transform, am.H);
-            addEdge(
-              c.edges, c.adjacency, anchorIndex, newIndex,
-              anchorTransform[2] - anchor.transform[2], anchorTransform[5] - anchor.transform[5], am.inliers
-            );
+            // Same as the chain edge above: am.H is already local to the anchor's frame.
+            addEdge(c.edges, c.adjacency, anchorIndex, newIndex, am.H[2], am.H[5], angleOf(am.H), am.inliers);
             usedAnchor = true;
           }
         }
@@ -801,7 +836,7 @@ export default function App() {
       newTile._desc = featNew.desc;
       persistTile(newIndex, newTile);
       if (sharp.blurry) setBlurryCount((n) => n + 1);
-      addEdge(c.edges, c.adjacency, best.index, newIndex, transform[2] - refTile.transform[2], transform[5] - refTile.transform[5], best.m.inliers);
+      addEdge(c.edges, c.adjacency, best.index, newIndex, best.m.H[2], best.m.H[5], angleOf(best.m.H), best.m.inliers);
       persistMeta();
       c.autoFails = 0;
       c.activeRefIndex = newIndex; // continuous scanning will now chain from here
@@ -846,13 +881,13 @@ export default function App() {
           if (!matchedAny) bestTransform = t;
           matchedAny = true;
           const neighborIndex = c.tiles.indexOf(neighbor);
-          newEdges.push({ a: neighborIndex, b: index, dx: t[2] - neighbor.transform[2], dy: t[5] - neighbor.transform[5], w: mm.inliers });
+          newEdges.push({ a: neighborIndex, b: index, dx: mm.H[2], dy: mm.H[5], dtheta: angleOf(mm.H), w: mm.inliers });
         }
       }
 
       const blob = await blobPromise;
       removeEdgesForTile(c.edges, c.adjacency, index);
-      for (const e of newEdges) addEdge(c.edges, c.adjacency, e.a, e.b, e.dx, e.dy, e.w);
+      for (const e of newEdges) addEdge(c.edges, c.adjacency, e.a, e.b, e.dx, e.dy, e.dtheta, e.w);
 
       const oldTile = c.tiles[index];
       if (oldTile.blurry) setBlurryCount((n) => Math.max(0, n - 1));
@@ -963,12 +998,12 @@ export default function App() {
           if (!matchedAny) bestTransform = t;
           matchedAny = true;
           const neighborIndex = c.tiles.indexOf(neighbor);
-          newEdges.push({ a: neighborIndex, b: index, dx: t[2] - neighbor.transform[2], dy: t[5] - neighbor.transform[5], w: mm.inliers });
+          newEdges.push({ a: neighborIndex, b: index, dx: mm.H[2], dy: mm.H[5], dtheta: angleOf(mm.H), w: mm.inliers });
         }
       }
 
       removeEdgesForTile(c.edges, c.adjacency, index);
-      for (const e of newEdges) addEdge(c.edges, c.adjacency, e.a, e.b, e.dx, e.dy, e.w);
+      for (const e of newEdges) addEdge(c.edges, c.adjacency, e.a, e.b, e.dx, e.dy, e.dtheta, e.w);
 
       const oldTile = c.tiles[index];
       if (oldTile.blurry) setBlurryCount((n) => Math.max(0, n - 1));
@@ -1177,7 +1212,11 @@ export default function App() {
       c.edges = [];
       c.adjacency = [];
       for (let i = 1; i < tiles.length; i++) {
-        addEdge(c.edges, c.adjacency, i - 1, i, tiles[i].transform[2] - tiles[i - 1].transform[2], tiles[i].transform[5] - tiles[i - 1].transform[5], 20);
+        const worldDx = tiles[i].transform[2] - tiles[i - 1].transform[2];
+        const worldDy = tiles[i].transform[5] - tiles[i - 1].transform[5];
+        const [ldx, ldy] = applyInverseLinear(tiles[i - 1].transform, worldDx, worldDy);
+        const dtheta = angleOf(tiles[i].transform) - angleOf(tiles[i - 1].transform);
+        addEdge(c.edges, c.adjacency, i - 1, i, ldx, ldy, dtheta, 20);
       }
       freeAllTileFeatures(c.tiles);
       c.tiles = tiles;
@@ -1294,8 +1333,9 @@ export default function App() {
                   </button>
                 </div>
                 <div className="note" style={{ marginTop: 6 }}>
-                  Kéo chuột trực tiếp trên khung xem trước để chọn 1 vùng nhỏ cần quét
-                  (không bắt buộc dùng cả cửa sổ). Không chọn gì thì dùng toàn khung.
+                  {cropAuto && cropBox
+                    ? 'Đã tự động chọn vùng nhìn (loại bỏ viền tối quanh thị kính) — kéo chuột lại nếu cần chỉnh.'
+                    : 'Kéo chuột trực tiếp trên khung xem trước để chọn 1 vùng nhỏ cần quét (không bắt buộc dùng cả cửa sổ). Không chọn gì thì dùng toàn khung.'}
                 </div>
               </>
             )}
