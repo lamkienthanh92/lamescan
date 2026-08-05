@@ -151,20 +151,61 @@ export function computeSharpness(mat) {
   return variance;
 }
 
+// Exhaustive (not random-sampled — the point count is capped low enough that
+// this is cheap and deterministic) 1-parameter robust fit for "pure
+// translation along one fixed axis, no rotation/scale": tries every point's
+// own along-axis offset as a candidate translation, keeps whichever explains
+// the most *other* points within `threshold` on both the along-axis residual
+// and the (should-be-near-zero) perpendicular residual, then refines with
+// the median over that inlier set.
+//
+// This is the actual fix for repetitive-texture aliasing (parallel fiber
+// bundles etc.): a cluster of points mismatched onto a neighboring identical
+// stripe all agree with each other under a free rotation+scale+XY model (so
+// general RANSAC accepts them as a large, "confident" inlier set), but they
+// do NOT agree once perpendicular displacement is required to be ~zero — so
+// they're excluded from consideration here, rather than accepted and only
+// corrected after the fact.
+function fitAxisTranslation(pts, axis, threshold) {
+  const n = pts.length;
+  let best = null;
+  for (let seed = 0; seed < n; seed++) {
+    const [sx, sy, dx0, dy0] = pts[seed];
+    const t = axis === 'x' ? dx0 - sx : dy0 - sy;
+    let inliers = 0;
+    for (let i = 0; i < n; i++) {
+      const [x, y, dx1, dy1] = pts[i];
+      const along = axis === 'x' ? dx1 - x : dy1 - y;
+      const perp = axis === 'x' ? dy1 - y : dx1 - x;
+      if (Math.abs(perp) < threshold && Math.abs(along - t) < threshold) inliers++;
+    }
+    if (!best || inliers > best.inliers) best = { inliers, t };
+  }
+  if (!best) return null;
+  const vals = [];
+  for (let i = 0; i < n; i++) {
+    const [x, y, dx1, dy1] = pts[i];
+    const along = axis === 'x' ? dx1 - x : dy1 - y;
+    const perp = axis === 'x' ? dy1 - y : dx1 - x;
+    if (Math.abs(perp) < threshold && Math.abs(along - best.t) < threshold) vals.push(along);
+  }
+  vals.sort((a, b) => a - b);
+  return { inliers: best.inliers, t: vals.length ? vals[Math.floor(vals.length / 2)] : best.t };
+}
+
 // Returns { ok, inliers, total, H? } where H is a flat 3x3 row-major array
 // mapping points from the "new" tile's pixel space into the "prev" tile's pixel space.
 //
 // `axisLock`: the caller confirms the physical stage/slide only ever moves
-// along a single axis at a time (pure X or pure Y, never diagonal) between
-// the two frames being matched — true for consecutive-capture matches, but
-// NOT for anchor/loop-closure or manual relocalization matches, where the two
-// tiles can be far apart in the scan and legitimately offset on both axes.
-// When set, whichever translation component is smaller gets forced to exactly
-// zero: on a repetitive/striped texture (parallel fiber bundles, etc.), ORB
-// can alias onto a neighboring identical-looking stripe and produce a
-// plausible-looking but wrong diagonal offset with plenty of RANSAC inlier
-// support — since real motion here is axis-only by construction, any
-// off-axis component is by definition noise, not signal.
+// along a single axis at a time (pure X or pure Y, never diagonal, and no
+// rotation) between the two frames being matched — true for consecutive-
+// capture matches, but NOT for anchor/loop-closure or manual relocalization
+// matches, where the two tiles can be far apart in the scan and legitimately
+// offset/rotated relative to each other. When set, this bypasses the general
+// similarity-transform RANSAC entirely and fits a constrained "translation
+// along one fixed axis only" model instead (see fitAxisTranslation above) —
+// baking the axis-only, non-rotating assumption into which points get to
+// vote as inliers in the first place, not just clamping the result afterward.
 export function matchTiles(kpNew, descNew, kpPrev, descPrev, { axisLock = false } = {}) {
   if (descNew.rows < 4 || descPrev.rows < 4) return { ok: false, inliers: 0, total: 0 };
 
@@ -185,6 +226,32 @@ export function matchTiles(kpNew, descNew, kpPrev, descPrev, { axisLock = false 
   // (rather than up to 60% of all of them) keeps obviously-bad far-distance
   // matches out of the pool RANSAC has to sift through.
   const keep = arr.slice(0, Math.min(200, Math.max(20, Math.floor(n * 0.5))));
+
+  if (axisLock) {
+    const pts = keep.map((m) => {
+      const p1 = kpNew.get(m.queryIdx).pt;
+      const p2 = kpPrev.get(m.trainIdx).pt;
+      return [p1.x, p1.y, p2.x, p2.y];
+    });
+    bf.delete();
+    matches.delete();
+    const AXIS_THRESH_PX = 5;
+    const rx = fitAxisTranslation(pts, 'x', AXIS_THRESH_PX);
+    const ry = fitAxisTranslation(pts, 'y', AXIS_THRESH_PX);
+    const best =
+      rx && ry ? (rx.inliers >= ry.inliers ? { axis: 'x', ...rx } : { axis: 'y', ...ry })
+      : rx ? { axis: 'x', ...rx }
+      : ry ? { axis: 'y', ...ry }
+      : null;
+    const ratio = best ? best.inliers / pts.length : 0;
+    // Same acceptance bar as the general path below, for consistent behavior.
+    if (!best || best.inliers < 15 || ratio < 0.25) {
+      return { ok: false, inliers: best ? best.inliers : 0, total: pts.length };
+    }
+    const H =
+      best.axis === 'x' ? [1, 0, best.t, 0, 1, 0, 0, 0, 1] : [1, 0, 0, 0, 1, best.t, 0, 0, 1];
+    return { ok: true, inliers: best.inliers, total: pts.length, H };
+  }
 
   const src = [];
   const dst = [];
@@ -245,10 +312,6 @@ export function matchTiles(kpNew, descNew, kpPrev, descPrev, { axisLock = false 
     // findHomography already returns a full 3x3 matrix; the affine estimators
     // return 2x3, which we pad into the same 3x3 homogeneous form.
     const H = method === 'homography' ? a : [a[0], a[1], a[2], a[3], a[4], a[5], 0, 0, 1];
-    if (axisLock) {
-      if (Math.abs(H[2]) >= Math.abs(H[5])) H[5] = 0;
-      else H[2] = 0;
-    }
     result = { ok: true, inliers, total: keep.length, H };
   }
 
