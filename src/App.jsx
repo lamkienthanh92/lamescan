@@ -17,6 +17,7 @@ const ANCHOR_MIN_TILES = ANCHOR_EXCLUDE_COUNT + 2;
 const EXTRAPOLATE_MIN_PX = 3; // minimum recent motion before it's worth extrapolating a guess
 const RELAX_ITERS_PER_TICK = 6; // small warm-started relaxation pass, run every tick
 const GUESS_EDGE_WEIGHT = 1; // low confidence for extrapolated (unmatched) placements
+const MAX_CONSECUTIVE_GUESSES = 2; // stop auto-accepting guesses after this many in a row without a real match confirming them
 const REBUILD_DRIFT_PX = 6; // repaint the mosaic once any already-painted tile drifts this much
 const REBUILD_MIN_TILES = 25; // ...but don't repaint more often than every N new tiles
 const REBUILD_MAX_MS = 8000; // ...or longer than this since the last repaint, if dirty
@@ -123,6 +124,8 @@ export default function App() {
     lastRebuildTime: 0,
     sharpnessHistory: [],
     activeRefIndex: null, // set by manual "confirm target" positioning; overrides the default "chain from last tile"
+    justResumed: false, // true right after (re)starting auto-match — requires one real match before guessing is allowed again
+    consecutiveGuesses: 0, // extrapolated (unmatched) placements in a row since the last real match
   });
 
   const uiRef = useRef({ cvReady: false, capturing: false });
@@ -713,9 +716,16 @@ export default function App() {
       };
 
       if (!m.ok) {
-        // Low-texture / motion-blur frame — guess from recent motion instead of stopping.
+        // Low-texture / motion-blur frame — normally guess from recent motion
+        // instead of stopping. But right after a pause (justResumed) or after
+        // several guesses in a row with no real match confirming them, the
+        // "recent motion" we'd extrapolate from is no longer trustworthy —
+        // the physical position could be anywhere — so require a genuine
+        // match before placing anything in that situation instead of risking
+        // a bad anchor that every later tile then chains from.
         let usedGuess = false;
-        if (c.tiles.length >= 2) {
+        const guessAllowed = !c.justResumed && c.consecutiveGuesses < MAX_CONSECUTIVE_GUESSES;
+        if (guessAllowed && c.tiles.length >= 2) {
           const prev2 = c.tiles[prevIndex - 1];
           const dx = prevTile.transform[2] - prev2.transform[2];
           const dy = prevTile.transform[5] - prev2.transform[5];
@@ -747,6 +757,7 @@ export default function App() {
             addEdge(c.edges, c.adjacency, prevIndex, newIndex, gdx, gdy, 0, GUESS_EDGE_WEIGHT);
             persistMeta();
             c.autoFails = 0;
+            c.consecutiveGuesses += 1;
             c.activeRefIndex = newIndex;
             await relaxAndMaybeRebuild();
             setTileCount(c.tiles.length);
@@ -760,6 +771,10 @@ export default function App() {
           c.autoFails += 1;
           if (m.unsupported) {
             setMatchInfo({ text: 'Trình duyệt/bản OpenCV.js hiện tại thiếu hàm cần thiết để so khớp ảnh — không thể ghép tự động. Thử lại bằng Chrome/Edge bản mới nhất.', kind: 'warn' });
+          } else if (c.justResumed) {
+            setMatchInfo({ text: 'Chưa khớp lại được sau khi tiếp tục — đưa tiêu bản về gần vị trí ô cuối cùng đã chụp (xem "Ô đã chụp"), hoặc dùng "Định vị thủ công".', kind: 'warn' });
+          } else if (!guessAllowed) {
+            setMatchInfo({ text: 'Mất khớp nhiều lần liên tiếp — dừng tự ước lượng để tránh lệch chồng chất. Kéo chậm lại hoặc dùng "Định vị thủ công" để khớp lại.', kind: 'warn' });
           } else if (c.autoFails >= AUTO_FAIL_WARN) {
             setMatchInfo({ text: 'Mất khớp liên tục — kéo chậm lại một chút để lấy nét ổn định.', kind: 'warn' });
           }
@@ -767,6 +782,11 @@ export default function App() {
         mat.delete();
         return;
       }
+
+      // A genuine match against the current reference — whatever pause or
+      // string of guesses came before is now confirmed resolved.
+      c.justResumed = false;
+      c.consecutiveGuesses = 0;
 
       const moveMag = Math.hypot(m.H[2], m.H[5]);
       const threshold = Math.max(AUTO_MOVE_MIN_PX, w * AUTO_MOVE_MIN_RATIO);
@@ -844,8 +864,21 @@ export default function App() {
 
   const startAuto = () => {
     if (autoTimerRef.current || !uiRef.current.capturing) return;
-    cv_.current.autoFails = 0;
-    setMatchInfo({ text: 'Đang ghép tự động — kéo tiêu bản dưới kính hiển vi.', kind: 'ok' });
+    const c = cv_.current;
+    c.autoFails = 0;
+    // Require one genuine feature match before any extrapolated "guess"
+    // placement is allowed — after a pause, the slide/lens may have moved
+    // arbitrarily far from the last captured tile, so trusting the pre-pause
+    // motion to extrapolate a new position is unsafe and can plant a wrong
+    // tile that everything afterward then chains from.
+    c.justResumed = true;
+    c.consecutiveGuesses = 0;
+    setMatchInfo({
+      text: c.tiles.length > 1
+        ? 'Đang tiếp tục — đưa tiêu bản về gần vị trí ô cuối cùng đã chụp để khớp lại.'
+        : 'Đang ghép tự động — kéo tiêu bản dưới kính hiển vi.',
+      kind: 'ok',
+    });
     autoTimerRef.current = setInterval(() => {
       autoTickRef.current();
     }, AUTO_INTERVAL_MS);
