@@ -265,22 +265,22 @@ function estimateGeneralTransform(keep, kpNew, kpPrev) {
 // Returns { ok, inliers, total, H? } where H is a flat 3x3 row-major array
 // mapping points from the "new" tile's pixel space into the "prev" tile's pixel space.
 //
-// `axisLock`: the caller confirms the physical stage/slide *normally* moves
+// `axisLock`: the caller guarantees the physical stage/slide only ever moves
 // along a single axis at a time (pure X or pure Y, never diagonal, and no
 // rotation) between the two frames being matched — true for consecutive-
 // capture matches, but NOT for anchor/loop-closure or manual relocalization
 // matches, where the two tiles can be far apart in the scan and legitimately
-// offset/rotated relative to each other. When set, this first tries fitting a
-// constrained "translation along one fixed axis only" model (see
-// fitAxisTranslation above) — baking the axis-only assumption into which
-// points get to vote as inliers in the first place, which is what actually
-// defeats repetitive-texture aliasing, not just clamping the result after.
-// If NEITHER axis fits well, this falls back to the general unconstrained fit
-// for that one match — the moment of switching from scanning along Y to
-// scanning along X inherently produces one or two genuinely diagonal frames
-// while the hand/stage is mid-turn, and hard-rejecting those would stall the
-// whole scan waiting for a manual fix instead of just accepting that one
-// transitional step as the (real, if temporarily off-axis) motion it is.
+// offset/rotated relative to each other. When set, this fits a constrained
+// "translation along one fixed axis only" model (see fitAxisTranslation
+// above) — baking the axis-only assumption into which points get to vote as
+// inliers in the first place, which is what actually defeats repetitive-
+// texture aliasing, not just clamping the result after the fact. If neither
+// axis fits well, the match is rejected outright (ok: false) rather than
+// falling back to an unconstrained fit — every accepted axisLock match is
+// guaranteed pure X or pure Y, no exceptions. In exchange, a frame captured
+// exactly while the hand/stage is transitioning between axes may fail to
+// match here and the scan will pause for it (see the caller's guess/
+// "just resumed" handling) rather than silently accepting a diagonal step.
 export function matchTiles(kpNew, descNew, kpPrev, descPrev, { axisLock = false } = {}) {
   if (descNew.rows < 4 || descPrev.rows < 4) return { ok: false, inliers: 0, total: 0 };
 
@@ -319,15 +319,12 @@ export function matchTiles(kpNew, descNew, kpPrev, descPrev, { axisLock = false 
       : ry ? { axis: 'y', ...ry }
       : null;
     const ratio = best ? best.inliers / pts.length : 0;
-    if (best && best.inliers >= 15 && ratio >= 0.25) {
-      const H =
-        best.axis === 'x' ? [1, 0, best.t, 0, 1, 0, 0, 0, 1] : [1, 0, 0, 0, 1, best.t, 0, 0, 1];
-      return { ok: true, inliers: best.inliers, total: pts.length, H };
+    if (!best || best.inliers < 15 || ratio < 0.25) {
+      return { ok: false, inliers: best ? best.inliers : 0, total: pts.length };
     }
-    // Neither pure axis explains the motion well — likely a genuine
-    // direction-change frame. Fall back to the unconstrained fit rather than
-    // rejecting outright.
-    return estimateGeneralTransform(keep, kpNew, kpPrev);
+    const H =
+      best.axis === 'x' ? [1, 0, best.t, 0, 1, 0, 0, 0, 1] : [1, 0, 0, 0, 1, best.t, 0, 0, 1];
+    return { ok: true, inliers: best.inliers, total: pts.length, H };
   }
 
   return estimateGeneralTransform(keep, kpNew, kpPrev);
