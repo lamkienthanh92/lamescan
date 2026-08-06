@@ -2,25 +2,29 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
 import JSZip from 'jszip';
 import './App.css';
-import { toMatchGray, estimateShift, sharpnessOf, borderIsDark, detectFieldRect } from './align.js';
+import { toMatchGray, estimateShift, sharpnessOf, borderIsDark, detectFieldRect, PATCH_CENTERS } from './align.js';
 import * as M from './mosaic.js';
 import * as db from './db.js';
 
 const TICK_MS = 200;          // how often a frame is sampled
-const MIN_SCORE = 0.35;       // correlation below this isn't a measurement
+const MIN_SCORE = 0.32;       // a single patch scoring below this isn't a measurement
+const LOST_AFTER = 4;         // consecutive unlocated frames before saying so plainly
+const AGREE_TOL_PX = 6;       // how close two patches must land to count as agreeing
+const MIN_AGREE = 2;          // patches that must agree before a frame is accepted
 const MIN_STEP_PX = 12;       // don't record a tile until the picture has actually moved
-const STEP_FRAC = 0.10;       // ...or this fraction of the frame, whichever is larger
+const STEP_FRAC = 0.08;       // ...or this fraction of the frame, whichever is larger
+// Patch size as a fraction of the capture region. Deliberately small: the point
+// of the patch is to contain specimen and nothing else, and anything large enough
+// to be individually convincing is large enough to reach the stationary fixtures
+// (halo, dust, overlay) that make the tracker report zero movement.
+const PATCH_MIN = 0.04;
+const PATCH_MAX = 0.18;
+const PATCH_DEFAULT = 0.08;
 const BLUR_HISTORY = 30;
 const BLUR_MIN_SAMPLES = 5;
 const BLUR_RATIO = 0.4;
 const DIAG_SIZE = 16;
 const CV_TIMEOUT_MS = 25000;
-
-const PATCH_PRESETS = [
-  { key: 0.22, label: 'Nhỏ (22%)', note: 'Tầm với xa nhất (±39% khung/bước), an toàn nhất với viền halo. Cần vùng có chi tiết.' },
-  { key: 0.30, label: 'Vừa (30%)', note: 'Cân bằng: ±35% khung mỗi bước, đủ nội dung để điểm khớp ổn định.' },
-  { key: 0.42, label: 'Lớn (42%)', note: 'Điểm khớp chắc nhất trên vùng thưa chi tiết, nhưng chỉ còn ±29% khung và dễ chạm viền.' },
-];
 
 function fmt(n) {
   return (n >= 0 ? '+' : '') + Math.round(n);
@@ -58,13 +62,15 @@ export default function App() {
   const [status, setStatus] = useState({ text: 'Chưa bắt đầu.', kind: 'idle' });
   const [cropBox, setCropBox] = useState(null);
   const [dragRect, setDragRect] = useState(null);
-  const [patchFrac, setPatchFrac] = useState(0.30);
+  const [patchFrac, setPatchFrac] = useState(PATCH_DEFAULT);
   const [diag, setDiag] = useState([]);
   const [blurry, setBlurry] = useState(0);
   const [resume, setResume] = useState(null);
   const [borderWarn, setBorderWarn] = useState(false);
   const [busyLabel, setBusyLabel] = useState(null);
   const [showTiles, setShowTiles] = useState(false);
+  const [patchPx, setPatchPx] = useState(0);
+  const [lost, setLost] = useState(false);
 
   const videoRef = useRef(null);
   const previewRef = useRef(null);
@@ -74,15 +80,32 @@ export default function App() {
   const timerRef = useRef(null);
   const cropRef = useRef(null);
   const dragStart = useRef(null);
-  const patchRef = useRef(0.30);
+  const patchRef = useRef(PATCH_DEFAULT);
   useEffect(() => { patchRef.current = patchFrac; }, [patchFrac]);
 
   const S = useRef({
     mosaic: null,
     scale: 1,          // mosaic px -> display canvas px
     tiles: [],         // { x, y, w, h, blob, sharpness, blurry, capturedAt }
-    refGray: null,     // grayscale copy of the last accepted frame
-    refScale: 1,       // original crop px -> refGray px
+    // TWO reference frames, not one.
+    //
+    // refTile is the last frame that actually became a tile — the accurate
+    // anchor, because measuring against it involves no accumulation.
+    // refPrev is simply the previous frame, accepted or not.
+    //
+    // With only refTile, a displacement larger than a patch's reach makes every
+    // patch peak at the edge of its search area, the frame is discarded, and
+    // because the reference only updates when a tile is accepted, THE REFERENCE
+    // NEVER MOVES. The scan then sits still permanently — not until the next
+    // frame, but until the slide is dragged back into overlap with a tile placed
+    // however long ago. A single jolt past the reach ends the session, and
+    // reversing an axis (mechanical backlash, a knock as you change hands) is
+    // exactly where that jolt happens.
+    //
+    // refPrev is at most one tick old, so falling back to it means a lost lock
+    // costs one frame instead of the rest of the scan.
+    refTile: null,     // { gray, scale, x, y }
+    refPrev: null,     // { gray, scale, x, y }
     busy: false,
     fails: 0,
     blurHistory: [],
@@ -186,6 +209,14 @@ export default function App() {
 
   // Prefills a capture region well inside the bright field, so the stationary
   // vignette ring is excluded from the start.
+  const autoCropForce = () => {
+    cropRef.current = null;
+    setCropBox(null);
+    S.current.checkedBorder = false;
+    setBorderWarn(false);
+    autoCrop();
+  };
+
   const autoCrop = () => {
     let tries = 0;
     const attempt = () => {
@@ -278,11 +309,16 @@ export default function App() {
     return isBlurry;
   };
 
-  const setRef = (gray, scale) => {
+  const freeRef = (r) => {
+    if (r && r.gray) r.gray.delete();
+  };
+
+  const clearRefs = () => {
     const s = S.current;
-    if (s.refGray) s.refGray.delete();
-    s.refGray = gray;
-    s.refScale = scale;
+    freeRef(s.refTile);
+    freeRef(s.refPrev);
+    s.refTile = null;
+    s.refPrev = null;
   };
 
   const addTile = async (mat, w, h, blobPromise, x, y, sharpness, isBlurry) => {
@@ -355,62 +391,101 @@ export default function App() {
         }
         s.mosaic = M.createMosaic(w, h);
         await addTile(mat, w, h, blobPromise, 0, 0, sharp, isBlurry);
-        setRef(gray, scale);
+        clearRefs();
+        s.refTile = { gray: gray.clone(), scale, x: 0, y: 0 };
+        s.refPrev = { gray, scale, x: 0, y: 0 };
         grayOwned = false;
         s.fails = 0;
+        setLost(false);
         log('ok', `ô nền #1 tại (0, 0), ${w}×${h}px`);
         setStatus({ text: 'Ô nền đã đặt — kéo tiêu bản để tiếp tục.', kind: 'ok' });
         return;
       }
 
-      const est = estimateShift(s.refGray, gray, patchRef.current);
-      if (!est) {
-        log('warn', 'khung dò lớn hơn khung ảnh — chọn kích thước nhỏ hơn');
+      // Tiles exist but there is no reference frame: the session was resumed from
+      // disk, or the last tile was undone. Nothing in the pixels tells us where
+      // the current view sits, so the documented workflow is to line the specimen
+      // back up with the last tile first — and this frame is taken at its word as
+      // being that position. Previously this path dereferenced a null reference
+      // and threw on the first tick after resuming or undoing.
+      if (!s.refTile) {
+        const last = s.tiles[s.tiles.length - 1];
+        freeRef(s.refPrev);
+        s.refTile = { gray: gray.clone(), scale, x: last.x, y: last.y };
+        s.refPrev = { gray, scale, x: last.x, y: last.y };
+        grayOwned = false;
+        s.fails = 0;
+        setLost(false);
+        log('info', `nối lại từ ô #${s.tiles.length} — coi khung hiện tại là trùng vị trí ô đó`);
+        setStatus({
+          text: `Đã nối lại từ ô #${s.tiles.length}. Nếu tiêu bản chưa về đúng vị trí ô đó thì ảnh ghép sẽ lệch — bấm "Hoàn tác ô cuối" rồi thử lại.`,
+          kind: 'warn',
+        });
         return;
       }
 
-      if (est.score < MIN_SCORE) {
+      const opts = { minScore: MIN_SCORE, tolPx: AGREE_TOL_PX, minAgree: MIN_AGREE };
+      const patchOf = (e) =>
+        (e.all || []).map((r) => `${Math.round(r.dx / s.refTile.scale)},${Math.round(r.dy / s.refTile.scale)}`).join(' ');
+
+      // Against the last placed tile first: no accumulated error.
+      let est = estimateShift(s.refTile.gray, gray, patchRef.current, opts);
+      let base = s.refTile;
+      let chained = false;
+      if (!est.ok && s.refPrev && s.refPrev !== s.refTile) {
+        // Out of reach of the tile, but the previous frame is one tick old, so
+        // whatever just happened is almost certainly within reach of that.
+        const alt = estimateShift(s.refPrev.gray, gray, patchRef.current, opts);
+        if (alt.ok) {
+          est = alt;
+          base = s.refPrev;
+          chained = true;
+        }
+      }
+      setPatchPx(est.pw);
+
+      if (!est.ok) {
         s.fails++;
-        log('fail', `điểm khớp ${est.score.toFixed(2)} < ${MIN_SCORE} — không định vị được`);
-        if (s.fails >= 4) {
-          setStatus({
-            text: 'Không định vị được: vùng quét thiếu chi tiết, ảnh mờ, hoặc đã kéo quá xa giữa hai khung. Kéo chậm lại, lấy nét, hoặc chọn khung dò nhỏ hơn.',
-            kind: 'warn',
-          });
+        if (s.fails >= LOST_AFTER) setLost(true);
+        if (est.reason === 'too-far') {
+          log('warn', `kéo quá xa (${est.edged}/${est.total} khung dò mất dấu) — kéo chậm lại`);
+        } else if (est.reason === 'disagree') {
+          // What a stationary fixture inside one patch looks like: that patch
+          // says nothing moved, the others disagree, nobody has enough company.
+          log('fail', `${est.used}/${est.total} khung dò không khớp nhau · đo được: ${patchOf(est)}`);
+        } else {
+          log('fail', `không khung dò nào định vị được (điểm cao nhất ${est.bestScore.toFixed(2)} < ${MIN_SCORE})`);
         }
         return;
       }
 
-      const last = s.tiles[s.tiles.length - 1];
-      // est is measured in refGray pixels; convert back to crop pixels.
-      const dx = est.dx / s.refScale;
-      const dy = est.dy / s.refScale;
-      const stepPx = Math.hypot(dx, dy);
-      const minStep = Math.max(MIN_STEP_PX, w * STEP_FRAC);
+      const dx = est.dx / base.scale;
+      const dy = est.dy / base.scale;
+      const x = base.x + dx;
+      const y = base.y + dy;
 
-      if (est.atEdge) {
-        s.fails++;
-        log('warn', `đã kéo quá xa (≥${Math.round(est.reachX / s.refScale)}px) — kéo chậm lại hoặc chọn khung dò nhỏ hơn`);
-        return;
-      }
-
-      if (stepPx < minStep) {
-        s.fails = 0;
-        log('skip', `mới dịch ${Math.round(stepPx)}px (cần ≥ ${Math.round(minStep)}px), điểm ${est.score.toFixed(2)}`);
-        return;
-      }
-
-      const x = last.x + dx;
-      const y = last.y + dy;
-      const index = await addTile(mat, w, h, blobPromise, x, y, sharp, isBlurry);
-      // The accepted frame becomes the reference for the next step. Only accepted
-      // frames do, so no error from a skipped frame can enter the chain.
-      setRef(gray, scale);
+      // The frame is located, so it becomes the previous-frame reference whether
+      // or not it earns a tile. This is what keeps the fallback fresh.
+      if (s.refPrev !== s.refTile) freeRef(s.refPrev);
+      s.refPrev = { gray, scale, x, y };
       grayOwned = false;
       s.fails = 0;
-      log('ok', `ô #${index + 1} tại (${Math.round(x)}, ${Math.round(y)}) · dịch ${fmt(dx)},${fmt(dy)} · điểm ${est.score.toFixed(2)}`);
+      setLost(false);
+
+      const stepPx = Math.hypot(x - s.refTile.x, y - s.refTile.y);
+      const minStep = Math.max(MIN_STEP_PX, Math.min(w, h) * STEP_FRAC);
+      if (stepPx < minStep) {
+        log('skip', `mới dịch ${Math.round(stepPx)}px (cần ≥ ${Math.round(minStep)}px), ${est.used}/${est.total} khung dò đồng ý`);
+        return;
+      }
+
+      const index = await addTile(mat, w, h, blobPromise, x, y, sharp, isBlurry);
+      freeRef(s.refTile);
+      s.refTile = { gray: s.refPrev.gray.clone(), scale, x, y };
+      log('ok', `ô #${index + 1} tại (${Math.round(x)}, ${Math.round(y)}) · dịch ${fmt(dx)},${fmt(dy)}` +
+        ` · ${est.used}/${est.total} khung dò đồng ý (điểm ${est.score.toFixed(2)})` + (chained ? ' · nối qua khung trước' : ''));
       setStatus({
-        text: `Đã ghép ${index + 1} ô. Bước vừa rồi: ${fmt(dx)}, ${fmt(dy)} px (điểm khớp ${est.score.toFixed(2)}).` +
+        text: `Đã ghép ${index + 1} ô. Bước vừa rồi: ${fmt(dx)}, ${fmt(dy)} px — ${est.used}/${est.total} khung dò đồng ý.` +
           (isBlurry ? ' Ô này có thể bị mờ.' : ''),
         kind: isBlurry ? 'warn' : 'ok',
       });
@@ -485,7 +560,7 @@ export default function App() {
       // slide has moved since. Force a fresh reference on the next tick by
       // dropping it; the first frame after resuming becomes the new anchor, so
       // line the specimen back up with the last tile before starting.
-      if (s.refGray) { s.refGray.delete(); s.refGray = null; }
+      clearRefs();
       setStatus({
         text: `Đã khôi phục ${s.tiles.length} ô. Đưa tiêu bản về đúng vị trí ô cuối cùng rồi bấm "Bắt đầu" — khung đầu tiên sau khi bắt đầu sẽ được coi là nối tiếp từ ô cuối.`,
         kind: 'ok',
@@ -511,7 +586,7 @@ export default function App() {
       const t = s.tiles.pop();
       if (t.blurry) setBlurry((n) => Math.max(0, n - 1));
       db.deleteFrom(i).catch(() => {});
-      if (s.refGray) { s.refGray.delete(); s.refGray = null; }
+      clearRefs();
       await rebuild();
       log('info', `đã hoàn tác ô #${i + 1}`);
       setStatus({ text: 'Đã hoàn tác. Đưa tiêu bản về vị trí ô cuối trước khi chạy tiếp.', kind: 'idle' });
@@ -525,7 +600,7 @@ export default function App() {
     const s = S.current;
     M.freeMosaic(s.mosaic);
     s.mosaic = null;
-    if (s.refGray) { s.refGray.delete(); s.refGray = null; }
+    clearRefs();
     s.tiles = [];
     s.blurHistory = [];
     s.fails = 0;
@@ -534,6 +609,7 @@ export default function App() {
     db.clearAll().catch(() => {});
     setBlurry(0);
     setBorderWarn(false);
+    setLost(false);
     setTileCount(0);
     setDims({ w: 0, h: 0, scale: 1 });
     setDiag([]);
@@ -621,19 +697,43 @@ export default function App() {
     };
   })();
 
-  // The patch actually being correlated, drawn so it's obvious whether it clears
-  // the halo — this is the one setting that decides whether tracking works.
-  const patchStyle = (() => {
-    if (!cropStyle) return null;
+  // The patches actually being correlated, drawn at true size and position. This
+  // is the one thing worth looking at before starting: if any yellow square
+  // overlaps the halo, a dust speck, or a software overlay, that square will
+  // report "nothing moved" and has to be voted down by the others.
+  const patchStyles = (() => {
+    if (!cropStyle) return [];
     const pw = cropStyle.width * patchFrac;
     const ph = cropStyle.height * patchFrac;
-    return {
-      left: cropStyle.left + (cropStyle.width - pw) / 2,
-      top: cropStyle.top + (cropStyle.height - ph) / 2,
+    return PATCH_CENTERS.map(([cx, cy]) => ({
+      left: cropStyle.left + cropStyle.width * cx - pw / 2,
+      top: cropStyle.top + cropStyle.height * cy - ph / 2,
       width: pw,
       height: ph,
-    };
+    }));
   })();
+
+  // Shrinks the capture region toward its centre. The fastest fix when fixtures
+  // are inside the frame, and it shrinks the patches with it since they are sized
+  // relative to the region.
+  const shrinkCrop = () => {
+    const b = cropRef.current;
+    const v = videoRef.current;
+    if (!b || !v) return;
+    const nw = Math.max(80, Math.round(b.w * 0.9));
+    const nh = Math.max(80, Math.round(b.h * 0.9));
+    const box = {
+      x: Math.round(b.x + (b.w - nw) / 2),
+      y: Math.round(b.y + (b.h - nh) / 2),
+      w: nw,
+      h: nh,
+    };
+    cropRef.current = box;
+    setCropBox(box);
+    S.current.checkedBorder = false;
+    setBorderWarn(false);
+    log('info', `thu nhỏ vùng quét: ${box.w}×${box.h}px`);
+  };
 
   return (
     <>
@@ -678,7 +778,9 @@ export default function App() {
               <video ref={videoRef} muted playsInline></video>
               {!capturing && <div className="empty">Bấm "Chọn cửa sổ" và chọn cửa sổ phần mềm camera.</div>}
               {cropStyle && <div className="box crop" style={cropStyle}></div>}
-              {patchStyle && <div className="box patch" style={patchStyle}><span>khung dò</span></div>}
+              {patchStyles.map((st, i) => (
+                <div className="box patch" key={i} style={st}>{i === 0 && <span>khung dò</span>}</div>
+              ))}
               {dragRect && <div className="box crop dragging" style={{ left: dragRect.x, top: dragRect.y, width: dragRect.w, height: dragRect.h }}></div>}
             </div>
             <div className="gap" />
@@ -694,22 +796,49 @@ export default function App() {
                 và ảnh ghép đứng yên. Hãy kéo chọn lại một vùng nhỏ hơn, nằm hẳn trong vùng sáng.
               </div>
             )}
+            {capturing && cropBox && (
+              <>
+                <div className="gap" />
+                <div className="row">
+                  <button onClick={shrinkCrop}>Thu nhỏ vùng quét 10%</button>
+                  <button onClick={autoCropForce}>Dò lại tự động</button>
+                </div>
+                <div className="note mono">
+                  Vùng quét: {cropBox.w}×{cropBox.h}px
+                </div>
+              </>
+            )}
             <div className="note">
-              Khung <b>xanh</b> = vùng ảnh được lưu. Khung <b>vàng</b> ở giữa = khung dò, phần thực sự
-              dùng để đo dịch chuyển. Kéo chuột trên khung xem trước để chọn lại vùng quét.
+              Khung <b>xanh</b> = vùng ảnh được lưu vào ảnh ghép. 5 khung <b>vàng</b> = khung dò, phần
+              thực sự dùng để đo dịch chuyển. Kéo chuột trên khung xem trước để chọn lại vùng quét —
+              càng vào giữa vùng sáng càng tốt.
             </div>
           </div>
 
           <div className="block">
             <h2>2 · Khung dò</h2>
-            <div className="row">
-              {PATCH_PRESETS.map((p) => (
-                <button key={p.key} className={patchFrac === p.key ? 'primary' : ''} onClick={() => setPatchFrac(p.key)}>
-                  {p.label}
-                </button>
-              ))}
+            <div className="slider-row">
+              <input
+                type="range"
+                min={PATCH_MIN * 100}
+                max={PATCH_MAX * 100}
+                step={1}
+                value={Math.round(patchFrac * 100)}
+                onChange={(e) => setPatchFrac(Number(e.target.value) / 100)}
+              />
+              <span className="mono">{Math.round(patchFrac * 100)}%</span>
             </div>
-            <div className="note">{PATCH_PRESETS.find((p) => p.key === patchFrac).note}</div>
+            <div className="note">
+              5 khung dò nhỏ, đặt rải trong vùng quét. Mỗi khung đo dịch chuyển độc lập; app chỉ nhận
+              kết quả mà <b>ít nhất {MIN_AGREE} khung đồng ý</b> với nhau (lệch dưới {AGREE_TOL_PX}px).
+              Nhờ vậy một khung dò vô tình nằm trên vật cố định — bụi, viền halo, overlay — sẽ báo
+              "không dịch chuyển", lệch khỏi nhóm, và bị loại; nó không kéo được kết quả đi.
+            </div>
+            <div className="note">
+              Nhỏ thì an toàn hơn với vật cố định <i>và</i> tầm với xa hơn, nhưng cần vùng có chi tiết.
+              Chỉ tăng lên khi nhật ký báo "không khung dò nào định vị được".
+              {patchPx > 0 && <> Hiện tại mỗi khung dò ≈ <span className="mono">{patchPx}×{patchPx}px</span> ở độ phân giải xử lý.</>}
+            </div>
           </div>
 
           <div className="block" style={{ borderColor: running ? 'var(--teal)' : 'var(--line)' }}>
@@ -721,18 +850,28 @@ export default function App() {
             ) : (
               <button className="warn" onClick={stopAuto}>Đang chạy — bấm để dừng <span className="kbd">Space</span></button>
             )}
+            {lost && (
+              <div className="alert lost">
+                <b>Mất dấu.</b> App không xác định được khung hiện tại đang ở đâu, nên nó dừng ghép chứ
+                không đoán — đoán sai một ô là sai cả phần sau.
+                <br /><br />
+                Kéo tiêu bản <b>trở lại</b> cho tới khi thấy lại vùng đã quét gần đây; app tự bắt lại
+                ngay khi định vị được, không cần bấm gì. Nếu vẫn không bắt lại: lấy nét lại, hoặc thu
+                nhỏ vùng quét (có thể một khung dò đang nằm trên vật cố định).
+              </div>
+            )}
             <div className="note">
               Mỗi {TICK_MS}ms app lấy 1 khung, đo xem ảnh đã dịch bao nhiêu pixel theo x và y, rồi dán
-              khung đó vào đúng vị trí. Không có bước xác nhận, không ước lượng bù: khung nào không đo
-              được thì bỏ qua, thử lại khung sau.
+              khung đó vào đúng vị trí. Đo so với ô cuối cùng đã đặt; nếu ngoài tầm với thì so với khung
+              ngay trước đó — nên một cú giật khi đổi trục chỉ mất 1 khung, không mất cả phiên.
             </div>
           </div>
 
           <div className="block">
             <h2>Trạng thái</h2>
             <div className="status">
-              <span className={`badge ${status.kind}`}>
-                {status.kind === 'ok' ? 'Tốt' : status.kind === 'warn' ? 'Chú ý' : 'Sẵn sàng'}
+              <span className={`badge ${lost ? 'warn' : status.kind}`}>
+                {lost ? 'Mất dấu' : status.kind === 'ok' ? 'Tốt' : status.kind === 'warn' ? 'Chú ý' : 'Sẵn sàng'}
               </span>
               <div className="gap-s" />
               {busyLabel || status.text}

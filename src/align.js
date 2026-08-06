@@ -63,54 +63,120 @@ function subpixelPeak(res, loc) {
   return [loc.x + ox, loc.y + oy];
 }
 
-// Finds how far the picture moved between `refGray` (the last accepted frame)
-// and `curGray` (the live frame), both produced by toMatchGray.
+// Five small patches, spread out but all kept well inside the frame. This is the
+// answer to the problem that a patch large enough to be individually reliable is
+// also large enough to swallow the stationary fixtures — vignette ring, sensor
+// dust, software overlay — that pin the measured displacement at zero.
 //
-// `patchFrac` is the patch's size as a fraction of the frame, and it directly
-// sets the trade-off: the patch is taken from the centre, so the largest
-// detectable movement is half of what's left over — at patchFrac 0.3 that's
-// ±35% of the frame per step. Smaller patch, larger reach, but less content to
-// correlate on; larger patch, more reliable score, but you must sample more
-// often or the movement outruns the search.
+// A patch small enough to sit entirely in clean specimen is, on its own, easier
+// to mismatch: less content means more places in the frame that correlate about
+// as well. Measuring the same displacement from several independent small
+// patches and keeping only what the majority agrees on fixes that, and it
+// happens to fix the fixture problem too — a patch that landed on something
+// stationary reports "didn't move" while the others report the real
+// displacement, so it falls outside the agreeing group and is dropped. One
+// bad patch cannot drag the result, and nothing has to be detected or
+// configured for that to work.
+export const PATCH_CENTERS = [
+  [0.5, 0.5],
+  [0.3, 0.3],
+  [0.7, 0.3],
+  [0.3, 0.7],
+  [0.7, 0.7],
+];
+
+// Largest subset of measurements that all landed within `tolPx` of one another.
+// Kept separate and pure because it is the part that decides whether a frame is
+// trusted, and it is the part worth being able to test without a camera.
 //
-// Returns displacement of the frame origin in ORIGINAL crop pixels:
-// the same specimen detail sits at (tx, ty) in the reference and at (sx, sy) in
-// the current frame, so the current frame's origin is offset by (tx-sx, ty-sy).
-export function estimateShift(refGray, curGray, patchFrac) {
+// Deliberately not a median: a median of five values where two came from patches
+// sitting on stationary fixtures still sits between the two answers. Requiring
+// mutual agreement instead means a wrong answer has to be *reproduced* by an
+// independent patch to be believed, and two patches landing on the same wrong
+// offset by chance is much less likely than one doing so.
+export function largestAgreeingGroup(results, tolPx) {
+  let best = [];
+  for (const seed of results) {
+    const g = results.filter((r) => Math.hypot(r.dx - seed.dx, r.dy - seed.dy) <= tolPx);
+    if (g.length > best.length) best = g;
+  }
+  return best;
+}
+
+function matchOnePatch(refGray, curGray, cx, cy, pw, ph) {
   const w = refGray.cols;
   const h = refGray.rows;
-  const pw = Math.max(24, Math.round(w * patchFrac));
-  const ph = Math.max(24, Math.round(h * patchFrac));
+  const tx = Math.round(cx * w - pw / 2);
+  const ty = Math.round(cy * h - ph / 2);
+  if (tx < 0 || ty < 0 || tx + pw > w || ty + ph > h) return null;
   if (pw >= curGray.cols || ph >= curGray.rows) return null;
-  const tx = Math.round((w - pw) / 2);
-  const ty = Math.round((h - ph) / 2);
-
   const tpl = refGray.roi(new cv.Rect(tx, ty, pw, ph));
   const res = new cv.Mat();
   try {
     // TM_CCOEFF_NORMED subtracts the mean of both windows, so a slow overall
-    // brightness change (camera auto-exposure between frames) doesn't move the
-    // peak, and the score stays comparable from frame to frame.
+    // brightness change (camera auto-exposure) doesn't move the peak and scores
+    // stay comparable between frames.
     cv.matchTemplate(curGray, tpl, res, cv.TM_CCOEFF_NORMED);
     const mm = cv.minMaxLoc(res);
     const [sx, sy] = subpixelPeak(res, mm.maxLoc);
-    // The peak sitting hard against the edge of the search area means the true
-    // match is probably outside it — the drag outran the patch's reach — so the
-    // reported number is a floor, not a measurement.
+    // A peak hard against the edge of the search area means the true match is
+    // probably outside it — the drag outran this patch's reach — so the number
+    // is a floor, not a measurement.
     const atEdge =
       mm.maxLoc.x <= 0 || mm.maxLoc.y <= 0 || mm.maxLoc.x >= res.cols - 1 || mm.maxLoc.y >= res.rows - 1;
-    return {
-      score: mm.maxVal,
-      dx: tx - sx,
-      dy: ty - sy,
-      reachX: tx,
-      reachY: ty,
-      atEdge,
-    };
+    return { score: mm.maxVal, dx: tx - sx, dy: ty - sy, atEdge };
   } finally {
     res.delete();
     tpl.delete();
   }
+}
+
+// Measures how far the picture moved between `refGray` (the last accepted frame)
+// and `curGray`, both from toMatchGray. Displacement is returned in refGray
+// pixels: the same detail sits at (tx, ty) in the reference and (sx, sy) in the
+// current frame, so the current frame's origin is offset by (tx-sx, ty-sy).
+//
+// `patchFrac` sets patch size as a fraction of the frame. Because each patch is
+// taken from a fixed position, the largest movement it can still locate is
+// roughly the distance from that position to the far edge — so smaller patches
+// reach further as well as being safer. `tolPx` is how close two patches must
+// land to count as agreeing.
+export function estimateShift(refGray, curGray, patchFrac, { minScore = 0.4, tolPx = 4, minAgree = 2 } = {}) {
+  const pw = Math.max(14, Math.round(refGray.cols * patchFrac));
+  const ph = Math.max(14, Math.round(refGray.rows * patchFrac));
+  const total = PATCH_CENTERS.length;
+  const info = { patchPx: Math.round(pw / (refGray.cols / 100)) / 100, pw, ph, total };
+
+  const good = [];
+  let edged = 0;
+  let bestScore = 0;
+  for (const [cx, cy] of PATCH_CENTERS) {
+    const r = matchOnePatch(refGray, curGray, cx, cy, pw, ph);
+    if (!r) continue;
+    if (r.score > bestScore) bestScore = r.score;
+    if (r.atEdge) { edged++; continue; }
+    if (r.score < minScore) continue;
+    good.push(r);
+  }
+
+  if (good.length === 0) {
+    return { ok: false, reason: edged >= 2 ? 'too-far' : 'no-signal', bestScore, used: 0, edged, all: [], ...info };
+  }
+
+  const group = largestAgreeingGroup(good, tolPx);
+  if (group.length < minAgree) {
+    return {
+      ok: false, reason: edged >= 2 ? 'too-far' : 'disagree', bestScore, used: good.length, edged,
+      all: good.map((r) => ({ dx: r.dx, dy: r.dy, score: r.score })), ...info,
+    };
+  }
+
+  const all = good.map((r) => ({ dx: r.dx, dy: r.dy, score: r.score }));
+  const dx = group.reduce((a, r) => a + r.dx, 0) / group.length;
+  const dy = group.reduce((a, r) => a + r.dy, 0) / group.length;
+  const score = group.reduce((a, r) => a + r.score, 0) / group.length;
+  const spread = Math.max(...group.map((r) => Math.hypot(r.dx - dx, r.dy - dy)));
+  return { ok: true, dx, dy, score, spread, all, used: group.length, checked: good.length, edged, ...info };
 }
 
 // Laplacian variance — the standard cheap focus measure. Higher is sharper.
@@ -157,7 +223,7 @@ export function borderIsDark(gray) {
 // halo's edge is a soft gradient many pixels wide, and a rectangle that merely
 // touches the nominal boundary still contains enough of the stationary ring to
 // pin the correlation at zero.
-export function detectFieldRect(mat, insetFrac = 0.14) {
+export function detectFieldRect(mat, insetFrac = 0.2) {
   const gray = new cv.Mat();
   cv.cvtColor(mat, gray, cv.COLOR_RGBA2GRAY);
   const w = gray.cols;

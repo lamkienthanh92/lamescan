@@ -71,3 +71,7 @@ button.danger{background:#3A211C;border-color:var(--red);color:#F0C4BA;}
 .stage-frame canvas{display:block;}
 .footer{display:flex;justify-content:space-between;padding:8px 16px;
   border-top:1px solid var(--line);font-size:10px;color:var(--ink-dim);}
+.slider-row{display:flex;align-items:center;gap:10px;}
+.slider-row input[type=range]{flex:1;accent-color:var(--amber);}
+.slider-row span{font-size:12px;color:var(--amber);min-width:34px;text-align:right;}
+.alert.lost{background:#3A211C;border-color:var(--red);color:#F0C4BA;}
