@@ -4,11 +4,19 @@ import JSZip from 'jszip';
 import './App.css';
 import { toMatchGray, estimateShift, sharpnessOf, borderIsDark, detectFieldRect, PATCH_CENTERS } from './align.js';
 import * as M from './mosaic.js';
+import { alignToMosaic, relocalizeCoarse, buildCoarseMosaic, coarseScaleFor } from './anchor.js';
+import { fuseMosaic, FUSION_METHODS, medianSharpnessOf, tileQuality } from './fuse.js';
+import { optimizePositions } from './optimize.js';
 import * as db from './db.js';
 
 const TICK_MS = 200;          // how often a frame is sampled
 const MIN_SCORE = 0.32;       // a single patch scoring below this isn't a measurement
 const LOST_AFTER = 4;         // consecutive unlocated frames before saying so plainly
+// Search radius for the mosaic measurement, as a fraction of the frame. It only
+// has to cover the error that has crept in since the last tile, so it can stay
+// small — which also keeps the extracted region, and the cost, small.
+const ANCHOR_RADIUS_FRAC = 0.12;
+const ANCHOR_TOL_PX = 6;
 const AGREE_TOL_PX = 6;       // how close two patches must land to count as agreeing
 const MIN_AGREE = 2;          // patches that must agree before a frame is accepted
 const MIN_STEP_PX = 12;       // don't record a tile until the picture has actually moved
@@ -71,6 +79,13 @@ export default function App() {
   const [showTiles, setShowTiles] = useState(false);
   const [patchPx, setPatchPx] = useState(0);
   const [lost, setLost] = useState(false);
+  const [lastRect, setLastRect] = useState(null); // last tile, marked on the mosaic view
+  const [anchor, setAnchor] = useState(true);
+  const [fusion, setFusion] = useState('best');
+  const [excluded, setExcluded] = useState(() => new Set());
+  const [fused, setFused] = useState(null); // which method the current mosaic shows
+  const [optStats, setOptStats] = useState(null);
+  const anchorRef = useRef(true);
 
   const videoRef = useRef(null);
   const previewRef = useRef(null);
@@ -82,6 +97,7 @@ export default function App() {
   const dragStart = useRef(null);
   const patchRef = useRef(PATCH_DEFAULT);
   useEffect(() => { patchRef.current = patchFrac; }, [patchFrac]);
+  useEffect(() => { anchorRef.current = anchor; }, [anchor]);
 
   const S = useRef({
     mosaic: null,
@@ -106,6 +122,7 @@ export default function App() {
     // costs one frame instead of the rest of the scan.
     refTile: null,     // { gray, scale, x, y }
     refPrev: null,     // { gray, scale, x, y }
+    coarse: null,      // { mat, scale } shrunk mosaic, for relocalising when lost
     busy: false,
     fails: 0,
     blurHistory: [],
@@ -114,6 +131,9 @@ export default function App() {
   });
   const ui = useRef({ capturing: false });
   useEffect(() => { ui.current.capturing = capturing; }, [capturing]);
+
+  const cv_originX = () => (S.current.mosaic ? S.current.mosaic.originX : 0);
+  const cv_originY = () => (S.current.mosaic ? S.current.mosaic.originY : 0);
 
   const log = useCallback((kind, text) => {
     const t = new Date().toLocaleTimeString('vi-VN', { hour12: false });
@@ -153,6 +173,7 @@ export default function App() {
     setBusyLabel('Đang vẽ lại ảnh ghép…');
     M.freeMosaic(s.mosaic);
     s.mosaic = null;
+    dropCoarse();
     if (s.tiles.length === 0) {
       if (canvasRef.current) {
         canvasRef.current.width = 1;
@@ -313,12 +334,21 @@ export default function App() {
     if (r && r.gray) r.gray.delete();
   };
 
+  // The shrunk mosaic used for relocalisation is only valid until the mosaic
+  // changes, so it is dropped whenever a tile lands or the mosaic is rebuilt.
+  const dropCoarse = () => {
+    const s = S.current;
+    if (s.coarse && s.coarse.mat) s.coarse.mat.delete();
+    s.coarse = null;
+  };
+
   const clearRefs = () => {
     const s = S.current;
     freeRef(s.refTile);
     freeRef(s.refPrev);
     s.refTile = null;
     s.refPrev = null;
+    dropCoarse();
   };
 
   const addTile = async (mat, w, h, blobPromise, x, y, sharpness, isBlurry) => {
@@ -339,11 +369,14 @@ export default function App() {
     const index = s.tiles.length;
     const tile = { x, y, w, h, blob, sharpness, blurry: isBlurry, capturedAt: Date.now() };
     s.tiles.push(tile);
+    setLastRect({ x, y, w, h });
     db.saveTile({ index, ...tile }).catch((e) =>
       setStatus({ text: 'Cảnh báo: không lưu được vào bộ nhớ tạm (' + e.message + ')', kind: 'warn' })
     );
     if (isBlurry) setBlurry((n) => n + 1);
     setTileCount(s.tiles.length);
+    setFused(null); // mosaic no longer matches any reviewed fusion
+    dropCoarse();
     return index;
   };
 
@@ -447,6 +480,26 @@ export default function App() {
       if (!est.ok) {
         s.fails++;
         if (s.fails >= LOST_AFTER) setLost(true);
+
+        // Lost. Rather than waiting for the operator to line the field back up
+        // with the last tile by eye — which is the hard part, since the open edge
+        // of a mosaic has no landmark to aim at — search the whole mosaic for this
+        // frame. Dragging back to ANY previously scanned area is enough.
+        if (s.fails >= LOST_AFTER && s.tiles.length >= 2 && s.fails % 2 === 0) {
+          const found = tryRelocalize(s, gray, scale, w, h);
+          if (found) {
+            freeRef(s.refPrev);
+            freeRef(s.refTile);
+            s.refTile = { gray: gray.clone(), scale, x: found.x, y: found.y };
+            s.refPrev = { gray, scale, x: found.x, y: found.y };
+            grayOwned = false;
+            s.fails = 0;
+            setLost(false);
+            log('ok', `đã tự tìm lại vị trí: (${Math.round(found.x)}, ${Math.round(found.y)}) — không cần khớp tay`);
+            setStatus({ text: 'Đã tự tìm lại vị trí trong ảnh ghép — cứ kéo tiếp bình thường.', kind: 'ok' });
+            return;
+          }
+        }
         if (est.reason === 'too-far') {
           log('warn', `kéo quá xa (${est.edged}/${est.total} khung dò mất dấu) — kéo chậm lại`);
         } else if (est.reason === 'disagree') {
@@ -461,8 +514,24 @@ export default function App() {
 
       const dx = est.dx / base.scale;
       const dy = est.dy / base.scale;
-      const x = base.x + dx;
-      const y = base.y + dy;
+      let x = base.x + dx;
+      let y = base.y + dy;
+
+      // Frame-to-frame tracking has produced a prediction. Now measure the frame's
+      // position against the mosaic itself, which carries no accumulated error, and
+      // use that instead when it succeeds. This is what stops the whole strip from
+      // leaning: without it, every tile inherits the sum of all previous
+      // measurement errors, so a small consistent bias becomes a visible skew.
+      let anchored = null;
+      if (anchorRef.current && s.tiles.length >= 2) {
+        const radius = Math.max(20, Math.round(Math.min(w, h) * ANCHOR_RADIUS_FRAC));
+        const a = alignToMosaic(s.mosaic, gray, scale, w, h, x, y, radius, patchRef.current, ANCHOR_TOL_PX);
+        if (a.ok) {
+          x = a.x;
+          y = a.y;
+          anchored = a;
+        }
+      }
 
       // The frame is located, so it becomes the previous-frame reference whether
       // or not it earns a tile. This is what keeps the fallback fresh.
@@ -483,7 +552,9 @@ export default function App() {
       freeRef(s.refTile);
       s.refTile = { gray: s.refPrev.gray.clone(), scale, x, y };
       log('ok', `ô #${index + 1} tại (${Math.round(x)}, ${Math.round(y)}) · dịch ${fmt(dx)},${fmt(dy)}` +
-        ` · ${est.used}/${est.total} khung dò đồng ý (điểm ${est.score.toFixed(2)})` + (chained ? ' · nối qua khung trước' : ''));
+        ` · ${est.used}/${est.total} khung dò đồng ý (điểm ${est.score.toFixed(2)})` +
+        (chained ? ' · nối qua khung trước' : '') +
+        (anchored ? ` · neo vào ảnh ghép (chỉnh ${anchored.correction.toFixed(1)}px)` : ''));
       setStatus({
         text: `Đã ghép ${index + 1} ô. Bước vừa rồi: ${fmt(dx)}, ${fmt(dy)} px — ${est.used}/${est.total} khung dò đồng ý.` +
           (isBlurry ? ' Ô này có thể bị mờ.' : ''),
@@ -506,6 +577,29 @@ export default function App() {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [paintAll, log]);
+
+  // Coarse search over the whole mosaic, then the same five-patch measurement used
+  // everywhere else to confirm it. A false coarse peak cannot survive having to be
+  // agreed on by five independent patches at working resolution, so the coarse
+  // stage is allowed to be permissive.
+  const tryRelocalize = (s, gray, scale, w, h) => {
+    if (!s.mosaic) return null;
+    try {
+      if (!s.coarse) {
+        const cs = coarseScaleFor(s.mosaic, scale, w, h);
+        s.coarse = { mat: buildCoarseMosaic(s.mosaic, cs), scale: cs };
+      }
+      const c = relocalizeCoarse(s.mosaic, s.coarse.mat, s.coarse.scale, gray, scale);
+      if (!c.ok) return null;
+      const radius = Math.max(24, c.uncertaintyPx);
+      const fine = alignToMosaic(s.mosaic, gray, scale, w, h, c.x, c.y, radius, patchRef.current, ANCHOR_TOL_PX);
+      if (!fine.ok) return null;
+      return { x: fine.x, y: fine.y };
+    } catch (e) {
+      log('warn', 'tìm lại vị trí lỗi: ' + (e && e.message ? e.message : e));
+      return null;
+    }
+  };
 
   const tickRef = useRef(tick);
   useEffect(() => { tickRef.current = tick; }, [tick]);
@@ -610,6 +704,10 @@ export default function App() {
     setBlurry(0);
     setBorderWarn(false);
     setLost(false);
+    setLastRect(null);
+    setExcluded(new Set());
+    setFused(null);
+    setOptStats(null);
     setTileCount(0);
     setDims({ w: 0, h: 0, scale: 1 });
     setDiag([]);
@@ -618,6 +716,102 @@ export default function App() {
       canvasRef.current.height = 1;
     }
     setStatus({ text: 'Đã đặt lại.', kind: 'idle' });
+  };
+
+  // ---- review & fuse before export ----
+  const runFusion = async (method) => {
+    const s = S.current;
+    if (!s.mosaic || s.tiles.length === 0 || busyLabel) return;
+    stopAuto();
+    try {
+      const r = await fuseMosaic(s.mosaic, s.tiles, {
+        method,
+        excluded,
+        onProgress: (done, total) =>
+          setBusyLabel(`Đang dựng lại ảnh ghép (${FUSION_METHODS[method].label}) — dải ${done}/${total}…`),
+      });
+      paintAll();
+      setFused(method);
+      const n = excluded.size;
+      setStatus({
+        text: `Đã dựng lại bằng "${FUSION_METHODS[method].label}" từ ${r.used} ô` +
+          (n > 0 ? `, bỏ ${n} ô.` : '.') + ' Xem lại rồi hãy xuất.',
+        kind: 'ok',
+      });
+      log('info', `dựng lại: ${FUSION_METHODS[method].label}, ${r.used} ô, ${r.bands} dải`);
+    } catch (e) {
+      setStatus({ text: 'Dựng lại thất bại: ' + (e && e.message ? e.message : e), kind: 'warn' });
+    } finally {
+      setBusyLabel(null);
+    }
+  };
+
+  // Global optimisation. Measures every overlapping pair and re-solves all
+  // positions at once, so drift already baked into the recorded positions gets
+  // corrected instead of merely stopped.
+  const runOptimize = async () => {
+    const s = S.current;
+    if (s.tiles.length < 3 || busyLabel) return;
+    stopAuto();
+    setBusyLabel('Đang đo các cặp ô chồng lấn…');
+    try {
+      const r = await optimizePositions(s.tiles, {
+        onProgress: (done, total, measured) =>
+          setBusyLabel(`Đang đo cặp ô chồng lấn ${done}/${total} (đo được ${measured})…`),
+      });
+      if (!r.ok) {
+        setStatus({
+          text: r.reason === 'no-pairs'
+            ? 'Không tìm thấy cặp ô nào chồng lấn đủ nhiều để tối ưu — các ô cách nhau quá xa.'
+            : 'Không đo được cặp ô nào (vùng chồng lấn thiếu chi tiết).',
+          kind: 'warn',
+        });
+        return;
+      }
+      setBusyLabel('Đang áp vị trí mới…');
+      r.positions.forEach((q, i) => {
+        s.tiles[i].x = q.x;
+        s.tiles[i].y = q.y;
+      });
+      // Persist the corrected geometry, otherwise resuming would restore the
+      // pre-optimisation positions.
+      s.tiles.forEach((t, i) => db.saveTile({ index: i, ...t }).catch(() => {}));
+      clearRefs(); // reference frames carry old positions
+      setOptStats(r);
+      setFused(null);
+      await rebuild();
+      setStatus({
+        text: `Đã tối ưu ${s.tiles.length} ô từ ${r.links}/${r.pairs} cặp chồng lấn. ` +
+          `Sai lệch trung bình giữa các cặp: ${r.beforeResidual.toFixed(1)}px → ${r.afterResidual.toFixed(1)}px. ` +
+          `Ô dịch nhiều nhất ${r.maxMove.toFixed(0)}px.`,
+        kind: 'ok',
+      });
+      log('info', `tối ưu toàn cục: ${r.links}/${r.pairs} cặp, sai lệch ${r.beforeResidual.toFixed(1)}→${r.afterResidual.toFixed(1)}px, bỏ ${r.dropped} cặp lỗi`);
+    } catch (e) {
+      setStatus({ text: 'Tối ưu thất bại: ' + (e && e.message ? e.message : e), kind: 'warn' });
+    } finally {
+      setBusyLabel(null);
+    }
+  };
+
+  const toggleExclude = (i) => {
+    setExcluded((prev) => {
+      const next = new Set(prev);
+      if (next.has(i)) next.delete(i);
+      else next.add(i);
+      return next;
+    });
+    setFused(null);
+  };
+
+  const excludeAllBlurry = () => {
+    const s = S.current;
+    setExcluded((prev) => {
+      const next = new Set(prev);
+      s.tiles.forEach((t, i) => { if (t.blurry) next.add(i); });
+      return next;
+    });
+    setFused(null);
   };
 
   // ---- export ----
@@ -657,17 +851,26 @@ export default function App() {
     try {
       const zip = new JSZip();
       const pad = Math.max(4, String(s.tiles.length).length);
-      const rows = ['index,filename,x_px,y_px,width_px,height_px,blurry,sharpness,captured_at_iso'];
+      const rows = ['index,filename,x_px,y_px,width_px,height_px,blurry,sharpness,quality,excluded,captured_at_iso'];
       const cfg = ['# Define the number of dimensions we are working on', 'dim = 2', '# Define the image coordinates'];
+      const medSharp = medianSharpnessOf(s.tiles);
       s.tiles.forEach((t, i) => {
         const name = `tile_${String(i + 1).padStart(pad, '0')}.png`;
+        const skip = excluded.has(i);
+        // Excluded tiles still ship, flagged in the manifest rather than deleted:
+        // the operator's judgement is recorded, not silently applied, so the call
+        // can be reviewed later. They are left out of TileConfiguration so Fiji
+        // won't place them.
         zip.file(name, t.blob);
         // Coordinates are the integer positions the tiles were actually pasted
         // at, shifted so the top-left of the mosaic is the origin.
         const x = Math.round(t.x) + s.mosaic.originX;
         const y = Math.round(t.y) + s.mosaic.originY;
-        rows.push(`${i + 1},${name},${x},${y},${t.w},${t.h},${t.blurry ? 1 : 0},${Math.round(t.sharpness || 0)},${new Date(t.capturedAt).toISOString()}`);
-        cfg.push(`${name}; ; (${x}.0, ${y}.0)`);
+        rows.push(
+          `${i + 1},${name},${x},${y},${t.w},${t.h},${t.blurry ? 1 : 0},${Math.round(t.sharpness || 0)},` +
+          `${tileQuality(t, medSharp).toFixed(2)},${skip ? 1 : 0},${new Date(t.capturedAt).toISOString()}`
+        );
+        if (!skip) cfg.push(`${name}; ; (${x}.0, ${y}.0)`);
       });
       zip.file('manifest.csv', rows.join('\n') + '\n');
       zip.file('TileConfiguration.txt', cfg.join('\n') + '\n');
@@ -808,6 +1011,12 @@ export default function App() {
                 </div>
               </>
             )}
+            <div className="alert">
+              <b>Đưa con trỏ chuột ra ngoài vùng quét</b> trước khi bắt đầu. Trình duyệt thường bỏ qua
+              yêu cầu ẩn con trỏ, nên nó sẽ bị dán vào ảnh ghép; và khi bạn rời tay khỏi chuột để kéo
+              tiêu bản, con trỏ đứng yên trở thành một vật cố định trong khung — đúng loại thứ làm lệch
+              phép đo dịch chuyển.
+            </div>
             <div className="note">
               Khung <b>xanh</b> = vùng ảnh được lưu vào ảnh ghép. 5 khung <b>vàng</b> = khung dò, phần
               thực sự dùng để đo dịch chuyển. Kéo chuột trên khung xem trước để chọn lại vùng quét —
@@ -841,8 +1050,27 @@ export default function App() {
             </div>
           </div>
 
+          <div className="block">
+            <h2>3 · Chống trôi</h2>
+            <label className="check">
+              <input type="checkbox" checked={anchor} onChange={(e) => setAnchor(e.target.checked)} />
+              <span>Neo từng ô vào ảnh ghép</span>
+            </label>
+            <div className="note">
+              Bật (khuyến nghị): vị trí mỗi ô được đo <b>so với ảnh ghép đã dựng</b>, không phải so với ô
+              liền trước. Ảnh ghép là hệ quy chiếu cố định nên sai số không cộng dồn — đó là thứ chặn hiện
+              tượng cả dải ảnh nghiêng dần. Khi quét zigzag đi ngược lại cạnh một cột cũ, vị trí được đo
+              từ chính phần chồng lấn với cột đó, nên vòng quét tự khép lại.
+            </div>
+            <div className="note">
+              Tắt nếu muốn thấy đúng chuỗi đo thô (chỉ để chẩn đoán). Nhật ký ghi
+              <code> neo vào ảnh ghép (chỉnh Npx)</code> — N là mức sai số vừa được sửa; N tăng dần theo
+              đường quét chính là lượng trôi mà bước này đang bù.
+            </div>
+          </div>
+
           <div className="block" style={{ borderColor: running ? 'var(--teal)' : 'var(--line)' }}>
-            <h2>3 · Chạy</h2>
+            <h2>4 · Chạy</h2>
             {!running ? (
               <button className="primary" disabled={!cvReady || !capturing} onClick={startAuto}>
                 Bắt đầu <span className="kbd">Space</span>
@@ -852,12 +1080,14 @@ export default function App() {
             )}
             {lost && (
               <div className="alert lost">
-                <b>Mất dấu.</b> App không xác định được khung hiện tại đang ở đâu, nên nó dừng ghép chứ
-                không đoán — đoán sai một ô là sai cả phần sau.
+                <b>Mất dấu — đang tự tìm lại.</b> App đang dò khung hiện tại trong <i>toàn bộ</i> ảnh
+                ghép, nên bạn <b>không cần khớp tay với ô cuối</b>.
                 <br /><br />
-                Kéo tiêu bản <b>trở lại</b> cho tới khi thấy lại vùng đã quét gần đây; app tự bắt lại
-                ngay khi định vị được, không cần bấm gì. Nếu vẫn không bắt lại: lấy nét lại, hoặc thu
-                nhỏ vùng quét (có thể một khung dò đang nằm trên vật cố định).
+                Chỉ cần kéo tiêu bản về <b>bất kỳ vùng nào đã quét</b> — bất kỳ chỗ nào, không cần đúng
+                mép đang để ngỏ. App tự nhận ra vị trí và tiếp tục, không phải bấm gì.
+                <br /><br />
+                Nếu vẫn không bắt lại: lấy nét lại (ảnh mờ thì không dò được), hoặc thu nhỏ vùng quét —
+                có thể một khung dò đang nằm trên vật cố định.
               </div>
             )}
             <div className="note">
@@ -899,6 +1129,69 @@ export default function App() {
           </div>
 
           <div className="block">
+            <h2>5 · Tối ưu vị trí toàn cục</h2>
+            <button className="primary" onClick={runOptimize} disabled={tileCount < 3 || !!busyLabel}>
+              Tối ưu vị trí tất cả các ô
+            </button>
+            <div className="note">
+              Trong lúc quét, vị trí mỗi ô được quyết định ngay khi đặt và không đổi nữa — ô nào đã lệch
+              3px thì lệch luôn. Bước này đo dịch chuyển giữa <b>mọi cặp ô chồng lấn</b> (kể cả ô ở hàng
+              trên, hay cột mà đường quét đang đi ngược lại cạnh nó), coi mỗi phép đo là một ràng buộc có
+              độ tin cậy, rồi <b>giải lại toàn bộ vị trí cùng lúc</b> sao cho thoả mãn tất cả tốt nhất.
+              Không phép đo nào là tối hậu, nên một phép đo sai bị các ô lân cận áp đảo thay vì lan ra —
+              và đường quét vòng lại buộc phải khớp với chính nó.
+            </div>
+            <div className="note">
+              Đây chính là thuật toán Fiji dùng. Bài toán nhỏ (vài trăm ô, vài trăm ràng buộc) nên chạy
+              ngay trong trình duyệt, không cần server.
+            </div>
+            {optStats && (
+              <div className="note mono" style={{ color: 'var(--teal)' }}>
+                {optStats.links}/{optStats.pairs} cặp đo được · sai lệch trung bình{' '}
+                {optStats.beforeResidual.toFixed(1)}px → {optStats.afterResidual.toFixed(1)}px · bỏ{' '}
+                {optStats.dropped} cặp lỗi · dịch tối đa {optStats.maxMove.toFixed(0)}px
+              </div>
+            )}
+          </div>
+
+          <div className="block" style={{ borderColor: fused ? 'var(--teal)' : 'var(--amber)' }}>
+            <h2>6 · Hậu kiểm pixel trước khi xuất</h2>
+            <div className="note" style={{ marginTop: 0 }}>
+              Trong lúc quét, ô chụp sau ghi đè ô chụp trước — nhanh, đủ để định vị. Nhưng ở một vị trí
+              thường có vài ô chồng lấn, và chúng <b>không tốt như nhau</b> tại vị trí đó: pixel gần
+              <b> tâm</b> khung nằm ở vùng phẳng, đều sáng; cùng chi tiết đó nếu lấy từ <b>mép</b> khung
+              thì dính vignette, gradient halo và quang sai nặng nhất. Bước này dựng lại cả ảnh ghép và
+              quyết định theo từng pixel là tin ô nào.
+            </div>
+            <div className="gap" />
+            {Object.entries(FUSION_METHODS).map(([key, m]) => (
+              <label className={'radio' + (fusion === key ? ' on' : '')} key={key}>
+                <input type="radio" name="fusion" checked={fusion === key} onChange={() => setFusion(key)} />
+                <span>
+                  <b>{m.label}</b>
+                  <br />
+                  <span className="dim">{m.note}</span>
+                </span>
+              </label>
+            ))}
+            <div className="gap" />
+            <button className="primary" onClick={() => runFusion(fusion)} disabled={tileCount === 0 || !!busyLabel}>
+              Dựng lại &amp; xem trước
+            </button>
+            <div className="note">
+              {fused
+                ? `Ảnh ghép đang hiển thị bản dựng "${FUSION_METHODS[fused].label}" — xuất ra sẽ đúng như bạn thấy.`
+                : 'Ảnh ghép đang hiển thị bản dán lúc quét (ô mới ghi đè). Dựng lại trước khi xuất để dùng bản tốt nhất.'}
+            </div>
+            {excluded.size > 0 && (
+              <div className="note amber">
+                Đang bỏ {excluded.size} ô. Chúng vẫn nằm trong bản xuất ZIP nhưng được đánh dấu
+                <code> excluded=1</code> trong manifest và không đưa vào TileConfiguration.
+              </div>
+            )}
+          </div>
+
+          <div className="block">
             <h2>Công cụ</h2>
             <div className="row">
               <button onClick={undo} disabled={tileCount === 0}>Hoàn tác ô cuối</button>
@@ -920,16 +1213,34 @@ export default function App() {
               {showTiles ? 'Ẩn danh sách ô' : 'Hiện danh sách ô'}
             </button>
             {showTiles && (
-              <div className="tiles">
-                {S.current.tiles.map((t, i) => (
-                  <div className="tile-row" key={i}>
-                    <span className="mono dim">#{i + 1}</span>
-                    <Thumb blob={t.blob} />
-                    <span className="mono dim">{Math.round(t.x)}, {Math.round(t.y)}</span>
-                    {t.blurry && <span className="badge warn">Mờ</span>}
-                  </div>
-                ))}
-              </div>
+              <>
+                {blurry > 0 && (
+                  <>
+                    <div className="gap" />
+                    <button onClick={excludeAllBlurry}>Bỏ tất cả {blurry} ô mờ</button>
+                  </>
+                )}
+                <div className="tiles">
+                  {S.current.tiles.map((t, i) => (
+                    <label className={'tile-row' + (excluded.has(i) ? ' off' : '')} key={i}>
+                      <input
+                        type="checkbox"
+                        checked={!excluded.has(i)}
+                        onChange={() => toggleExclude(i)}
+                        title="Bỏ tích để loại ô này khỏi ảnh ghép"
+                      />
+                      <span className="mono dim">#{i + 1}</span>
+                      <Thumb blob={t.blob} />
+                      <span className="mono dim">{Math.round(t.x)}, {Math.round(t.y)}</span>
+                      {t.blurry && <span className="badge warn">Mờ</span>}
+                    </label>
+                  ))}
+                </div>
+                <div className="note">
+                  Bỏ tích ô nào bị halo, nhoè, hoặc lệch. Sau khi bỏ, bấm "Dựng lại &amp; xem trước" ở trên
+                  để thấy kết quả — chỗ trống sẽ được các ô chồng lấn còn lại lấp vào.
+                </div>
+              </>
             )}
           </div>
         </div>
@@ -943,7 +1254,25 @@ export default function App() {
             </div>
           ) : (
             <div className="stage-scroll">
-              <div className="stage-frame"><canvas ref={canvasRef}></canvas></div>
+              <div className="stage-frame">
+                <canvas ref={canvasRef}></canvas>
+                {/* Marks where the newest tile sits. Without it the mosaic gives no
+                    clue which edge is the open one, which is exactly what makes
+                    manual re-alignment so awkward. */}
+                {lastRect && dims.w > 0 && (
+                  <div
+                    className={'last-tile' + (lost ? ' lost' : '')}
+                    style={{
+                      left: (lastRect.x + cv_originX()) * dims.scale,
+                      top: (lastRect.y + cv_originY()) * dims.scale,
+                      width: lastRect.w * dims.scale,
+                      height: lastRect.h * dims.scale,
+                    }}
+                  >
+                    <span>ô mới nhất{lost ? ' · đang tìm lại vị trí' : ''}</span>
+                  </div>
+                )}
+              </div>
             </div>
           )}
           <div className="footer mono">

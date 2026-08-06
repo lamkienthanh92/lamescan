@@ -27,6 +27,34 @@ Việc dán là **block copy tại toạ độ nguyên** — không warp, không
 trong ảnh ghép đúng là pixel ra từ camera, nguyên vẹn, tại đúng (x, y) mà bộ đo
 đặt nó vào.
 
+## Chống trôi: neo vào ảnh ghép
+
+Nếu mỗi ô được đặt **so với ô liền trước**, thì vị trí của ô thứ N là tổng của N
+phép đo. Sai số ngẫu nhiên trong các phép đo đó lớn dần theo kiểu bước ngẫu nhiên,
+nhưng sai số **có hệ thống** — lệch đều một phía dưới 1 pixel do peak-locking trong
+nội suy dưới pixel, do stage hơi xoay, do pixel không vuông — thì lớn dần **tuyến
+tính**. Trên một cột dài, nó hiện ra thành cả dải ảnh nghiêng dần: từng hàng vẫn
+khớp với hàng bên cạnh, nhưng cả cột đi dạt sang một bên.
+
+Cách sửa là thôi đo so với ô trước, mà đo **so với ảnh ghép đã dựng**. Ảnh ghép là
+hệ quy chiếu cố định chứa mọi ô đã đặt, nên vị trí đo từ nó không mang sai số cộng
+dồn. Và khi quét zigzag đi ngược lại cạnh một cột cũ, phần chồng lấn với cột đó
+chính là thứ vị trí được đo từ — nên vòng quét **tự khép lại**, không cần cơ chế
+loop closure riêng.
+
+Cách làm: trích một vùng của ảnh ghép quanh vị trí dự đoán, làm xám và thu về đúng
+độ phân giải xử lý, rồi tìm 5 khung dò của khung hiện tại trong đó. Phần ảnh ghép
+chưa được vẽ (alpha = 0) được làm phẳng về giá trị trung bình của phần đã vẽ — để
+nguyên màu đen thì nó là một vùng tương phản cực mạnh mà tương quan sẽ bám vào.
+Cần ít nhất 25% diện tích ô đã có sẵn trong ảnh ghép, và kết quả bị bỏ nếu nó lệch
+khỏi dự đoán quá bán kính tìm (không phải tinh chỉnh nữa mà là khớp sai).
+
+Nhật ký ghi `neo vào ảnh ghép (chỉnh Npx)`. **N tăng dần theo đường quét chính là
+lượng trôi mà bước này đang bù** — đó là con số để bạn biết hiện tượng trôi lớn tới
+đâu.
+
+Tắt được (chỉ để chẩn đoán, xem chuỗi đo thô).
+
 ## Hai mốc tham chiếu
 
 Khung dò được lấy từ **hai** mốc, không phải một:
@@ -45,9 +73,39 @@ lúc nào đó. Một cú giật vượt tầm với là kết thúc phiên qué
 Mốc "khung ngay trước đó" luôn chỉ cũ 200ms, nên mất dấu chỉ tốn **1 khung** thay
 vì phần còn lại của phiên. Nhật ký ghi `nối qua khung trước` khi điều đó xảy ra.
 
+### Tự tìm lại vị trí khi mất dấu
+
+Khi mất dấu, vị trí là **chưa biết chứ không phải không thể biết**: ảnh ghép đã chứa
+toàn bộ những gì đã quét, nên khung hiện tại có thể được dò tìm trong *tất cả* nó.
+Đòi người đọc phải chỉnh kính cho khớp lại với ô cuối là bắt họ làm bằng mắt cái việc
+mà máy làm chính xác được — và nó khó thật, vì mép đang để ngỏ của ảnh ghép không có
+mốc nào để nhắm quang trường vào.
+
+Nên app tự làm, hai tầng:
+
+- **Thô:** thu nhỏ cả ảnh ghép và khung hiện tại theo cùng một tỉ lệ rồi tương quan.
+  Tìm được vị trí gần đúng ở *bất kỳ đâu* trong vùng đã quét, với giá của một phép
+  `matchTemplate` trên ảnh nhỏ. Tỉ lệ thu nhỏ được chọn sao cho khung vẫn còn đủ lớn
+  (cạnh ngắn ≥ 56px) — thu theo kích thước ảnh ghép không thôi thì với scan lớn khung
+  sẽ còn vài pixel và vô dụng.
+- **Tinh:** đưa ứng viên đó cho chính bước neo vào ảnh ghép, đo lại ở độ phân giải xử
+  lý với đồng thuận 5 khung dò như mọi chỗ khác.
+
+Tầng tinh là thứ làm một đỉnh tương quan thô sai trở nên vô hại — một vị trí sai
+không thể qua được yêu cầu 5 khung dò độc lập cùng đồng ý tại đó. Nhờ vậy tầng thô
+được phép dễ tính.
+
+**Với bạn nghĩa là:** kéo tiêu bản về **bất kỳ vùng nào đã quét** là xong. Bất kỳ
+chỗ nào, không cần đúng mép đang để ngỏ, không cần khớp tâm quang trường với tâm ô
+nào cả, không phải bấm gì. App tự nhận ra và tiếp tục. Nhật ký ghi
+`đã tự tìm lại vị trí: (x, y) — không cần khớp tay`.
+
+Ảnh ghép cũng vẽ khung viền quanh **ô mới nhất** (nhấp nháy đỏ khi đang mất dấu), để
+bạn luôn biết mép nào đang để ngỏ.
+
 Nếu vẫn mất dấu 4 khung liên tiếp, app hiện rõ trạng thái **Mất dấu** kèm hướng
-dẫn: kéo trở lại vùng đã quét, app tự bắt lại, không cần bấm gì. Nó dừng ghép chứ
-không đoán — đoán sai một ô là sai cả phần sau.
+dẫn, và bắt đầu tự dò tìm (xem dưới). Nó dừng ghép chứ không đoán — đoán sai một ô
+là sai cả phần sau.
 
 ## Vì sao khung dò phải nhỏ
 
@@ -112,6 +170,85 @@ App còn hỗ trợ ba cách nữa:
   bạn thấy ngay có khung nào chạm vào halo/bụi/overlay không.
 - Kiểm tra độ tối dải viền vùng quét và cảnh báo thẳng nếu nghi ngờ.
 
+## Tối ưu vị trí toàn cục
+
+Đây là thứ duy nhất trước đây phải nhờ Fiji, và giờ đã có trong app.
+
+Trong lúc quét, vị trí một ô được quyết định ngay khi đặt và không đổi nữa. Kể cả
+khi đo so với cả ảnh ghép, quyết định vẫn là chung cuộc: ô nào đã lệch 3px thì lệch
+luôn, và mọi ô đo sau đó thừa hưởng chỗ lệch ấy.
+
+Fiji làm ngược lại. Nó đo dịch chuyển giữa **mọi cặp ô chồng lấn**, coi mỗi phép đo
+là một ràng buộc mềm kèm độ tin cậy, rồi **giải ra tập vị trí thoả mãn tất cả tốt
+nhất cùng một lúc**. Không phép đo nào là tối hậu, nên một phép đo tồi bị các ô lân
+cận áp đảo thay vì lan ra — và đường quét vòng lại buộc phải khớp với chính nó.
+
+Đó là bài toán bình phương tối thiểu có trọng số, và nó **nhỏ**: vài trăm ô, vài
+trăm ràng buộc. Không có lý do gì phải cần server.
+
+Cách làm:
+
+1. Tìm mọi cặp ô có độ chồng lấn ≥ 12% — kể cả cặp không liền nhau theo thứ tự
+   chụp: ô ở hàng trên, cột mà đường quét đang đi ngược lại cạnh nó. Chính những
+   ràng buộc "thêm" này mới cho phép phát hiện và sửa trôi.
+2. Với từng cặp: tương quan chuẩn hoá trên vùng chồng lấn, nội suy dưới pixel, lấy
+   điểm tương quan làm độ tin cậy.
+3. Giải Gauss-Seidel cho `min Σ w·‖(pⱼ − pᵢ) − dᵢⱼ‖²`, giữ ô đầu tiên làm mốc.
+4. Lặp lại có gia trọng bền vững (IRLS): cặp nào lệch quá xa nghiệm hiện tại sẽ bị
+   giảm trọng số rồi giải lại — nên một cặp đo sai bị chiết khấu thay vì kéo cả
+   vùng lân cận theo.
+
+App báo lại con số cụ thể: `sai lệch trung bình giữa các cặp: 8.4px → 0.6px`. Đó là
+thước đo trực tiếp cho việc tối ưu đã làm được gì.
+
+`test-optimize.mjs` dựng một đường quét zigzag 6×5 với truth đã biết, làm hỏng vị
+trí đúng theo kiểu trôi tích luỹ (0.4px mỗi bước, sai tối đa >10px), rồi kiểm tra
+solver khôi phục lại dưới 0.05px. Có một test riêng làm sai lệch một cặp 60px và
+kiểm tra không ô nào bị dịch quá 3px.
+
+## Hậu kiểm trước khi xuất
+
+Trong lúc quét, mỗi khung được dán đè lên chỗ cũ — nhanh, đủ để định vị. Nhưng ở
+một vị trí thường có vài ô chồng lấn, và chúng **không tốt như nhau tại vị trí
+đó**: pixel gần **tâm** khung nằm ở vùng phẳng, đều sáng; cùng chi tiết đó nếu lấy
+từ **mép** khung thì dính vignette, gradient halo và quang sai nặng nhất. Dán đè là
+chọn bừa giữa chúng.
+
+Nên trước khi xuất, ảnh ghép được dựng lại từ toàn bộ ô cùng lúc, quyết định theo
+từng pixel là tin ô nào. Đây chính là *fusion method* của Fiji, và cùng một đánh
+đổi: giữ nguyên một pixel gốc thì bảo toàn chi tiết chính xác nhưng còn thấy đường
+ranh; trộn nhiều pixel thì mượt ranh nhưng nhoè đúng những chỗ định vị hơi lệch.
+
+| Phương pháp | Làm gì | Dùng khi |
+|---|---|---|
+| **Chọn pixel tốt nhất** *(mặc định)* | Mỗi pixel lấy từ ô có điểm chất lượng cao nhất — ưu tiên gần tâm khung và ô nét. Không trộn. | Mặc định cho việc đếm: pixel giữ nguyên gốc, không nhoè. |
+| **Trộn có trọng số** | Trung bình có trọng số, giảm dần về 0 ở biên khung. | Khi cần ảnh nhìn liền mạch, chấp nhận nhoè nhẹ. |
+| **Trộn loại nhiễu** | 2 lượt: lượt đầu tính trung bình, lượt sau bỏ ô lệch quá xa rồi tính lại. | Xoá con trỏ chuột, bụi, mép halo, ô mờ đơn lẻ. Cần ≥3 ô chồng lấn. |
+| **Ô mới nhất** | Không hậu kiểm — như lúc quét. | Chỉ để so sánh. |
+
+Trọng số chất lượng là cửa sổ Hann theo cả hai chiều (đạt 1 ở tâm, về 0 ở biên) nhân
+với điểm nét của ô. Ô mờ bị **giảm trọng số chứ không bỏ**, để nó vẫn lấp được chỗ
+mà không ô nét nào phủ tới, thay vì để lỗ trống.
+
+### Loại ô bằng tay
+
+Danh sách ô có checkbox. Bỏ tích ô nào dính halo, nhoè hay lệch; chỗ trống sẽ được
+các ô chồng lấn còn lại lấp vào. Có nút **Bỏ tất cả ô mờ** cho các ô app đã tự đánh
+dấu.
+
+Ô bị bỏ **vẫn nằm trong bản xuất ZIP**, đánh dấu `excluded=1` trong `manifest.csv`
+và không đưa vào `TileConfiguration.txt`. Nhận định của người đọc được *ghi lại*
+chứ không âm thầm áp dụng — để sau này có thể xem lại quyết định đó.
+
+Quy trình: quét → mở danh sách ô, bỏ ô xấu → chọn phương pháp → **Dựng lại & xem
+trước** → kiểm tra trên màn hình → xuất. Bất cứ khi nào có ô mới được thêm, bản
+dựng bị đánh dấu hết hiệu lực và cần dựng lại.
+
+Xử lý theo từng dải ngang nên bộ nhớ đỉnh không phụ thuộc kích thước phiên quét.
+
+Thứ tự đầy đủ trước khi xuất: **Tối ưu vị trí toàn cục** → bỏ ô xấu → chọn phương
+pháp gộp pixel → **Dựng lại & xem trước** → xuất.
+
 ## Nhật ký
 
 Mỗi tick đều ghi lại nó quyết định gì và vì sao, nên "app không chạy" luôn có câu
@@ -135,7 +272,7 @@ từng khung dò đúng vì lý do này — bạn thấy ngay bao nhiêu khung b
 ```bash
 npm install
 npm run dev
-npm run test   # kiểm tra quy tắc đồng thuận giữa các khung dò
+npm run test   # đồng thuận khung dò + chuyển hệ toạ độ khi neo + quy tắc hậu kiểm
 ```
 
 Cần chạy qua HTTP(S)/localhost — API chia sẻ màn hình yêu cầu "secure context",
@@ -150,22 +287,28 @@ khai lên host tĩnh nào cũng được (đã có `netlify.toml`).
   trước khi bấm Bắt đầu — khung đầu tiên sau đó được coi là nối tiếp từ ô cuối.
 - **Cảnh báo mờ.** Laplacian variance so với trung vị của ~30 ô gần nhất; ô nào
   dưới 40% mức nền bị đánh dấu. Ngưỡng tương đối, tự thích nghi theo phiên.
-- **Xuất.** PNG toàn cảnh (tự thu nhỏ nếu vượt giới hạn canvas của trình duyệt),
+- **Xuất.** PNG toàn cảnh (nhớ chạy hậu kiểm trước) (tự thu nhỏ nếu vượt giới hạn canvas của trình duyệt),
   và ZIP gồm từng ảnh gốc + `manifest.csv` (toạ độ x, y nguyên) +
   `TileConfiguration.txt` nếu muốn ghép lại bằng Fiji cho chất lượng cao hơn.
-- Vùng chồng lấn: **ô mới ghi đè ô cũ**. Với định vị thuần tịnh tiến, hai bản của
-  vùng chồng lấn là cùng những pixel đó (trong giới hạn sai số của bộ đo), nên
-  trộn chúng không được gì mà còn mất — trộn hai bản lệch nhau chút ít của cùng
-  cấu trúc chính là thứ tạo ra vệt nhoè/nhân đôi ở biên ô.
+- Vùng chồng lấn lúc đang quét: **ô mới ghi đè ô cũ** (nhanh). Việc chọn pixel tốt
+  nhất diễn ra ở khâu hậu kiểm trước khi xuất — xem mục trên.
 - Phím **Space** bật/tắt chạy.
 
 ## Giới hạn đã biết
 
-- **Không có hiệu chỉnh trôi tích luỹ.** Mỗi bước được đo so với bước trước, nên
-  sai số cộng dồn theo chiều dài đường quét. Không loop closure, không tối ưu toàn
-  cục — đó là cái giá của việc bỏ pose graph. Với đường quét dài, dùng bản xuất ZIP
-  + Fiji (`Grid/Collection stitching` → `Positions from file` → `Defined by
-  TileConfiguration`) để tinh chỉnh lại toàn cục.
+- **Chỉ mô hình tịnh tiến.** Cả bước tối ưu toàn cục cũng chỉ giải ra vị trí x, y —
+  không xoay, không tỉ lệ, không biến dạng phi tuyến. Nếu stage của bạn có xoay
+  đáng kể, hoặc ống kính có méo hình rõ, thì đây là giới hạn thật và Fiji (hoặc
+  ASHLAR) sẽ tốt hơn.
+- **Vùng chồng lấn thiếu chi tiết** thì phép đo cặp thất bại và ràng buộc đó không
+  tồn tại. Vùng nền trắng của tiêu bản là chỗ hay gặp. App báo số cặp đo được trên
+  tổng số cặp; nếu tỉ lệ đó thấp thì kết quả tối ưu yếu.
+- **Con trỏ chuột bị dán vào ảnh.** Trình duyệt thường bỏ qua `cursor: 'never'`.
+  Đưa con trỏ ra ngoài vùng quét trước khi bắt đầu — ngoài việc làm bẩn ảnh, một
+  con trỏ đứng yên là vật cố định trong khung và sẽ làm lệch phép đo.
+- **Ghép nối thấy được vệt sáng/tối giữa các ô** nếu camera đang tự động điều chỉnh
+  phơi sáng hoặc cân bằng trắng. Chưa có bù gain. Cách xử lý hiện tại: tắt
+  auto-exposure và auto-white-balance trong phần mềm camera trước khi quét.
 - **Không xử lý xoay.** Nếu lame bị xoay giữa hai khung thì tương quan tụt điểm và
   khung đó bị bỏ qua.
 - **Nguồn ảnh là màn hình**, đã qua nén/resample của phần mềm camera. Nếu camera là
@@ -183,6 +326,23 @@ khai lên host tĩnh nào cũng được (đã có `netlify.toml`).
 trên từng ảnh gốc trong bản xuất ZIP. Nếu dùng để hỗ trợ đọc AFB thật, cần một
 bước thẩm định song song (đọc thủ công so với đọc qua app trên cùng bộ lame) trước
 khi tin vào kết quả.
+
+## So với Fiji
+
+| | App này | Fiji Grid/Collection |
+|---|---|---|
+| Đo cặp ô | Tương quan chuẩn hoá + nội suy dưới pixel | Phase correlation (FFT) |
+| Tối ưu toàn cục | Có — bình phương tối thiểu có trọng số + IRLS | Có |
+| Gộp pixel | 4 phương pháp (tốt nhất / trộn / loại nhiễu / mới nhất) | Tương tự |
+| Xoay, tỉ lệ, méo hình | **Không** | Không (bản Grid/Collection cũng chỉ tịnh tiến) |
+| Chống vật cố định (halo, bụi, con trỏ) | **Có** — khung dò nhỏ + đồng thuận + trộn loại nhiễu | Không có khái niệm này |
+| Chạy trực tiếp lúc quét | Có | Không (chỉ xử lý offline) |
+| Loại ô bằng tay, ghi lại quyết định | Có | Không |
+
+Chỗ Fiji còn hơn: phase correlation trên toàn vùng chồng lấn thường bền hơn tương
+quan trên mảng nhỏ khi ảnh có nhiễu; và nếu cần mô hình biến đổi phức tạp hơn tịnh
+tiến thì phải dùng Fiji hoặc ASHLAR. Ngược lại, Fiji không biết gì về vòng halo —
+nó sẽ vui vẻ bám vào đó y như bản đầu của app này.
 
 ## So với bản trước
 

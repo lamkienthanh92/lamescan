@@ -45,7 +45,7 @@ export function toMatchGray(mat, maxDim = MATCH_MAX_DIM) {
 // per axis. The peak of a smooth correlation surface almost never sits exactly
 // on an integer sample; without this, every step carries up to half a
 // working-resolution pixel of error, and those errors accumulate along a scan.
-function subpixelPeak(res, loc) {
+export function subpixelPeakOf(res, loc) {
   const refine = (a, b, c) => {
     const d = a - 2 * b + c;
     if (d === 0) return 0;
@@ -118,7 +118,7 @@ function matchOnePatch(refGray, curGray, cx, cy, pw, ph) {
     // stay comparable between frames.
     cv.matchTemplate(curGray, tpl, res, cv.TM_CCOEFF_NORMED);
     const mm = cv.minMaxLoc(res);
-    const [sx, sy] = subpixelPeak(res, mm.maxLoc);
+    const [sx, sy] = subpixelPeakOf(res, mm.maxLoc);
     // A peak hard against the edge of the search area means the true match is
     // probably outside it — the drag outran this patch's reach — so the number
     // is a floor, not a measurement.
