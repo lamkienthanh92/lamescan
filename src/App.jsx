@@ -83,6 +83,8 @@ export default function App() {
   const [lastRect, setLastRect] = useState(null); // last tile, marked on the mosaic view
   const [cover, setCover] = useState(null);       // { onceFrac } from the minimap
   const [pipOn, setPipOn] = useState(false);
+  const [showCov, setShowCov] = useState(true);
+  const showCovRef = useRef(true);
   const [anchor, setAnchor] = useState(true);
   const [fusion, setFusion] = useState('best');
   const [excluded, setExcluded] = useState(() => new Set());
@@ -103,7 +105,7 @@ export default function App() {
   useEffect(() => { patchRef.current = patchFrac; }, [patchFrac]);
   useEffect(() => { anchorRef.current = anchor; }, [anchor]);
   useEffect(() => { excludedRef.current = excluded; }, [excluded]);
-  useEffect(() => { refreshMinimap(); }, [excluded, refreshMinimap]);
+  useEffect(() => { showCovRef.current = showCov; }, [showCov]);
 
   const S = useRef({
     mosaic: null,
@@ -148,9 +150,16 @@ export default function App() {
       sourceCanvas: canvasRef.current,
       lastRect: last ? { x: last.x, y: last.y, w: last.w, h: last.h } : null,
       excluded: excludedRef.current,
+      showCoverage: showCovRef.current,
     });
     if (r) setCover({ onceFrac: r.onceFrac });
   }, []);
+
+  // Placed after refreshMinimap, not next to the other ref-syncing effects: a
+  // dependency array is evaluated where it is written, so naming a `const`
+  // declared further down the component throws "cannot access before
+  // initialization" on the very first render.
+  useEffect(() => { refreshMinimap(); }, [excluded, showCov, refreshMinimap]);
 
   const cv_originX = () => (S.current.mosaic ? S.current.mosaic.originX : 0);
   const cv_originY = () => (S.current.mosaic ? S.current.mosaic.originY : 0);
@@ -1195,6 +1204,13 @@ export default function App() {
             ) : (
               <button className="warn" onClick={closePip}>Đóng cửa sổ nổi</button>
             )}
+            <label className="check" style={{ marginTop: 8 }}>
+              <input type="checkbox" checked={showCov} onChange={(e) => setShowCov(e.target.checked)} />
+              <span>Tô vùng chưa hoàn thiện</span>
+            </label>
+            <div className="note">
+              Nền bản đồ là <b>ảnh thật đã quét</b>, thu nhỏ. Bỏ tích ở trên để xem ảnh sạch không lớp phủ.
+            </div>
             <div className="note">
               Vùng <span className="amber">vàng</span> = mới quét <b>1 lần</b>, chưa có ô nào chồng lấn:
               đã có ảnh, nhưng không có ô thứ hai để đối chiếu hay để chọn pixel tốt hơn ở khâu hậu kiểm,
@@ -1359,14 +1375,18 @@ export default function App() {
         </div>
 
         <div className="stage">
-          {tileCount === 0 ? (
+          {tileCount === 0 && (
             <div className="stage-empty">
               Ảnh ghép sẽ hiện ở đây.
               <br />
               Chọn cửa sổ nguồn, kiểm tra khung dò nằm trong vùng sáng, rồi bấm "Bắt đầu".
             </div>
-          ) : (
-            <div className="stage-scroll">
+          )}
+          {/* Always mounted, hidden while empty. Unmounting it meant the first tile
+              was composited into a canvas that did not exist yet — nothing appeared
+              until the second tile forced a full repaint, and the overview map had
+              no real image to copy from. */}
+          <div className="stage-scroll" style={{ display: tileCount === 0 ? 'none' : 'block' }}>
               <div className="stage-frame">
                 <canvas ref={canvasRef}></canvas>
                 {/* Marks where the newest tile sits. Without it the mosaic gives no
@@ -1386,8 +1406,7 @@ export default function App() {
                   </div>
                 )}
               </div>
-            </div>
-          )}
+          </div>
           <div className="footer mono">
             <span>Tương quan pixel trên khung dò · tịnh tiến x, y · không nội suy</span>
             <span>{tileCount} ô</span>

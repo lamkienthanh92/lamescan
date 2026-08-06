@@ -17,7 +17,7 @@
 // The second case is the one that is invisible on the mosaic itself and the one
 // that quietly degrades the result, so it gets the highlight.
 
-const MAX_DIM = 260;
+const MAX_DIM = 320;
 
 // How many tiles cover each cell of the map, capped at 2 — the only distinction
 // that matters is none / exactly one / more than one. Kept pure and separate from
@@ -58,7 +58,10 @@ export const COVERAGE_COLOURS = {
 // `sourceCanvas` is the live display canvas: it already holds a scaled copy of the
 // whole mosaic, so blitting it down is a GPU operation rather than another pass
 // over the mosaic Mat.
-export function drawMinimap(canvas, mosaic, tiles, { sourceCanvas, lastRect, excluded, maxDim = MAX_DIM } = {}) {
+export function drawMinimap(
+  canvas, mosaic, tiles,
+  { sourceCanvas, lastRect, excluded, maxDim = MAX_DIM, showCoverage = true } = {}
+) {
   if (!canvas || !mosaic || !mosaic.w || !mosaic.h) return null;
   const scale = Math.min(maxDim / mosaic.w, maxDim / mosaic.h);
   const cw = Math.max(1, Math.round(mosaic.w * scale));
@@ -74,6 +77,10 @@ export function drawMinimap(canvas, mosaic, tiles, { sourceCanvas, lastRect, exc
   }
 
   const { cov, onceCells, coveredCells } = coverageStats(mosaic, tiles, scale, cw, ch, excluded);
+  if (!showCoverage) {
+    if (lastRect) strokeLast(ctx, mosaic, lastRect, scale);
+    return { scale, w: cw, h: ch, onceFrac: coveredCells > 0 ? onceCells / coveredCells : 0 };
+  }
 
   if (!overlayCanvas) overlayCanvas = document.createElement('canvas');
   if (overlayCanvas.width !== cw || overlayCanvas.height !== ch) {
@@ -88,21 +95,15 @@ export function drawMinimap(canvas, mosaic, tiles, { sourceCanvas, lastRect, exc
     img.data[d] = 199;      // amber, matching the app's warning colour
     img.data[d + 1] = 125;
     img.data[d + 2] = 20;
-    img.data[d + 3] = 150;
+    // Deliberately light. The base layer is the real scanned image and that is
+    // what the map is for — the tint is a hint about coverage, not a substitute
+    // for seeing the specimen, so it must not obscure it.
+    img.data[d + 3] = 66;
   }
   octx.putImageData(img, 0, 0);
   ctx.drawImage(overlayCanvas, 0, 0);
 
-  if (lastRect) {
-    ctx.strokeStyle = '#3FB8A0';
-    ctx.lineWidth = 1.5;
-    ctx.strokeRect(
-      (lastRect.x + mosaic.originX) * scale,
-      (lastRect.y + mosaic.originY) * scale,
-      Math.max(2, lastRect.w * scale),
-      Math.max(2, lastRect.h * scale)
-    );
-  }
+  if (lastRect) strokeLast(ctx, mosaic, lastRect, scale);
 
   return {
     scale,
@@ -110,6 +111,17 @@ export function drawMinimap(canvas, mosaic, tiles, { sourceCanvas, lastRect, exc
     h: ch,
     onceFrac: coveredCells > 0 ? onceCells / coveredCells : 0,
   };
+}
+
+function strokeLast(ctx, mosaic, lastRect, scale) {
+  ctx.strokeStyle = '#3FB8A0';
+  ctx.lineWidth = 1.5;
+  ctx.strokeRect(
+    (lastRect.x + mosaic.originX) * scale,
+    (lastRect.y + mosaic.originY) * scale,
+    Math.max(2, lastRect.w * scale),
+    Math.max(2, lastRect.h * scale)
+  );
 }
 
 // ---- floating window ----

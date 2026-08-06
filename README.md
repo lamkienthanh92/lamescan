@@ -254,8 +254,12 @@ pháp gộp pixel → **Dựng lại & xem trước** → xuất.
 Trong lúc quét bạn đang nhìn cửa sổ phần mềm camera, không nhìn app — nên ảnh ghép
 nằm sau ba cửa sổ khác thì vô dụng. Bản đồ này nhỏ và **nổi lên trên**.
 
-Nó hiện nhiều hơn "chỗ nào đã có pixel", vì đó không phải câu hỏi. Câu hỏi là chỗ nào
-còn phải làm, và có **hai** câu trả lời khác nhau:
+Nền bản đồ là **ảnh thật đã quét**, thu nhỏ — không phải sơ đồ. Bên trên nó là một
+lớp tô mỏng (alpha ~26%) chỉ để gợi ý về độ phủ; tắt được bằng checkbox nếu muốn xem
+ảnh sạch.
+
+Vì ngoài "chỗ nào đã có pixel", câu hỏi thật là chỗ nào còn phải làm, và có **hai**
+câu trả lời khác nhau:
 
 - **Trong suốt** — chưa quét. Thấy ngay.
 - **Vàng** — đã quét, nhưng **chỉ 1 lần**, chưa có ô thứ hai chồng lấn. Chỗ đó đã có
@@ -294,6 +298,31 @@ Dòng lúc 10:42:16 là ví dụ đáng chú ý: có hai khung dò báo `0,0` tr
 khác báo `~312,3`. Hai khung đó đang nằm trên vật cố định. Nhật ký in ra số đo của
 từng khung dò đúng vì lý do này — bạn thấy ngay bao nhiêu khung bị ghim và bị ghim ở
 đâu.
+
+## Kiểm tra tự động
+
+```bash
+npm run test
+```
+
+Ngoài các test về thuật toán, có `check-hook-order.mjs` — nó chặn đúng lớp lỗi đã làm
+crash một bản trước:
+
+```js
+useEffect(() => { refreshMinimap(); }, [excluded, refreshMinimap]);
+...
+const refreshMinimap = useCallback(...);   // khai báo ở dưới
+```
+
+Mảng dependency là một biểu thức thường, được đánh giá đúng tại chỗ nó được viết, nên
+gọi tên một `const` khai báo phía dưới sẽ throw *"Cannot access '...' before
+initialization"* — ngay lúc render, trước khi có gì trên màn hình, với tên đã bị
+minify trong stack trace và không gợi ý gì về hook nào gây ra. Linter mặc định không
+bắt cái này.
+
+Check được xác nhận theo cả hai chiều: cây code sạch thì pass, và khi cố tình cắm lại
+đúng dòng gây lỗi thì nó báo `FAIL App.jsx:109 — hook dependency 'refreshMinimap' is
+declared later, at line 146`.
 
 ## Chạy thử
 
