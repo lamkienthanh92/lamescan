@@ -205,3 +205,16 @@ button.danger{color:var(--danger);border-color:#E7C9C9;}
 }
 .target-marker::before{left:14px;top:-6px;width:4px;height:44px;}
 .target-marker::after{left:-6px;top:14px;width:44px;height:4px;}
+
+/* diagnostics log */
+.diag-log{
+  max-height:220px;overflow-y:auto;font-size:10.5px;line-height:1.5;
+  border:1px solid var(--line);border-radius:4px;padding:6px;
+}
+.diag-row{display:flex;gap:6px;padding:2px 0;border-bottom:1px solid #ffffff08;}
+.diag-row:last-child{border-bottom:none;}
+.diag-time{color:var(--ink-dim);flex:none;}
+.diag-row.ok{color:var(--teal);}
+.diag-row.fail{color:var(--amber);}
+.diag-row.guess{color:var(--amber);opacity:.85;}
+.diag-row.skip{color:var(--ink-dim);}

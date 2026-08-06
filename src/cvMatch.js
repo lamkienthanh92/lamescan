@@ -330,7 +330,7 @@ function fitAxisTranslation(pts, axis, threshold, expectedT, maxDeviation) {
 // The general (unconstrained rotation + uniform scale + translation) RANSAC
 // fit — used both as the only path for non-axisLock matches, and as a
 // fallback for axisLock matches when neither pure-axis hypothesis fits.
-function estimateGeneralTransform(keep, kpNew, kpPrev) {
+function estimateGeneralTransform(keep, kpNew, kpPrev, minInliers = 15, minRatio = 0.10) {
   const src = [];
   const dst = [];
   keep.forEach((m) => {
@@ -349,7 +349,7 @@ function estimateGeneralTransform(keep, kpNew, kpPrev) {
     srcMat.delete();
     dstMat.delete();
     inlierMask.delete();
-    return { ok: false, inliers: 0, total: keep.length, unsupported: true };
+    return { ok: false, inliers: 0, total: keep.length, unsupported: true, reason: 'bản OpenCV.js thiếu hàm ước lượng biến đổi' };
   }
 
   let M;
@@ -368,7 +368,7 @@ function estimateGeneralTransform(keep, kpNew, kpPrev) {
     srcMat.delete();
     dstMat.delete();
     inlierMask.delete();
-    return { ok: false, inliers: 0, total: keep.length };
+    return { ok: false, inliers: 0, total: keep.length, reason: 'ước lượng biến đổi lỗi: ' + (e && e.message ? e.message : e) };
   }
 
   let inliers = 0;
@@ -379,8 +379,12 @@ function estimateGeneralTransform(keep, kpNew, kpPrev) {
   // inliers before trusting the fit — a handful of inliers out of hundreds of
   // matches is usually noise, not a real alignment.
   let result;
-  if (M.empty() || inliers < 15 || ratio < 0.25) {
-    result = { ok: false, inliers, total: keep.length };
+  if (M.empty()) {
+    result = { ok: false, inliers, total: keep.length, reason: 'không dựng được phép biến đổi' };
+  } else if (inliers < minInliers) {
+    result = { ok: false, inliers, total: keep.length, reason: `chỉ ${inliers} điểm nội, cần ${minInliers}` };
+  } else if (ratio < minRatio) {
+    result = { ok: false, inliers, total: keep.length, reason: `tỉ lệ nội ${(ratio * 100).toFixed(0)}% < ${(minRatio * 100).toFixed(0)}%` };
   } else {
     const a = Array.from(M.data64F);
     // findHomography already returns a full 3x3 matrix; the affine estimators
@@ -439,11 +443,29 @@ function estimateGeneralTransform(keep, kpNew, kpPrev) {
 // own multi-candidate search, so the (relatively expensive) cross-check only
 // has to run once on the winning candidate afterward, not on every candidate
 // during selection.
+// `minInliers` / `minRatio` / `axisTolPx` / `crossCheckVetoScore`: acceptance
+// tuning, supplied by the caller so it can be adjusted at runtime instead of
+// being frozen here.
+//
+// A note on `minRatio`, because the obvious value is wrong: the ratio is
+// inliers over the *whole* filtered match list, and that list covers the entire
+// frame while only the overlapping strip between two captures can possibly
+// match. Scanning at the recommended 25-35% overlap therefore caps the
+// achievable ratio at roughly 0.25-0.35 no matter how perfect the alignment is,
+// so a 0.25 floor rejects almost every legitimate capture. The absolute inlier
+// count is the meaningful gate; the ratio is only there to catch "a handful of
+// points out of hundreds", so it belongs well below the overlap fraction.
 export function matchTiles(
   kpNew, descNew, kpPrev, descPrev,
-  { axisLock = false, expectedDX = null, expectedDY = null, newSmall = null, prevSmall = null, tileW = null, tileH = null, skipCrossCheck = false } = {}
+  {
+    axisLock = false, expectedDX = null, expectedDY = null,
+    newSmall = null, prevSmall = null, tileW = null, tileH = null, skipCrossCheck = false,
+    minInliers = 15, minRatio = 0.10, axisTolPx = 7, crossCheckVetoScore = 0.5,
+  } = {}
 ) {
-  if (descNew.rows < 4 || descPrev.rows < 4) return { ok: false, inliers: 0, total: 0 };
+  if (descNew.rows < 4 || descPrev.rows < 4) {
+    return { ok: false, inliers: 0, total: 0, reason: 'quá ít đặc trưng ORB' };
+  }
 
   const bf = new cv.BFMatcher(cv.NORM_HAMMING, true);
   const matches = new cv.DMatchVector();
@@ -452,7 +474,7 @@ export function matchTiles(
   if (n < 8) {
     bf.delete();
     matches.delete();
-    return { ok: false, inliers: 0, total: n };
+    return { ok: false, inliers: 0, total: n, reason: `chỉ ${n} match thô, cần >= 8` };
   }
 
   const arr = [];
@@ -471,7 +493,7 @@ export function matchTiles(
       const p2 = kpPrev.get(m.trainIdx).pt;
       return [p1.x, p1.y, p2.x, p2.y];
     });
-    const AXIS_THRESH_PX = 5;
+    const AXIS_THRESH_PX = axisTolPx;
     // Half the tile's own dimension is a generous window — genuine matches
     // need real overlap to work at all, so the true offset is essentially
     // never more than about half the tile size, while a repeated-stripe
@@ -513,8 +535,17 @@ export function matchTiles(
       best = null;
     }
     const ratio = best ? best.inliers / pts.length : 0;
-    if (!best || best.inliers < 15 || ratio < 0.25) {
-      return { ok: false, inliers: best ? best.inliers : 0, total: pts.length };
+    if (!best) {
+      return { ok: false, inliers: 0, total: pts.length, reason: `không có giả thuyết trục nào khớp (dung sai ${AXIS_THRESH_PX}px)` };
+    }
+    if (best.inliers < minInliers) {
+      return { ok: false, inliers: best.inliers, total: pts.length, reason: `chỉ ${best.inliers} điểm nội, cần ${minInliers}` };
+    }
+    if (ratio < minRatio) {
+      return {
+        ok: false, inliers: best.inliers, total: pts.length,
+        reason: `tỉ lệ nội ${(ratio * 100).toFixed(0)}% < ${(minRatio * 100).toFixed(0)}% (chồng lấn quá ít?)`,
+      };
     }
 
     // Second, independent opinion — the "outer frame": pixel cross-
@@ -523,6 +554,7 @@ export function matchTiles(
     // when the caller supplied the downscaled tile copies; skipped (not
     // rejected) otherwise so callers without them still work.
     let finalT = best.t;
+    let crossChecked = false;
     if (!skipCrossCheck && newSmall && prevSmall) {
       const origDim = best.axis === 'x' ? tileW : tileH;
       const cc = origDim ? crossCorrelateAxis(newSmall, prevSmall, best.axis, best.t, origDim) : null;
@@ -531,20 +563,25 @@ export function matchTiles(
       if (cc && cc.score >= MIN_SCORE && Math.abs(cc.t - best.t) <= AGREEMENT_PX) {
         // Both agree — average for a touch more precision than either alone.
         finalT = (best.t + cc.t) / 2;
-      } else if (cc) {
-        // Both ran, but disagree — this is the actual "outer frame catches a
-        // bad inner-frame match" case. Reject rather than silently keeping
-        // the ORB-only answer.
-        return { ok: false, inliers: best.inliers, total: pts.length, disagreement: true };
+        crossChecked = true;
+      } else if (cc && cc.score >= crossCheckVetoScore) {
+        // They disagree AND the correlation is confident enough for its dissent
+        // to mean something. A weak correlation peak on a low-texture strip is
+        // not evidence of anything, so vetoing on that alone (as an
+        // unconditional disagreement check does) throws away good ORB matches.
+        return {
+          ok: false, inliers: best.inliers, total: pts.length, disagreement: true,
+          reason: `ORB và tương quan pixel lệch nhau ${Math.abs(cc.t - best.t).toFixed(0)}px (điểm ${cc.score.toFixed(2)})`,
+        };
       }
-      // cc === null (e.g. degenerate tile size): fall through and trust ORB alone.
+      // Otherwise: correlation is absent or too weak to arbitrate — trust ORB.
     }
 
     const H =
       best.axis === 'x' ? [1, 0, finalT, 0, 1, 0, 0, 0, 1] : [1, 0, 0, 0, 1, finalT, 0, 0, 1];
-    return { ok: true, inliers: best.inliers, total: pts.length, H };
+    return { ok: true, inliers: best.inliers, total: pts.length, H, axis: best.axis, crossChecked };
   }
 
-  return estimateGeneralTransform(keep, kpNew, kpPrev);
+  return estimateGeneralTransform(keep, kpNew, kpPrev, minInliers, minRatio);
 }
 

@@ -56,6 +56,37 @@ function fitScale(w, h, maxDim, maxArea) {
   return Math.min(1, maxDim / Math.max(w, h), Math.sqrt(maxArea / (w * h)));
 }
 
+// Matching strictness presets. The original code hard-coded the "strict" numbers,
+// which assume a mechanical stage moving along exactly one axis at a time with
+// no rotation. That assumption is what makes the repetitive-texture defence work,
+// but if the slide is nudged by hand — or the stage has any play in it — a step
+// with a few px of off-axis motion fails BOTH axis hypotheses and is rejected
+// outright, and the scan stalls with nothing accepted. Being able to switch is
+// the difference between diagnosing that in a minute and guessing at it.
+const MATCH_MODES = {
+  strict: {
+    label: 'Chặt (bàn cơ 2 trục)',
+    note: 'Chỉ nhận bước tịnh tiến thuần theo 1 trục. Chống nhiễu texture lặp tốt nhất, nhưng trượt nếu kéo lệch chéo.',
+    axisLock: true, minInliers: 15, minRatio: 0.22, axisTolPx: 5, crossCheckVetoScore: 0.3,
+  },
+  balanced: {
+    label: 'Vừa (khuyến nghị)',
+    note: 'Vẫn khoá trục, nhưng nới dung sai lệch chéo và không để phép tương quan pixel bác bỏ khớp khi chính nó cũng không chắc.',
+    axisLock: true, minInliers: 15, minRatio: 0.10, axisTolPx: 9, crossCheckVetoScore: 0.55,
+  },
+  loose: {
+    label: 'Linh hoạt (kéo tay)',
+    note: 'Bỏ khoá trục — nhận tịnh tiến 2 chiều và xoay nhẹ, có kiểm tra hợp lý so với vị trí dự đoán. Dùng khi chế độ trên liên tục mất khớp.',
+    axisLock: false, minInliers: 14, minRatio: 0.08, axisTolPx: 12, crossCheckVetoScore: 0.65,
+  },
+};
+// Sanity limits applied to a match from the unconstrained estimator in 'loose'
+// mode, since it has no built-in defence against repetitive-texture aliasing.
+const LOOSE_MAX_ROT_RAD = 0.12; // ~7 degrees
+const LOOSE_SCALE_TOL = 0.08;
+const LOOSE_MAX_OFFSET_FRAC = 0.6; // vs. predicted position, as a fraction of tile size
+const DIAG_LOG_SIZE = 14;
+
 function tileBBox(transform, w, h) {
   return bboxOf(cornersOf(transform, w, h));
 }
@@ -144,6 +175,9 @@ export default function App() {
   const [targetMode, setTargetMode] = useState(false);
   const [targetWorld, setTargetWorld] = useState(null); // {x,y} in world coords, or null
   const [targetConfirming, setTargetConfirming] = useState(false);
+  const [matchMode, setMatchMode] = useState('balanced');
+  const [showDiag, setShowDiag] = useState(false);
+  const [diagLog, setDiagLog] = useState([]);
 
   const videoRef = useRef(null);
   const pipVideoRef = useRef(null);
@@ -179,9 +213,20 @@ export default function App() {
     consecutiveGuesses: 0, // extrapolated (unmatched) placements in a row since the last real match
   });
 
-  const uiRef = useRef({ cvReady: false, capturing: false });
+  const uiRef = useRef({ cvReady: false, capturing: false, matchMode: 'balanced' });
   useEffect(() => { uiRef.current.cvReady = cvReady; }, [cvReady]);
   useEffect(() => { uiRef.current.capturing = capturing; }, [capturing]);
+  useEffect(() => { uiRef.current.matchMode = matchMode; }, [matchMode]);
+
+  // Rolling log of what each tick actually decided. Without this, a stalled scan
+  // is indistinguishable from a broken one: the status line only ever showed the
+  // last message, so "no tile was added" gave no clue whether the frame was
+  // skipped as not-yet-moved, found too few inliers, was vetoed by the pixel
+  // cross-check, or was rejected for having no valid axis hypothesis at all.
+  const logDiag = (kind, text) => {
+    const entry = { t: new Date().toLocaleTimeString('vi-VN', { hour12: false }), kind, text };
+    setDiagLog((prev) => [entry, ...prev].slice(0, DIAG_LOG_SIZE));
+  };
 
   // ---- load opencv.js (script tag is included in index.html) ----
   // Polling with no ceiling meant a failed script load (404 from a misconfigured
@@ -1088,6 +1133,7 @@ export default function App() {
       // uncertainty, so this only ever skips clear-cut "barely moved" ticks.
       const movedFrac = quickOverlapCheck();
       if (movedFrac !== null && movedFrac < MIN_MOVE_FRAC) {
+        logDiag('skip', `bỏ qua: mới di chuyển ${Math.round(movedFrac * 100)}% khung (cần ≥ ${Math.round(MIN_MOVE_FRAC * 100)}%)`);
         return;
       }
 
@@ -1124,6 +1170,7 @@ export default function App() {
         c.activeRefIndex = 0;
         c.lastRebuildTime = Date.now();
         setTileCount(1);
+        logDiag('ok', `đặt ô nền #1 (${w}×${h}px)`);
         setMatchInfo({ text: 'Ô nền (#1) đã đặt — kéo tiêu bản để tiếp tục.', kind: 'ok' });
         return;
       }
@@ -1165,8 +1212,14 @@ export default function App() {
       let m = null;
       let prevIndex = null;
       let prevTile = null;
-      // Pass 1 (cheap): ORB-only axis fit for every candidate, no cross-
-      // correlation — just enough to rank them.
+      const mode = MATCH_MODES[uiRef.current.matchMode] || MATCH_MODES.balanced;
+      const tuning = {
+        minInliers: mode.minInliers, minRatio: mode.minRatio,
+        axisTolPx: mode.axisTolPx, crossCheckVetoScore: mode.crossCheckVetoScore,
+      };
+      const failures = [];
+      // Pass 1 (cheap): ORB-only fit for every candidate, no cross-correlation —
+      // just enough to rank them.
       const trialResults = [];
       for (const cand of candidates) {
         const candFeat = await getTileFeatures(cand.tile);
@@ -1176,9 +1229,10 @@ export default function App() {
           predictedTransform[5] - cand.tile.transform[5]
         );
         const trial = matchTiles(featNew.kp, featNew.desc, candFeat.kp, candFeat.desc, {
-          axisLock: true, expectedDX: localExpDX, expectedDY: localExpDY, skipCrossCheck: true,
+          ...tuning, axisLock: mode.axisLock, expectedDX: localExpDX, expectedDY: localExpDY, skipCrossCheck: true,
         });
         if (trial.ok) trialResults.push({ cand, candFeat, localExpDX, localExpDY, inliers: trial.inliers });
+        else failures.push(`ô #${cand.index + 1}: ${trial.reason || 'không khớp'}`);
       }
       trialResults.sort((a, b) => b.inliers - a.inliers);
       // Pass 2 (only as many as needed): re-check the top candidate(s) with
@@ -1188,17 +1242,35 @@ export default function App() {
       // candidate.
       for (const r of trialResults) {
         const verified = matchTiles(featNew.kp, featNew.desc, r.candFeat.kp, r.candFeat.desc, {
-          axisLock: true, expectedDX: r.localExpDX, expectedDY: r.localExpDY,
+          ...tuning, axisLock: mode.axisLock, expectedDX: r.localExpDX, expectedDY: r.localExpDY,
           newSmall: featNew.small, prevSmall: r.candFeat.small, tileW: w, tileH: h,
         });
-        if (verified.ok) {
-          m = verified;
-          prevIndex = r.cand.index;
-          prevTile = r.cand.tile;
-          break;
+        if (!verified.ok) {
+          failures.push(`ô #${r.cand.index + 1} (xác nhận): ${verified.reason || 'không khớp'}`);
+          continue;
         }
+        // In loose mode the unconstrained estimator is doing the work, and it has
+        // no built-in guard against locking onto a repeated structure — so check
+        // the result is physically plausible before accepting it.
+        if (!mode.axisLock) {
+          const rot = Math.abs(angleOf(verified.H));
+          const sc = Math.hypot(verified.H[0], verified.H[3]);
+          const offErr = Math.hypot(verified.H[2] - r.localExpDX, verified.H[5] - r.localExpDY);
+          const maxOff = Math.max(w, h) * LOOSE_MAX_OFFSET_FRAC;
+          if (rot > LOOSE_MAX_ROT_RAD || Math.abs(sc - 1) > LOOSE_SCALE_TOL || offErr > maxOff) {
+            failures.push(
+              `ô #${r.cand.index + 1}: kết quả bất hợp lý (xoay ${((rot * 180) / Math.PI).toFixed(1)}°, ` +
+              `tỉ lệ ${sc.toFixed(2)}, lệch dự đoán ${Math.round(offErr)}px)`
+            );
+            continue;
+          }
+        }
+        m = verified;
+        prevIndex = r.cand.index;
+        prevTile = r.cand.tile;
+        break;
       }
-      if (!m) m = { ok: false, inliers: 0, total: 0 };
+      if (!m) m = { ok: false, inliers: 0, total: 0, reason: failures[0] };
       if (prevIndex === null) {
         prevIndex = primaryIndex;
         prevTile = primaryTile;
@@ -1278,6 +1350,7 @@ export default function App() {
             c.autoFails = 0;
             c.consecutiveGuesses += 1;
             c.activeRefIndex = newIndex;
+            logDiag('guess', `ước lượng vị trí (không khớp được: ${m.reason || 'không rõ'})`);
             await relaxAndMaybeRebuild();
             setTileCount(c.tiles.length);
             setMatchInfo({ text: 'Vùng ít chi tiết — đã ước lượng vị trí theo hướng di chuyển gần nhất.' + (sharp.blurry ? ' (ô này có thể bị mờ)' : ''), kind: 'warn' });
@@ -1290,6 +1363,7 @@ export default function App() {
           // what is one of the two most frequently taken paths in the loop.
           freeFeatures(featNew);
           c.autoFails += 1;
+          logDiag('fail', 'không đặt được ô — ' + (m.reason || 'không khớp'));
           if (m.unsupported) {
             setMatchInfo({ text: 'Trình duyệt/bản OpenCV.js hiện tại thiếu hàm cần thiết để so khớp ảnh — không thể ghép tự động. Thử lại bằng Chrome/Edge bản mới nhất.', kind: 'warn' });
           } else if (c.justResumed) {
@@ -1312,6 +1386,7 @@ export default function App() {
       const moveMag = Math.hypot(m.H[2], m.H[5]);
       const threshold = Math.max(AUTO_MOVE_MIN_PX, w * AUTO_MOVE_MIN_RATIO);
       if (moveMag < threshold) {
+        logDiag('skip', `khớp được nhưng chỉ dịch ${Math.round(moveMag)}px (cần ≥ ${Math.round(threshold)}px)`);
         freeFeatures(featNew); // same leak as above — `small` was never released here
         mat.delete();
         c.autoFails = 0;
@@ -1384,6 +1459,12 @@ export default function App() {
       await relaxAndMaybeRebuild();
       persistMeta();
       setTileCount(c.tiles.length);
+      logDiag(
+        'ok',
+        `đặt ô #${newIndex + 1} theo trục ${m.axis || 'tự do'}, ${m.inliers}/${m.total} điểm nội` +
+          (m.crossChecked ? ', đã đối chiếu pixel' : '') +
+          (usedAnchor ? ', có điểm neo' : '')
+      );
       setMatchInfo({
         text:
           (usedAnchor
@@ -1406,6 +1487,7 @@ export default function App() {
           ' — dữ liệu đã chụp vẫn được giữ. Thử bấm "Tối ưu & vẽ lại ngay", hoặc xuất ZIP để giữ kết quả rồi tải lại trang.',
         kind: 'warn',
       });
+      logDiag('fail', 'lỗi: ' + msg);
       // eslint-disable-next-line no-console
       console.error('[panorama] autoTick failed', err);
     } finally {
@@ -2257,6 +2339,63 @@ export default function App() {
                   </button>
                   <button onClick={clearTarget} disabled={!targetWorld}>Bỏ chọn điểm</button>
                   <button className="ghost" onClick={toggleTargetMode}>Thoát</button>
+                </div>
+              </>
+            )}
+          </div>
+
+          <div className="block">
+            <h2>Độ chặt khi so khớp</h2>
+            <div className="row">
+              {Object.entries(MATCH_MODES).map(([key, cfg]) => (
+                <button
+                  key={key}
+                  className={matchMode === key ? 'primary' : ''}
+                  onClick={() => setMatchMode(key)}
+                  style={{ fontSize: 11 }}
+                >
+                  {cfg.label}
+                </button>
+              ))}
+            </div>
+            <div className="note" style={{ marginTop: 8 }}>
+              {MATCH_MODES[matchMode].note}
+            </div>
+            <div className="note" style={{ marginTop: 6 }}>
+              Đổi được ngay trong lúc đang quét. Nếu ảnh ghép không nhích lên, hãy mở
+              "Chẩn đoán" bên dưới để xem app đang từ chối vì lý do gì rồi mới đổi chế độ —
+              chế độ càng linh hoạt thì càng dễ nhận khớp sai ở vùng texture lặp.
+            </div>
+          </div>
+
+          <div className="block">
+            <h2>Chẩn đoán</h2>
+            <div className="row">
+              <button onClick={() => setShowDiag((s) => !s)}>
+                {showDiag ? 'Ẩn chẩn đoán' : 'Hiện chẩn đoán'}
+              </button>
+              <button className="ghost" onClick={() => setDiagLog([])} disabled={diagLog.length === 0}>
+                Xoá log
+              </button>
+            </div>
+            {showDiag && (
+              <>
+                <div style={{ height: 8 }} />
+                <div className="diag-log mono">
+                  {diagLog.length === 0 ? (
+                    <div className="note">Chưa có gì — bấm "Bắt đầu ghép tự động" rồi kéo tiêu bản.</div>
+                  ) : (
+                    diagLog.map((d, i) => (
+                      <div className={'diag-row ' + d.kind} key={i}>
+                        <span className="diag-time">{d.t}</span>
+                        <span>{d.text}</span>
+                      </div>
+                    ))
+                  )}
+                </div>
+                <div className="note" style={{ marginTop: 6 }}>
+                  Dòng mới nhất ở trên. "bỏ qua" = chưa di chuyển đủ (bình thường).
+                  "không đặt được ô" kèm lý do = chỗ cần chú ý.
                 </div>
               </>
             )}
