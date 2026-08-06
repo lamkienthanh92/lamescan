@@ -85,6 +85,11 @@ export default function App() {
   const [cover, setCover] = useState(null);       // { onceFrac } from the minimap
   const [pipOn, setPipOn] = useState(false);
   const [showCov, setShowCov] = useState(true);
+  const [sourceMode, setSourceMode] = useState('camera');
+  const [cameras, setCameras] = useState([]);
+  const [deviceId, setDeviceId] = useState('');
+  const [srcInfo, setSrcInfo] = useState(null);   // negotiated track settings
+  const [locked, setLocked] = useState(null);     // which camera controls got fixed
   const showCovRef = useRef(true);
   const [anchor, setAnchor] = useState(true);
   const [fusion, setFusion] = useState('best');
@@ -202,6 +207,14 @@ export default function App() {
   useEffect(() => {
     if (!cvReady) return;
     db.countTiles().then((n) => { if (n > 0) setResume({ count: n }); }).catch(() => {});
+    navigator.mediaDevices
+      .enumerateDevices()
+      .then((devs) => {
+        const cams = devs.filter((d) => d.kind === 'videoinput');
+        setCameras(cams);
+        if (cams.length > 0) setDeviceId((prev) => prev || cams[0].deviceId);
+      })
+      .catch(() => {});
   }, [cvReady]);
 
   // ---- display helpers ----
@@ -246,26 +259,127 @@ export default function App() {
   }, [paintAll, refreshMinimap]);
 
   // ---- capture source ----
-  const start = async () => {
+  //
+  // Where the image quality is actually decided. Everything downstream is
+  // lossless — tiles are stored as PNG, pasted at integer offsets with no
+  // interpolation, and exported straight from the mosaic — so nothing after this
+  // point can recover detail that was not captured here.
+  //
+  // Screen capture is the convenient option and the lossy one. It records the
+  // camera software's *window*, so if a 2592x1944 sensor is being previewed in a
+  // 900x700 panel, 87% of the pixels are gone before this app sees anything; the
+  // capture pipeline then re-encodes what is left. Reading the camera directly
+  // skips all of that.
+  const attachStream = async (stream, mode) => {
+    streamRef.current = stream;
+    videoRef.current.srcObject = stream;
+    await videoRef.current.play();
+    const track = stream.getVideoTracks()[0];
+    track.addEventListener('ended', () => {
+      stopAuto();
+      setCapturing(false);
+      streamRef.current = null;
+    });
+    const st = track.getSettings ? track.getSettings() : {};
+    setSrcInfo({ w: st.width || 0, h: st.height || 0, fps: Math.round(st.frameRate || 0), mode });
+    setCapturing(true);
+    setSourceMode(mode);
+    log('info', `nguồn ${mode === 'camera' ? 'camera' : 'màn hình'}: ${st.width || '?'}×${st.height || '?'} @ ${Math.round(st.frameRate || 0)}fps`);
+    autoCrop();
+  };
+
+  const listCameras = async () => {
     try {
-      const stream = await navigator.mediaDevices.getDisplayMedia({ video: { cursor: 'never' }, audio: false });
-      streamRef.current = stream;
-      videoRef.current.srcObject = stream;
-      await videoRef.current.play();
-      stream.getVideoTracks()[0].addEventListener('ended', () => {
-        stopAuto();
-        setCapturing(false);
-        streamRef.current = null;
+      // Device labels stay blank until camera permission has been granted at
+      // least once, so ask first, then enumerate.
+      const probe = await navigator.mediaDevices.getUserMedia({ video: true });
+      probe.getTracks().forEach((t) => t.stop());
+    } catch {
+      /* permission refused: enumerate anyway, labels will be empty */
+    }
+    const devs = await navigator.mediaDevices.enumerateDevices();
+    const cams = devs.filter((d) => d.kind === 'videoinput');
+    setCameras(cams);
+    if (cams.length > 0 && !deviceId) setDeviceId(cams[0].deviceId);
+    return cams;
+  };
+
+  const startCamera = async (id) => {
+    try {
+      // Ask for far more than any microscope camera will give, so the browser
+      // negotiates the sensor's own maximum rather than a 640x480 default.
+      // resizeMode 'none' tells it not to helpfully rescale on the way out.
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: {
+          ...(id ? { deviceId: { exact: id } } : {}),
+          width: { ideal: 4096 },
+          height: { ideal: 4096 },
+          frameRate: { ideal: 10, max: 15 },
+          resizeMode: 'none',
+        },
+        audio: false,
       });
-      setCapturing(true);
-      autoCrop();
+      await attachStream(stream, 'camera');
+      if (!cameras.length) listCameras().catch(() => {});
+    } catch (e) {
+      setStatus({
+        text: 'Không mở được camera: ' + e.message + '. Nếu phần mềm camera đang giữ thiết bị thì hãy đóng nó, hoặc dùng chế độ ghi màn hình.',
+        kind: 'warn',
+      });
+    }
+  };
+
+  const startScreen = async () => {
+    try {
+      // getDisplayMedia ignores most constraints, but asking for a large frame
+      // does stop Chrome capping the capture below the window's own size.
+      const stream = await navigator.mediaDevices.getDisplayMedia({
+        video: { cursor: 'never', width: { ideal: 3840 }, height: { ideal: 2160 }, frameRate: { ideal: 10 }, resizeMode: 'none' },
+        audio: false,
+      });
+      await attachStream(stream, 'screen');
     } catch (e) {
       setStatus({ text: 'Không mở được nguồn hình: ' + e.message, kind: 'warn' });
     }
   };
 
+  // Auto exposure and auto white balance are why tiles differ in brightness and
+  // why the joins show as bands: the camera re-decides its levels between frames.
+  // Fixing them at their current value costs nothing and removes the cause rather
+  // than blending over the symptom.
+  const lockCamera = async () => {
+    const stream = streamRef.current;
+    if (!stream) return;
+    const track = stream.getVideoTracks()[0];
+    if (!track.getCapabilities) {
+      setStatus({ text: 'Trình duyệt không cho điều khiển camera từ web — hãy tắt auto-exposure/auto-WB trong phần mềm camera.', kind: 'warn' });
+      return;
+    }
+    const caps = track.getCapabilities();
+    const advanced = [];
+    const got = [];
+    if (caps.exposureMode && caps.exposureMode.includes('manual')) { advanced.push({ exposureMode: 'manual' }); got.push('phơi sáng'); }
+    if (caps.whiteBalanceMode && caps.whiteBalanceMode.includes('manual')) { advanced.push({ whiteBalanceMode: 'manual' }); got.push('cân bằng trắng'); }
+    if (caps.focusMode && caps.focusMode.includes('manual')) { advanced.push({ focusMode: 'manual' }); got.push('lấy nét'); }
+    if (advanced.length === 0) {
+      setLocked([]);
+      setStatus({ text: 'Camera này không cho khoá phơi sáng/cân bằng trắng qua web — hãy tắt chế độ tự động trong phần mềm camera.', kind: 'warn' });
+      return;
+    }
+    try {
+      await track.applyConstraints({ advanced });
+      setLocked(got);
+      log('info', 'đã khoá: ' + got.join(', '));
+      setStatus({ text: 'Đã khoá ' + got.join(', ') + ' — các ô sẽ đồng nhất về sáng/màu hơn.', kind: 'ok' });
+    } catch (e) {
+      setStatus({ text: 'Không khoá được: ' + e.message, kind: 'warn' });
+    }
+  };
+
   const stop = () => {
     stopAuto();
+    setSrcInfo(null);
+    setLocked(null);
     if (streamRef.current) streamRef.current.getTracks().forEach((t) => t.stop());
     streamRef.current = null;
     setCapturing(false);
@@ -1098,9 +1212,72 @@ export default function App() {
             </div>
             <div className="gap" />
             {!capturing ? (
-              <button className="primary" disabled={!cvReady} onClick={start}>Chọn cửa sổ / màn hình…</button>
+              <>
+                <div className="row">
+                  <button className="primary" disabled={!cvReady} onClick={() => startCamera(deviceId)}>
+                    Camera trực tiếp
+                  </button>
+                  <button disabled={!cvReady} onClick={startScreen}>Ghi màn hình</button>
+                </div>
+                <div className="gap" />
+                <div className="row">
+                  <select
+                    value={deviceId}
+                    onChange={(e) => setDeviceId(e.target.value)}
+                    disabled={cameras.length === 0}
+                    style={{ flex: 1, minWidth: 0 }}
+                  >
+                    {cameras.length === 0 ? (
+                      <option value="">— chưa dò camera —</option>
+                    ) : (
+                      cameras.map((c, i) => (
+                        <option key={c.deviceId} value={c.deviceId}>
+                          {c.label || `Camera ${i + 1}`}
+                        </option>
+                      ))
+                    )}
+                  </select>
+                  <button onClick={() => listCameras().catch(() => {})} style={{ flex: 'none', width: 'auto' }}>
+                    Dò
+                  </button>
+                </div>
+                <div className="note">
+                  <b>Camera trực tiếp</b> đọc thẳng từ cảm biến ở độ phân giải tối đa — đây là cách duy nhất
+                  để có ảnh gốc. <b>Ghi màn hình</b> chỉ chụp lại <i>cửa sổ</i> của phần mềm camera: nếu cảm
+                  biến 2592×1944 đang được xem trong khung 900×700 thì 87% pixel đã mất trước khi app nhìn
+                  thấy gì, rồi còn bị nén lại. Mọi bước sau đều lossless, nên không có gì cứu lại được phần
+                  đã mất ở đây.
+                </div>
+                <div className="note">
+                  Camera trực tiếp cần phần mềm camera <b>đang không giữ thiết bị</b> — đóng nó trước.
+                </div>
+              </>
             ) : (
-              <button className="danger" onClick={stop}>Dừng ghi</button>
+              <>
+                <div className="row">
+                  <button className="danger" onClick={stop}>Dừng ghi</button>
+                  {sourceMode === 'camera' && (
+                    <button onClick={lockCamera}>Khoá phơi sáng / WB</button>
+                  )}
+                </div>
+                {srcInfo && (
+                  <div className={'note mono' + (srcInfo.w > 0 && srcInfo.w < 1280 ? ' amber' : '')}>
+                    Nguồn {srcInfo.mode === 'camera' ? 'camera' : 'màn hình'}:{' '}
+                    <b>{srcInfo.w}×{srcInfo.h}</b> @ {srcInfo.fps}fps
+                    {cropBox && <> · vùng quét {cropBox.w}×{cropBox.h}</>}
+                    {srcInfo.w > 0 && srcInfo.w < 1280 && (
+                      <>
+                        <br />
+                        Nguồn khá nhỏ. Nếu đang ghi màn hình, hãy phóng to cửa sổ camera và đặt zoom 1:1,
+                        hoặc chuyển sang Camera trực tiếp.
+                      </>
+                    )}
+                  </div>
+                )}
+                {locked && locked.length > 0 && (
+                  <div className="note mono" style={{ color: 'var(--teal)' }}>Đã khoá: {locked.join(', ')}</div>
+                )}
+              </>
             )}
             {borderWarn && (
               <div className="alert">
@@ -1345,6 +1522,24 @@ export default function App() {
             </div>
             <div className="gap" />
             <button className="primary" onClick={exportPNG} disabled={tileCount === 0}>Xuất ảnh ghép (PNG)</button>
+            {dims.w > 0 && (() => {
+              // Told before clicking, not after: the only step in the whole
+              // pipeline that can reduce resolution is a mosaic too large for a
+              // browser canvas, and it is worth knowing that in advance.
+              const es = M.fitScale(dims.w, dims.h, M.EXPORT_MAX_DIM, M.EXPORT_MAX_AREA);
+              const mp = (dims.w * dims.h) / 1e6;
+              return es < 1 ? (
+                <div className="note mono amber">
+                  Ảnh ghép {dims.w}×{dims.h} ({mp.toFixed(0)} MP) vượt giới hạn canvas của trình duyệt —
+                  PNG sẽ bị thu nhỏ còn {Math.round(es * 100)}%. Muốn giữ đủ độ phân giải thì dùng bản
+                  xuất ZIP: ảnh gốc từng ô là PNG không mất dữ liệu.
+                </div>
+              ) : (
+                <div className="note mono">
+                  PNG sẽ xuất ở đúng {dims.w}×{dims.h} ({mp.toFixed(1)} MP), không mất dữ liệu.
+                </div>
+              );
+            })()}
             <div className="gap" />
             <button onClick={exportZip} disabled={tileCount === 0 || !!busyLabel}>
               {busyLabel ? 'Đang xử lý…' : 'Xuất ảnh gốc + toạ độ (ZIP)'}

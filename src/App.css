@@ -96,3 +96,6 @@ button.danger{background:#3A211C;border-color:var(--red);color:#F0C4BA;}
 .mini-box{display:flex;flex-direction:column;align-items:center;min-height:40px;}
 canvas.mini{max-width:100%;height:auto;border:1px solid var(--line);border-radius:3px;
   background:repeating-conic-gradient(#171F22 0% 25%, #141A1C 0% 50%) 50% / 10px 10px;}
+select{width:100%;padding:7px 8px;background:#1B2429;color:var(--ink);border:1px solid var(--line);
+  border-radius:4px;font-family:inherit;font-size:11px;}
+select:disabled{opacity:.5;}

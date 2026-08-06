@@ -107,6 +107,49 @@ Nếu vẫn mất dấu 4 khung liên tiếp, app hiện rõ trạng thái **M�
 dẫn, và bắt đầu tự dò tìm (xem dưới). Nó dừng ghép chứ không đoán — đoán sai một ô
 là sai cả phần sau.
 
+## Chất lượng ảnh: nơi nó bị mất
+
+Toàn bộ đường đi sau lúc chụp là **không mất dữ liệu**: ô lưu dạng PNG, dán bằng block
+copy tại toạ độ nguyên (không warp, không nội suy), xuất trực tiếp từ ảnh ghép. Nghĩa
+là không bước nào sau đó cứu lại được chi tiết đã không được chụp — chất lượng được
+quyết định **ngay tại lúc chụp**.
+
+### Camera trực tiếp so với ghi màn hình
+
+**Ghi màn hình** là lựa chọn tiện và là lựa chọn mất mát. Nó ghi lại *cửa sổ* của phần
+mềm camera: nếu cảm biến 2592×1944 đang được xem trong khung 900×700 thì **87% pixel
+đã mất** trước khi app nhìn thấy gì, rồi phần còn lại còn bị nén qua đường capture.
+
+**Camera trực tiếp** (`getUserMedia`) đọc thẳng từ thiết bị, và app xin
+`width/height: {ideal: 4096}` cùng `resizeMode: 'none'` để trình duyệt thương lượng ra
+độ phân giải tối đa của cảm biến thay vì một mặc định 640×480. Cần đóng phần mềm camera
+trước, vì nó đang giữ thiết bị.
+
+App hiện độ phân giải **thực tế đã thương lượng** ngay dưới nút — `Nguồn camera:
+2592×1944 @ 10fps` — và cảnh báo nếu dưới 1280px. Đây là con số cần xem đầu tiên khi
+thấy ảnh kém; nếu nó nhỏ thì mọi thứ khác không quan trọng.
+
+### Khoá phơi sáng và cân bằng trắng
+
+Vệt sáng/tối giữa các ô là do camera **tự quyết định lại** mức sáng và màu giữa các
+khung. Nút *Khoá phơi sáng / WB* gọi `applyConstraints` để chốt
+`exposureMode`/`whiteBalanceMode`/`focusMode` ở giá trị hiện tại nếu thiết bị cho phép,
+và báo lại cái nào khoá được. Đây là xử lý **nguyên nhân**, khác với việc trộn ảnh cho
+mờ đường ranh đi.
+
+Không phải camera nào cũng cho điều khiển qua web; khi đó phải tắt chế độ tự động trong
+phần mềm camera.
+
+### Bước xuất
+
+PNG là không mất dữ liệu. Chỗ duy nhất có thể giảm độ phân giải là khi ảnh ghép vượt
+giới hạn canvas của trình duyệt (~16000px mỗi chiều, ~200 MP) — lúc đó PNG bị thu nhỏ.
+App nói trước con số này **ngay cạnh nút xuất**, chứ không để bạn phát hiện sau. Khi đó
+dùng bản xuất ZIP: từng ảnh gốc vẫn là PNG nguyên vẹn kèm toạ độ.
+
+Khung xem trên màn hình cũng bị thu nhỏ khi ảnh ghép lớn (hiện `xem ở N%`) — nếu bạn
+đang đánh giá chất lượng bằng cách nhìn khung đó thì nó không phản ánh ảnh xuất ra.
+
 ## Vì sao khung dò phải nhỏ
 
 Khung ảnh camera hiển vi chứa hai loại nội dung:
