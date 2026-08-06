@@ -1,325 +1,141 @@
-# Ghép Panorama Kính Hiển Vi
+# Ghép Panorama Kính Hiển Vi — bản đơn giản
 
-App React (Vite) để **kéo tiêu bản liên tục** dưới kính hiển vi 3 mắt (qua camera
-gắn kính, chia sẻ màn hình cửa sổ phần mềm camera) và **tự động tích luỹ + ghép**
-thành 1 ảnh scan lame hoàn chỉnh theo thời gian thực, dùng ORB feature matching +
-RANSAC similarity transform (OpenCV.js) — giống cách máy quét panorama cầm tay
-hoạt động.
+Kéo tiêu bản dưới kính hiển vi, app tự đo xem ảnh đã dịch bao nhiêu **pixel theo
+trục x và y**, rồi dán khung ảnh vào đúng vị trí đó. Một cơ chế duy nhất, không
+có bước xác nhận nào.
 
-## Cách dùng
+## Cách hoạt động
 
-1. Bấm **"Chọn cửa sổ / màn hình…"**, chọn đúng cửa sổ phần mềm camera kính hiển vi.
-2. (Tuỳ chọn) **Kéo chuột trực tiếp trên khung xem trước** để khoanh vùng cần quét —
-   không cần dùng cả cửa sổ được chia sẻ. Bấm "Xoá vùng chọn" để quay lại dùng toàn khung.
-3. (Tuỳ chọn) Bấm **"Mở cửa sổ nổi"** để theo dõi ảnh ghép trong 1 cửa sổ nổi trên
-   mọi cửa sổ khác, phòng khi cửa sổ chính của app bị che bởi phần mềm camera.
-4. Bấm **"Bắt đầu ghép tự động"** (hoặc phím `Space`).
-5. Kéo tiêu bản liên tục — kể cả theo kiểu **zigzag** (trái→phải, xuống hàng,
-   phải→trái, ...). App chạy hoàn toàn tự động, **không dừng lại để hỏi xác nhận**:
-   - Khớp tốt → ghép thẳng.
-   - Vùng ít chi tiết, khớp thất bại → **tự ước lượng vị trí** theo hướng di chuyển
-     gần nhất (ngoại suy từ 2 ô trước) rồi tiếp tục, đánh dấu ô đó là "ước lượng"
-     trong manifest xuất ra để biết chỗ nào nên xem lại.
-   - Quay lại gần 1 vùng đã quét trước đó (điển hình khi zigzag) → tự nhận diện và
-     chỉnh lại theo điểm tham chiếu cũ, giảm trôi tích luỹ.
-6. Xong thì bấm **"Xuất ảnh ghép (PNG)"** để lấy ảnh toàn cảnh, và/hoặc
-   **"Xuất toàn bộ ảnh gốc + manifest (ZIP)"** để lấy lại từng ảnh gốc (dùng để
-   đếm/phân loại AFB-WBC) kèm file `manifest.csv` ghi vị trí (toạ độ x,y trong
-   ảnh ghép), thứ tự chụp, cờ "ước lượng hay không", và thời điểm chụp của từng ảnh.
+Tiêu bản trượt dưới ống kính cố định thì ảnh chỉ **tịnh tiến**. Nên toàn bộ bài
+toán định vị chỉ là: *"so với khung trước, ảnh đã dịch bao nhiêu pixel theo x và
+y?"* — và câu đó được trả lời trực tiếp bằng tương quan chéo chuẩn hoá
+(`TM_CCOEFF_NORMED`) giữa một mảng nhỏ ở giữa khung trước và khung hiện tại.
 
+Mỗi 200ms:
 
-## Chạy thử (dev)
+1. Lấy 1 khung từ vùng quét.
+2. Lấy **khung dò** — một mảng nhỏ ở giữa khung vừa được nhận trước đó — và tìm
+   nó trong khung mới.
+3. Nội suy parabol qua đỉnh tương quan để có độ chính xác dưới 1 pixel.
+4. Nếu điểm khớp đủ cao và ảnh đã dịch đủ xa, dán khung mới vào vị trí tích luỹ.
+
+Không keypoint, không RANSAC, không giả thuyết theo từng trục, không bỏ phiếu
+đồng thuận giữa hai bộ ước lượng, không ngoại suy bù khi trượt. Khung nào không
+đo được thì **bỏ qua**, thử lại khung sau 200ms.
+
+Việc dán là **block copy tại toạ độ nguyên** — không warp, không nội suy. Nghĩa là
+mọi pixel trong ảnh ghép đúng là pixel ra từ camera, nguyên vẹn, tại đúng (x, y)
+mà bộ đo đặt nó vào.
+
+## Vì sao khung dò phải nhỏ và ở giữa
+
+Khung ảnh camera hiển vi chứa hai loại nội dung:
+
+- **Tiêu bản** — di chuyển khi bạn kéo lame.
+- **Vật cố định của đường quang** — vòng vignette/halo thị kính, bụi trên sensor,
+  overlay do phần mềm camera vẽ. Những thứ này **không bao giờ di chuyển**; chúng
+  cố định trong toạ độ camera.
+
+V� chúng cũng thường là các đường biên tương phản mạnh nhất trong khung. Nếu chúng
+nằm trong vùng được tương quan, thì phép khớp tốt nhất là phép khớp giữ chúng ở
+nguyên chỗ, và bộ đo sẽ **tự tin báo dịch chuyển bằng 0** dù bạn đã kéo lame đi
+bao xa. Ảnh ghép khi đó không bao giờ nhích lên — và không có gì trên màn hình
+giải thích tại sao.
+
+Đây là lý do duy nhất và đủ để giữ khung dò nhỏ. App hỗ trợ việc này ba cách:
+
+- Tự dò vùng sáng khi bắt đầu và **lùi vào trong 14%** mỗi phía (viền halo là một
+  dải gradient mềm rộng nhiều pixel, nên một hình chữ nhật chỉ *chạm* biên danh
+  nghĩa vẫn còn chứa đủ vòng halo để ghim tương quan về 0).
+- Vẽ khung dò (vàng) trực tiếp trên khung xem trước, để bạn thấy ngay nó có nằm
+  hẳn trong vùng sáng không.
+- Kiểm tra độ tối của dải viền vùng quét và cảnh báo thẳng nếu nghi ngờ.
+
+## Chọn kích thước khung dò
+
+Khung dò lấy từ giữa, nên tầm với tối đa mỗi bước là nửa phần còn lại:
+
+| Kích thước | Tầm với/bước | Đánh đổi |
+|---|---|---|
+| Nhỏ 22% | ±39% khung | An toàn nhất với halo, tầm xa nhất. Cần vùng có chi tiết. |
+| Vừa 30% | ±35% khung | Cân bằng — mặc định. |
+| Lớn 42% | ±29% khung | Điểm khớp chắc nhất trên vùng thưa chi tiết, nhưng dễ chạm viền. |
+
+Nếu nhật ký báo *"đã kéo quá xa"* thì hoặc kéo chậm lại, hoặc chọn khung dò nhỏ
+hơn. Nếu báo *"điểm khớp thấp"* thì thường là vùng thiếu chi tiết hoặc ảnh mờ.
+
+## Nhật ký
+
+Mỗi tick đều ghi lại nó quyết định gì và vì sao, nên "app không chạy" luôn có câu
+trả lời cụ thể:
+
+```
+10:42:19  ô #7 tại (2104, 0) · dịch +351,+2 · điểm 0.91
+10:42:18  mới dịch 31px (cần ≥ 52px), điểm 0.94
+10:42:17  đã kéo quá xa (≥182px) — kéo chậm lại hoặc chọn khung dò nhỏ hơn
+10:42:15  điểm khớp 0.19 < 0.35 — không định vị được
+```
+
+## Chạy thử
 
 ```bash
 npm install
 npm run dev
 ```
 
-M�� địa chỉ được in ra (mặc định `http://localhost:5173`).
+Cần chạy qua HTTP(S)/localhost — API chia sẻ màn hình yêu cầu "secure context",
+không mở trực tiếp `index.html` từ ổ đĩa. `npm run build` xuất ra `dist/`, triển
+khai lên host tĩnh nào cũng được (đã có `netlify.toml`).
 
-## Build bản triển khai
+## Khác
 
-```bash
-npm run build
-npm run preview   # xem thử bản build, chạy tại localhost
-```
+- **Chống mất dữ liệu.** Mỗi ô (ảnh + toạ độ nguyên) được ghi vào IndexedDB ngay
+  khi chụp, nên tab đóng/crash/mất điện chỉ mất khung cuối. Mở lại sẽ thấy banner
+  "Tìm thấy phiên quét dở". Khi tiếp tục, hãy đưa tiêu bản về đúng vị trí ô cuối
+  trước khi bấm Bắt đầu — khung đầu tiên sau đó được coi là nối tiếp từ ô cuối.
+- **Cảnh báo mờ.** Laplacian variance so với trung vị của ~30 ô gần nhất; ô nào
+  dưới 40% mức nền bị đánh dấu. Đây là ngưỡng tương đối, tự thích nghi theo phiên.
+- **Xuất.** PNG toàn cảnh (tự thu nhỏ nếu vượt giới hạn canvas của trình duyệt),
+  và ZIP gồm từng ảnh gốc + `manifest.csv` (toạ độ x, y nguyên) +
+  `TileConfiguration.txt` nếu muốn ghép lại bằng Fiji cho chất lượng cao hơn.
+- Vùng chồng lấn: **ô mới ghi đè ô cũ**. Với định vị thuần tịnh tiến, hai bản của
+  vùng chồng lấn là cùng những pixel đó (trong giới hạn sai số của bộ đo), nên
+  trộn chúng không được gì mà còn mất — trộn hai bản lệch nhau chút ít của cùng
+  cấu trúc chính là thứ tạo ra vệt nhoè/nhân đôi ở biên ô.
 
-Thư mục `dist/` sau khi build có thể triển khai lên bất kỳ static host nào
-(Netlify, GitHub Pages, Nginx nội bộ, v.v.).
+## Giới hạn đã biết
 
-## Lưu ý quan trọng
-
-- **Lưu tạm chống mất dữ liệu (IndexedDB).** Mỗi ảnh gốc + vị trí được ghi vào
-  IndexedDB của trình duyệt ngay khi chụp (không chỉ giữ trong biến JS) — nên
-  nếu tab bị đóng nhầm, crash, hoặc mất điện, mở lại trang sẽ thấy banner
-  "Tìm thấy phiên quét dở" và có thể tiếp tục đúng chỗ đang dừng thay vì mất
-  sạch. IndexedDB là bộ nhớ trên đĩa của trình duyệt, không phải RAM của tab,
-  nên sống sót qua việc đóng/crash tab (chỉ mất khi người dùng chủ động xoá
-  dữ liệu trình duyệt, hoặc bấm "Đặt lại" trong app).
-- **Kiểm tra độ nét (Laplacian variance).** Mỗi ô chụp được so với đường nền
-  (median) độ nét của ~30 ô gần nhất; ô nào nét kém hơn 40% mức nền sẽ bị đánh
-  dấu "có thể mờ" — hiện số lượng ở khối Trạng thái, và liệt kê chi tiết trong
-  panel "Ô đã chụp". Đây là ngưỡng tương đối, tự thích nghi theo từng phiên
-  quét, không phải một con số cố định.
-- **Định vị thủ công (khi tiếp tục phiên).** Sau khi "Tiếp tục phiên cũ" hoặc
-  "Nhập lại từ ZIP", app **không** tự động dò khớp toàn bộ tile set nữa (bản
-  cũ làm vậy — quá nhạy, hễ thấy vân/kết cấu giống là quét lại từ đầu, rất tốn
-  thời gian). Thay vào đó: bấm **"Định vị thủ công"**, **bấm vào đúng điểm**
-  trên ảnh ghép cần tiếp tục (vùng thiếu, hoặc chỗ cần chụp bù) — hiện 1 dấu
-  khoanh tại đó — rồi tìm và ướm đúng vị trí đó dưới kính hiển vi, cuối cùng
-  bấm **"Xác nhận vị trí"**. App khi đó chỉ so khớp với **8 ô gần điểm bạn vừa
-  chọn nhất** (không phải toàn bộ) — nhanh và chính xác hơn nhiều vì đã có gợi
-  ý vị trí từ chính bạn. Nếu không dùng tính năng này, app vẫn hoạt động bình
-  thường theo mặc định: tiếp tục nối từ ô cuối cùng, dùng cơ chế ước lượng +
-  điểm neo sẵn có như lúc quét ban đầu.
-- **Cache đặc trưng vĩnh viễn theo từng ô (tăng tốc).** Trước đây, mỗi khi cần
-  so khớp với 1 ô cũ (điểm neo zigzag, xác định lại vị trí, chụp lại 1 ô), app
-  giải mã lại ảnh PNG + tính lại đặc trưng ORB **từ đầu mỗi lần**, dù ô đó có
-  thể đã được kiểm tra trước đó. Giờ mỗi ô tự giữ lại đặc trưng của chính nó
-  sau lần tính đầu tiên (gắn thẳng vào đối tượng ô trong bộ nhớ, không lưu vào
-  IndexedDB) — các lần so khớp lặp lại với cùng 1 ô sau đó gần như tức thời.
-  Đây là nguyên nhân chính của hiện tượng "trật nhịp, chuyển trục quét tiếp bị
-  khựng lại khá lâu" mà bạn gặp phải.
-- **Chụp lại 1 ô giữa chuỗi.** Trong panel "Ô đã chụp", bấm "Chụp lại" ở ô cần
-  sửa (đưa kính hiển vi về đúng vị trí đó trước) — ảnh mới được so khớp với cả
-  ô liền trước lẫn liền sau (nếu có) để xác định lại đúng vị trí, rồi thay thế
-  tại chỗ. Các ô khác trong chuỗi không bị ảnh hưởng, không cần "Hoàn tác" lùi
-  lại từ cuối.
-- **Nhập lại từ file ZIP đã xuất.** File zip xuất ra (`manifest.csv` + ảnh gốc)
-  giờ lưu đủ thông tin (kể cả ma trận vị trí) để **nạp lại y nguyên thành 1
-  phiên làm việc** — dùng khi đã xuất ảnh, xem lại sau đó (có thể vài ngày sau,
-  máy khác) mới phát hiện 1 ô bị lỗi. Nút "Nhập lại từ file ZIP đã xuất…" trong
-  khối Công cụ nạp lại toàn bộ ô, sau đó chọn cửa sổ nguồn và dùng "Chụp lại"
-  như bình thường để quét bù đúng vị trí đó.
-  **Giới hạn:** manifest không lưu số điểm nội (độ tin cậy) của từng phép khớp
-  gốc, nên khi nhập lại, các cạnh trong đồ thị vị trí được dựng lại thành chuỗi
-  tuần tự với độ tin cậy mặc định — không mất độ chính xác vị trí (vẫn dùng
-  đúng ma trận đã lưu), chỉ là các cạnh "điểm neo" đặc biệt trước đó sẽ cần
-  hình thành lại tự nhiên nếu quét tiếp qua vùng cũ.
-- **Quét nhiều lớp Z (chọn lọc theo từng ô).** Trong panel "Ô đã chụp", nút
-  "Quét Z" cho 1 ô cụ thể: chỉnh tiêu cự rồi bấm "Chụp thêm lớp" nhiều lần
-  (không di chuyển tiêu bản theo x,y giữa các lần, chỉ vặn ốc lấy nét) — mỗi
-  ô có thể có nhiều lớp ở các độ cao tiêu điểm khác nhau. Bấm "Xong" để lưu cả
-  chồng ảnh: **lớp nét nhất** (theo cùng chỉ số Laplacian variance đã dùng để
-  phát hiện mờ) được dùng để ghép vào ảnh toàn cảnh, còn **toàn bộ chồng ảnh**
-  được lưu kèm để xem lại bằng thanh trượt (nhấp nháy qua từng lớp) ngay trong
-  panel — không tự động ghép nhiều lớp thành 1 ảnh (không làm EDF/extended-
-  depth-of-field), mục đích là để mắt người xác nhận trực quan, phù hợp hơn
-  cho việc đếm AFB cần xác nhận thủ công.
-  **Giới hạn:** hoàn toàn thủ công (app không điều khiển được motor lấy nét),
-  và hiện tại **"Xuất toàn bộ ảnh gốc + manifest (ZIP)" / "Nhập lại từ ZIP"
-  chưa mang theo chồng ảnh Z** — chỉ ảnh đại diện (lớp nét nhất) được xuất/nhập;
-  chồng ảnh Z chỉ tồn tại trong phiên làm việc hiện tại (có lưu vào IndexedDB
-  nên vẫn sống sót qua "Tiếp tục phiên cũ", chỉ không đi qua đường xuất/nhập
-  ZIP).
-- **Cần chạy qua HTTP(S)/localhost**, không mở trực tiếp file `index.html` từ
-  ổ đĩa (`file://`) — API chia sẻ màn hình (`getDisplayMedia`) của trình duyệt
-  yêu cầu "secure context". `npm run dev`/`npm run preview` đã tự lo việc này.
-- **OpenCV.js được tự lưu trữ tại `public/opencv.js`** (cùng gốc/same-origin
-  với app), thay vì tải từ CDN `docs.opencv.org`. Lý do: khi deploy lên
-  Netlify/Vercel..., tải script từ một origin khác có thể bị trình duyệt chặn
-  với lỗi `ERR_BLOCKED_BY_RESPONSE.NotSameOrigin` nếu server CDN đó gửi header
-  `Cross-Origin-Resource-Policy`. Để cùng gốc thì không gặp vấn đề này, và app
-  cũng không phụ thuộc CDN ngoài khi chạy production.
-- **Triển khai lên Netlify:** đã có sẵn file `netlify.toml` với
-  `command = "npm run build"` và `publish = "dist"`. Trên dashboard Netlify,
-  vào **Site settings → Build & deploy → Build settings** và đảm bảo 2 giá trị
-  này khớp (nếu bạn tạo site từ trước khi có `netlify.toml`, có thể cần sửa
-  tay). Nếu Netlify serve thẳng file nguồn (`src/main.jsx`) thay vì bản build
-  trong `dist/`, trình duyệt sẽ báo lỗi
-  `Failed to load module script... MIME type of "application/octet-stream"`
-  — đây là dấu hiệu build/publish directory bị cấu hình sai.
-- Việc ghép ảnh là **ghép liên tiếp (frame-to-frame)**, có thêm 1 lớp **tự chỉnh
-  trôi (loop-closure đơn giản)**: mỗi khi 1 ô mới trùng vùng không gian với 1 ô đã
-  đặt từ khá lâu trước đó (ví dụ hàng dưới của kiểu quét zigzag chạm lại hàng
-  trên), app thử khớp lại trực tiếp với ô cũ đó và ưu tiên dùng kết quả này để kéo
-  sai số tích luỹ về đúng vị trí. Đây **không phải** bundle adjustment toàn cục
-  (không tối ưu đồng thời mọi ràng buộc), nên với chuỗi rất dài (hàng trăm ô) vẫn
-  có thể còn lệch nhẹ ở một số chỗ — quét với độ chồng lấn rộng rãi (~25–35%),
-  đặc biệt ở chỗ chuyển hàng, sẽ giúp cơ chế này hoạt động tốt hơn.
-- **Cửa sổ nổi (Picture-in-Picture)** dùng API chuẩn của trình duyệt
-  (`captureStream` + `requestPictureInPicture`), được Chrome/Edge desktop hỗ trợ
-  tốt nhất. Nếu trình duyệt không hỗ trợ, nút này sẽ tự ẩn/báo không khả dụng,
-  không ảnh hưởng đến chức năng ghép ảnh chính.
-- **Tối ưu hoá toàn cục liên tục (điểm khác biệt so với Fiji/Hugin).** Thay vì chỉ
-  tin 1 phép khớp cho mỗi ô (chuỗi tuần tự, hoặc để điểm neo ghi đè), mọi phép khớp
-  thành công — cả khớp chuỗi lẫn khớp điểm neo khi phát hiện trùng vùng cũ — đều
-  được ghi lại thành 1 "cạnh" trong 1 đồ thị vị trí (`src/graph.js`). Mỗi vài khung
-  hình, app chạy 1 vòng lặp Gauss-Seidel nhẹ để điều hoà vị trí (x,y) của **toàn bộ**
-  các ô sao cho tổng sai lệch trên mọi cạnh là nhỏ nhất — giống nguyên lý bundle
-  adjustment/pose-graph optimization dùng trong SLAM, nhưng đơn giản hoá thành bài
-  toán tuyến tính vì chỉ tối ưu tịnh tiến (xoay/tỷ lệ giữ nguyên từ phép khớp cục bộ,
-  vì tiêu bản dịch chuyển dưới kính hiển vi không tạo biến dạng phối cảnh).
-  - Đây là điểm Fiji/Hugin **không có**: các công cụ đó chỉ tối ưu toàn cục theo lô,
-    sau khi đã có sẵn toàn bộ ảnh — không tương tác thời gian thực. App này điều hoà
-    liên tục ngay trong lúc quét.
-  - **Thành thật về giới hạn:** "liên tục" ở đây nghĩa là *vị trí* được điều hoà mỗi
-    tick (rất rẻ, chỉ vài phép cộng trừ), nhưng việc **vẽ lại ảnh ghép hiển thị** thì
-    làm theo đợt (khi phát hiện lệch đủ lớn, hoặc tối đa mỗi ~25 ô/8 giây) — vẽ lại
-    toàn bộ hàng trăm ô mỗi khung hình sẽ không kịp thời gian thực. Có thể thấy ảnh
-    ghép "khựng" nhẹ vài giây mỗi khi tự vẽ lại — đó là lúc nó đang áp dụng kết quả
-    tối ưu, không phải lỗi.
-  - Dùng nút **"Tối ưu & vẽ lại ngay"** để ép chạy hội tụ đầy đủ + vẽ lại ngay lập
-    tức — nên bấm trước khi xuất ảnh/zip để đảm bảo kết quả cuối cùng đã ổn định.
-  - Đây vẫn là bản đơn giản hoá (chỉ tối ưu tịnh tiến, quan hệ hàng xóm thưa — chủ
-    yếu chuỗi + một vài cạnh điểm neo) chứ chưa phải bundle adjustment đầy đủ như
-    Fiji (tối ưu mọi cặp chồng lấn, cả xoay lẫn tỷ lệ). Với chuỗi cực dài và nhiều
-    vùng khó, kết quả có thể vẫn kém hơn Fiji chạy offline — nhưng bù lại có phản
-    hồi trực quan ngay trong lúc quét, điều Fiji không làm được.
-- **Không còn bước xác nhận thủ công nào** — mọi ô đều được đặt tự động. Khi
-  không đủ điểm khớp tin cậy (vùng ít chi tiết), app dùng phương án dự phòng:
-  **ngoại suy vị trí theo vector di chuyển giữa 2 ô liền trước** thay vì dừng lại.
-  Đây là đánh đổi có chủ đích theo yêu cầu — ưu tiên luồng quét liên tục, không bị
-  ngắt quãng — nhưng có nghĩa là **một vài ô ở vùng khó có thể bị đặt sai vị trí**
-  mà không có cảnh báo chặn luồng. Các ô này được đánh dấu `estimated=1` trong
-  `manifest.csv` khi xuất zip, để biết chỗ nào nên kiểm tra lại thủ công nếu cần.
-  Cơ chế tự chỉnh trôi theo điểm tham chiếu (mục trên) vẫn hoạt động song song và
-  thường sửa lại được phần lớn sai lệch này khi quét quay lại gần đó.
-- Ảnh ghép ra chỉ nên dùng để minh hoạ/toàn cảnh; việc đếm/phân loại vẫn nên làm
-  trên từng ảnh gốc. Mỗi ảnh gốc được giữ nguyên trong bộ nhớ trình duyệt suốt
-  phiên làm việc (dạng `Blob` nhị phân — nhẹ hơn base64 khoảng 25%) để phục vụ
-  "Hoàn tác ô cuối" và xuất zip.
-  **Lưu ý cho lame ~300 ô (chuẩn WHO):** tuỳ độ phân giải camera, tổng dung
-  lượng ảnh gốc giữ trong RAM có thể lên tới vài trăm MB — vẫn ổn với hầu hết
-  máy tính, nhưng nếu thấy trình duyệt chậm/giật giữa chừng, hãy xuất zip theo
-  từng đợt (ví dụ mỗi ~100 ô: xuất zip → "Đặt lại" → quét tiếp) thay vì cố giữ
-  toàn bộ 1 lame trong 1 phiên.
-- **Xuất toàn bộ ảnh gốc**: nút "Xuất toàn bộ ảnh gốc + manifest (ZIP)" đóng gói
-  từng `tile_XXXX.png` (đúng thứ tự chụp) cùng `manifest.csv` (toạ độ x,y trong
-  ảnh ghép, kích thước, thời điểm chụp) — mở trực tiếp bằng Excel để đối chiếu
-  vị trí từng ảnh khi cần truy vết một kết quả đếm về đúng chỗ trên lame.
-- Trình duyệt khuyến nghị: Chrome/Edge desktop (hỗ trợ `getDisplayMedia` tốt
-  nhất). Khi bấm "Chọn cửa sổ / màn hình…", chọn đúng cửa sổ của phần mềm
-  camera kính hiển vi trong hộp thoại chia sẻ màn hình của trình duyệt.
-
-## Cấu trúc mã nguồn
-
-- `src/App.jsx` — component chính: quản lý luồng chụp/ghép, canvas mở rộng dần,
-  bàn phím tắt (Space/Enter/Esc/mũi tên).
-- `src/matrix.js` — các phép toán ma trận 3x3 thuần JS (nhân ma trận, dịch
-  chuyển, biến đổi điểm) dùng để tính vị trí ghép.
-- `src/cvMatch.js` — bọc các lời gọi OpenCV.js (ORB detect, BFMatcher,
-  `findHomography` với RANSAC) để tìm phép biến đổi giữa 2 ô liên tiếp.
-- `src/App.css` — giao diện.
-
-## Bản sửa lỗi (changelog)
-
-Bản này sửa một loạt lỗi khiến app không dùng được ở quy mô thật (một lame ~300 ô
-theo chuẩn WHO). Chạy `npm run test` để kiểm tra các module logic thuần, và
-`npm run build` để verify.
-
-### Lỗi làm app chết giữa phiên quét
-
-- **Rò rỉ bộ nhớ WASM (`src/App.jsx`).** Ba nhánh — mất khớp, "di chuyển chưa đủ",
-  và `confirmTarget` khi không khớp — giải phóng `kp`/`desc` nhưng **quên `small`**
-  (ảnh grayscale thu nhỏ ~90KB trong WASM heap, không được GC). Đây là hai đường
-  chạy thường xuyên nhất của vòng lặp, nên chỉ sau vài chục phút quét là heap cạn
-  và cả trang bị abort. Nay dùng `freeFeatures()` (mới, trong `cvMatch.js`) để
-  không thể giải phóng thiếu.
-- **`composite()` warp vào buffer bằng cả khung mosaic.** `cv.warpPerspective`
-  nhận `Size(c.w, c.h)` rồi mới `.roi()` xuống vùng nhỏ — tức mỗi ô cấp phát một
-  Mat tạm bằng kích thước toàn bộ ảnh ghép (~675MB ở 300 ô), cộng thêm mosaic
-  chính. Nay gấp phép dịch `(-rx, -ry)` vào transform và warp trực tiếp vào
-  bounding box của ô: chi phí tỉ lệ với kích thước 1 ô, không phụ thuộc độ lớn
-  vùng đã quét.
-- **Vẽ lại toàn khung mosaic mỗi ô.** `cv.imshow` chuyển đổi từng pixel của Mat
-  được truyền vào, nên repaint toàn bộ ở mỗi lần chụp làm chi phí mỗi ô tăng theo
-  tổng diện tích — quadratic. Nay ảnh ghép được cập nhật **tăng dần**: chỉ blit
-  đúng hình chữ nhật vừa thay đổi (`paintRegion`), full repaint chỉ khi thực sự cần.
-- **Giới hạn canvas của trình duyệt.** Quá ~16384px/chiều (và giới hạn diện tích
-  thấp hơn nhiều), canvas không báo lỗi mà **im lặng trả về trắng**. Nay khung xem
-  tự thu nhỏ khi vượt ngưỡng (`DISPLAY_MAX_DIM/AREA`) và hiển thị % thu nhỏ; pixel
-  gốc vẫn nằm nguyên trong Mat, và `exportPNG` render lại từ Mat (không đọc lại
-  canvas đã thu nhỏ) nên ảnh xuất ra vẫn đủ độ phân giải.
-- **Cache đặc trưng không có giới hạn.** Nay có LRU: giữ tối đa
-  `MAX_CACHED_FEATURES` ô, pin 12 ô mới nhất + ô tham chiếu đang dùng. Ô bị loại
-  chỉ đơn giản là được tính lại từ blob khi cần.
-
-### Lỗi làm hỏng dữ liệu / hỏng phiên
-
-- **`removeEdgesForTile()` chỉ unlink một đầu (`src/graph.js`).** Nó xoá edge khỏi
-  danh sách `edges` và clear `adjacency[idx]`, nhưng **adjacency của ô láng giềng
-  vẫn giữ nguyên chính các edge object đó**. Hai hậu quả: (a) sau "Hoàn tác ô
-  cuối", `relax()` deref một index không còn tồn tại và **throw ở mọi tick sau
-  đó** — tức một lần undo là kết thúc phiên quét; (b) sau mỗi "Chụp lại"/"Quét Z",
-  edge cũ vẫn sống và kéo ô về vị trí cũ, mỗi lần chụp lại thêm một lớp rác.
-  Có test cho cả hai (`test-graph.mjs`).
-- **`activeRefIndex` treo sau undo.** Nó được set bằng index của ô mới ở mỗi lần
-  chụp, nên sau khi pop ô cuối nó trỏ ra ngoài mảng → `tiles[undefined]`.
-- **`manifest.csv` / `TileConfiguration.txt` xuất toạ độ TRƯỚC tối ưu.**
-  `tile.bbox` chỉ được tính lúc ô được đặt và **không bao giờ cập nhật sau
-  `relax()`**, nhưng export lại đọc chính bbox đó. Nghĩa là file toạ độ — thứ duy
-  nhất nối một kết quả đếm về đúng chỗ trên lame — mô tả một layout khác với ảnh
-  ghép xuất kèm, và "Tối ưu & vẽ lại ngay" không sửa được. Nay có
-  `refreshBBoxes()` chạy sau mọi lần relax. Việc này cũng khôi phục độ chính xác
-  của tìm anchor/candidate theo độ chồng lấn, vốn đang kém dần đúng lúc sai số
-  tích luỹ lớn nhất.
-- **Vị trí đã tối ưu không được lưu.** Record của từng ô chỉ ghi một lần lúc chụp,
-  với transform *trước* relax. Nay `persistMeta()` snapshot transform hiện tại
-  (9 số/ô, không đáng kể so với blob) và "Tiếp tục phiên cũ" khôi phục đúng vị trí
-  đã hội tụ thay vì lùi về chuỗi thô.
-- **IndexedDB trộn hai phiên.** Nếu bỏ qua banner "Tìm thấy phiên quét dở" rồi quét
-  mới, record cũ ở index cao vẫn nằm đó trong khi ô mới ghi đè index thấp — crash
-  lần sau sẽ khôi phục ra một phiên lắp ghép từ hai lame. Nay DB được xoá tự động
-  khi ô đầu tiên của phiên mới được đặt.
-- **Edge trỏ vào ô không tồn tại khi load.** Thêm `rebuildAdjacency()` lọc và dựng
-  lại index, dùng cho cả "Tiếp tục phiên cũ" và "Nhập lại từ ZIP".
-
-### Lỗi làm tính năng không chạy
-
-- **"Quét Z" chết hoàn toàn (`ReferenceError`).** `finishZCapture` truyền
-  `tileW: w, tileH: h` nhưng **không có `w`/`h` nào trong scope đó** (các hàm khác
-  destructure chúng từ `grabVideoFrame()`, hàm này thì không). Try/catch bắt lại
-  và chỉ hiện "Quét lớp Z thất bại: w is not defined". Nay dùng `best.w`/`best.h`.
-- **`quickOverlapCheck` chưa từng hoạt động.** Nó thu nhỏ frame live về max
-  **220px** rồi `matchTemplate` với bản cache `_small` ở max **300px** — tức so
-  khớp hai độ phóng đại khác nhau của cùng cảnh, điểm gần như luôn dưới ngưỡng
-  0.25 → luôn trả `null` → không bao giờ skip tick nào. Nay dùng đúng
-  `CROSSCHECK_MAX_DIM`.
-- **`expectedDX/DY` sai hệ toạ độ** trong "Chụp lại" và "Quét Z": truyền delta
-  world-space vào chỗ `matchTiles` mong đợi offset trong frame riêng của ô láng
-  giềng. Nay đi qua `applyInverseLinear` như đường quét chính.
-- **Ngoại suy khi `prevIndex === 0`.** Guard cũ là `tiles.length >= 2`, chưa đủ:
-  ô tham chiếu có thể chính là ô 0, vốn không có ô trước để lấy vector di chuyển
-  → `undefined.transform`.
-
-### Lỗi im lặng
-
-- **`autoTick` không có `catch`** (chỉ `try/finally`). Mọi exception thành
-  unhandled rejection: timer vẫn chạy, khối Trạng thái vẫn hiện thông báo thành
-  công cũ, và app **lặng lẽ ngừng ghi ô**. Với công việc đọc lame thì đây là kiểu
-  lỗi tệ nhất. Nay dừng hẳn và báo rõ, dữ liệu đã chụp vẫn giữ.
-- **Poll `opencv.js` vô hạn.** Nếu script 404 (đúng tình huống cấu hình sai
-  build/publish mà README đã cảnh báo), trang treo mãi ở "Đang tải bộ xử lý
-  ảnh…". Nay timeout 25s kèm hướng dẫn kiểm tra cụ thể.
-- `maxRenderedDrift()` chỉ so tịnh tiến, nên chỉnh sửa **thuần xoay** không
-  trigger vẽ lại — ảnh ghép hiện lệch mà app tưởng không có gì thay đổi. Nay quy
-  đổi sai lệch góc thành dịch chuyển góc ảnh xấu nhất.
-- `relax()` giờ bỏ qua edge treo thay vì throw (phòng vệ, không thay thế các fix trên).
-
-### Còn cần làm (chưa sửa trong bản này)
-
-- **Đưa ORB/matching sang Web Worker.** Toàn bộ OpenCV vẫn chạy trên main thread;
-  ORB(1500) + BFMatcher crossCheck cho mỗi cặp là khá nặng và có thể vượt
-  `AUTO_INTERVAL_MS = 350`, khiến tick bị bỏ và UI đứng khi rebuild.
-- **Ngưỡng axis-lock cần hiệu chỉnh trên máy thật.** `AXIS_THRESH_PX = 5`, cấm
-  hoàn toàn xoay, cần ≥15 inliers *và* ratio ≥0.25, và reject thẳng nếu cả hai
-  trục fail. Hợp lý với stage cơ khí 2 núm x/y; nếu kéo tiêu bản bằng tay thì lệch
-  chéo >5px là chuyện thường và sẽ mất khớp liên tục. Đây là quyết định thiết kế có
-  chủ đích của bản gốc nên không bị thay đổi ở đây — nhưng nếu thực tế mất khớp
-  nhiều, đây là chỗ cần nới trước tiên.
-- **Nguồn ảnh.** `getDisplayMedia` là màn hình đã qua nén/resample của phần mềm
-  camera, không phải luồng gốc. Nếu camera là UVC thì `getUserMedia` sẽ cho ảnh
-  gốc và không cần dò vignette bằng heuristic.
-- **Chưa có calibration µm/pixel**, nên manifest chỉ có toạ độ pixel, không map
+- **Không có hiệu chỉnh trôi tích luỹ.** Mỗi bước được đo so với bước trước, nên
+  sai số cộng dồn theo chiều dài đường quét. Không có loop closure, không có tối
+  ưu toàn cục — đó là cái giá của việc bỏ pose graph. Với đường quét dài, hãy
+  dùng bản xuất ZIP + Fiji (`Grid/Collection stitching` → `Positions from file` →
+  `Defined by TileConfiguration`) để tinh chỉnh lại toàn cục.
+- **Không xử lý xoay.** Nếu lame bị xoay giữa hai khung thì tương quan sẽ tụt
+  điểm và khung đó bị bỏ qua.
+- **Nguồn ảnh là màn hình**, đã qua nén/resample của phần mềm camera. Nếu camera
+  là UVC thì `getUserMedia` sẽ cho ảnh gốc — đáng làm nếu chất lượng ảnh quan
+  trọng cho việc đếm.
+- **Chưa có calibration µm/pixel**, nên toạ độ trong manifest là pixel, không map
   được về vernier của stage.
-- Không multi-band blending (chỉ feather 8px), không EDF, `App.jsx` vẫn là một file
-  lớn, và chỉ có test cho phần logic thuần (phần OpenCV chưa có test).
+- Toàn bộ OpenCV chạy trên main thread. Ở đây nhẹ hơn bản cũ nhiều (một lần
+  `matchTemplate` mỗi tick thay vì ORB + BFMatcher trên nhiều ứng viên), nhưng
+  vẫn chưa dùng Web Worker.
 
-### Lưu ý về thẩm định
+## Lưu ý
 
-Nếu app được dùng để hỗ trợ đọc AFB thật, cần một bước thẩm định song song (đọc
-thủ công so với đọc qua app trên cùng bộ lame) trước khi tin vào kết quả, và giữ
-nguyên nguyên tắc đã ghi ở trên: **đếm trên từng ảnh gốc, ảnh ghép chỉ để định
-vị**. Lỗi toạ độ manifest ở trên đặc biệt quan trọng vì nó phá đúng sợi dây truy
-vết đó.
+Ảnh ghép nên dùng để **định vị và xem toàn cảnh**. Việc đếm/phân loại vẫn nên làm
+trên từng ảnh gốc trong bản xuất ZIP. Nếu dùng để hỗ trợ đọc AFB thật, cần một
+bước thẩm định song song (đọc thủ công so với đọc qua app trên cùng bộ lame)
+trước khi tin vào kết quả.
+
+## So với bản trước
+
+Bản trước có ORB + RANSAC, khoá trục theo từng bước, tương quan pixel làm ý kiến
+thứ hai, pose graph + relax Gauss-Seidel, phát hiện loop closure, ngoại suy bù khi
+mất khớp, định vị thủ công, quét lớp Z. Bản này bỏ toàn bộ những thứ đó: ~1.240
+dòng thay vì ~2.400, một đường đi duy nhất cho mỗi khung, và không có tầng nào có
+thể âm thầm từ chối một phép khớp đúng.
+
+Đổi lại, mất hiệu chỉnh trôi tích luỹ và loop closure (xem Giới hạn ở trên). Nếu
+cần lại, Fiji làm việc đó tốt hơn ở chế độ offline, và bản xuất ZIP đã có sẵn
+toạ độ khởi đầu cho nó.
