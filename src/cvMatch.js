@@ -454,13 +454,13 @@ export function matchTiles(
       const p2 = kpPrev.get(m.trainIdx).pt;
       return [p1.x, p1.y, p2.x, p2.y];
     });
-    const AXIS_THRESH_PX = 5;
+    const AXIS_THRESH_PX = 7;
     // Half the tile's own dimension is a generous window — genuine matches
     // need real overlap to work at all, so the true offset is essentially
     // never more than about half the tile size, while a repeated-stripe
     // alias is typically much further away than that.
-    const maxDevX = tileW != null ? tileW * 0.5 : null;
-    const maxDevY = tileH != null ? tileH * 0.5 : null;
+    const maxDevX = tileW != null ? tileW * 0.65 : null;
+    const maxDevY = tileH != null ? tileH * 0.65 : null;
     const rx = fitAxisTranslation(pts, 'x', AXIS_THRESH_PX, expectedDX, maxDevX);
     const ry = fitAxisTranslation(pts, 'y', AXIS_THRESH_PX, expectedDY, maxDevY);
     // Which axis to trust when BOTH hypotheses find a plausible fit. Naively
@@ -509,8 +509,8 @@ export function matchTiles(
     if (!skipCrossCheck && newSmall && prevSmall) {
       const origDim = best.axis === 'x' ? tileW : tileH;
       const cc = origDim ? crossCorrelateAxis(newSmall, prevSmall, best.axis, best.t, origDim) : null;
-      const AGREEMENT_PX = 15;
-      const MIN_SCORE = 0.3;
+      const AGREEMENT_PX = 25;
+      const MIN_SCORE = 0.18;
       if (cc && cc.score >= MIN_SCORE && Math.abs(cc.t - best.t) <= AGREEMENT_PX) {
         // Both agree — average for a touch more precision than either alone.
         finalT = (best.t + cc.t) / 2;
