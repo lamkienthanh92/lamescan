@@ -99,6 +99,10 @@ export default function App() {
   const workRef = useRef(document.createElement('canvas'));
   const streamRef = useRef(null);
   const timerRef = useRef(null);
+  const miniRef = useRef(null);     // the overview map canvas
+  const miniBoxRef = useRef(null);  // its home in the sidebar, to put it back after PiP
+  const pipRef = useRef(null);
+  const pipVideoRef = useRef(null);
   const cropRef = useRef(null);
   const dragStart = useRef(null);
   const patchRef = useRef(PATCH_DEFAULT);

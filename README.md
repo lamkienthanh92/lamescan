@@ -324,6 +324,16 @@ Check được xác nhận theo cả hai chiều: cây code sạch thì pass, v�
 đúng dòng gây lỗi thì nó báo `FAIL App.jsx:109 — hook dependency 'refreshMinimap' is
 declared later, at line 146`.
 
+`npm run test` cũng chạy `oxlint` với **`no-undef` bật**, và lint fail là fail cả test.
+Cấu hình oxlint mặc định không bật rule này, nên một biến chưa khai báo lọt qua được
+cả lint lẫn build (Vite không type-check) và chỉ nổ lúc render — đúng như
+`ReferenceError: miniBoxRef is not defined` ở một bản trước, khi bốn dòng `useRef`
+không được thêm vào nhưng chỗ dùng thì có. `env`/`globals` được khai báo cho `browser`,
+`cv` và `documentPictureInPicture` để rule này không báo sai.
+
+Rule cũng được kiểm chứng bằng cách xoá lại đúng dòng khai báo đã thiếu:
+`x eslint(no-undef): 'miniBoxRef' is not defined` — 4 lỗi, exit code 1.
+
 ## Chạy thử
 
 ```bash
