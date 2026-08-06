@@ -36,11 +36,16 @@ nội suy dưới pixel, do stage hơi xoay, do pixel không vuông — thì l�
 tính**. Trên một cột dài, nó hiện ra thành cả dải ảnh nghiêng dần: từng hàng vẫn
 khớp với hàng bên cạnh, nhưng cả cột đi dạt sang một bên.
 
-Cách sửa là thôi đo so với ô trước, mà đo **so với ảnh ghép đã dựng**. Ảnh ghép là
-hệ quy chiếu cố định chứa mọi ô đã đặt, nên vị trí đo từ nó không mang sai số cộng
-dồn. Và khi quét zigzag đi ngược lại cạnh một cột cũ, phần chồng lấn với cột đó
-chính là thứ vị trí được đo từ — nên vòng quét **tự khép lại**, không cần cơ chế
-loop closure riêng.
+Cách sửa là thôi đo so với ô trước, mà đo **so với ảnh ghép đã dựng**.
+
+**Giới hạn thật của việc này, tôi đã nói quá ở bản trước:** ngay tại mép đang quét,
+thứ duy nhất có trong ảnh ghép quanh khung mới là chính ô vừa đặt — nên "neo vào ảnh
+ghép" ở đó **không khác gì** neo vào ô liền trước, và sai số vẫn cộng dồn y như cũ.
+Nó chỉ thật sự giúp khi khung mới chồng lên *nhiều* ô cũ, tức khi đường quét đi ngược
+lại cạnh một cột đã quét — lúc đó vòng quét tự khép lại.
+
+Thứ sửa được trôi **đã** tích luỹ là bước tối ưu toàn cục ở dưới, và nó cần các cột
+chồng lấn lên nhau mới có ràng buộc để giải.
 
 Cách làm: trích một vùng của ảnh ghép quanh vị trí dự đoán, làm xám và thu về đúng
 độ phân giải xử lý, rồi tìm 5 khung dò của khung hiện tại trong đó. Phần ảnh ghép
@@ -256,11 +261,43 @@ Cách làm:
    chụp: ô ở hàng trên, cột mà đường quét đang đi ngược lại cạnh nó. Chính những
    ràng buộc "thêm" này mới cho phép phát hiện và sửa trôi.
 2. Với từng cặp: tương quan chuẩn hoá trên vùng chồng lấn, nội suy dưới pixel, lấy
-   điểm tương quan làm độ tin cậy.
-3. Giải Gauss-Seidel cho `min Σ w·‖(pⱼ − pᵢ) − dᵢⱼ‖²`, giữ ô đầu tiên làm mốc.
-4. Lặp lại có gia trọng bền vững (IRLS): cặp nào lệch quá xa nghiệm hiện tại sẽ bị
+   điểm tương quan làm độ tin cậy. Bán kính dò **tỉ lệ theo kích thước ô và theo
+   khoảng cách trong thứ tự chụp** (40–220px). Trước đây nó là 24px cố định, và điều
+   đó âm thầm vô hiệu hoá cả bước này: đến lúc so hai ô ở hai cột khác nhau thì sai
+   số đã hàng trăm px, nằm ngoài hẳn cửa sổ 24px — nên đúng những liên kết dài mang
+   theo phần hiệu chỉnh lại là những liên kết không bao giờ sống sót. Đỉnh tương quan
+   nằm sát biên cửa sổ dò cũng bị **loại** thay vì nhận, vì nó là một giới hạn dưới
+   chứ không phải một phép đo, và đưa một ràng buộc sai trông có vẻ chắc chắn cho
+   solver còn tệ hơn là không có ràng buộc nào.
+3. **Khởi tạo bằng cây khung**: đặt mọi ô bằng cách đi từ ô mốc ra ngoài theo các
+   liên kết đáng tin nhất. Việc này giải *chính xác* phần cây và tức thời.
+4. Giải Gauss-Seidel cho `min Σ w·‖(pⱼ − pᵢ) − dᵢⱼ‖²`, giữ ô đầu tiên làm mốc.
+5. Lặp lại có gia trọng bền vững (IRLS): cặp nào lệch quá xa nghiệm hiện tại sẽ bị
    giảm trọng số rồi giải lại — nên một cặp đo sai bị chiết khấu thay vì kéo cả
    vùng lân cận theo.
+
+Bước 3 quan trọng hơn bước 4. Gauss-Seidel (và cả over-relaxation, và đổi chiều lượt
+quét) đều lan thông tin khoảng **một ô mỗi lượt** dọc theo một chuỗi, nên chuỗi dài
+cần cỡ N² lượt mới hội tụ. Đo thật trên chuỗi 300 ô: vẫn còn lệch **4600px**. Một
+phiên quét chủ yếu là chuỗi cộng vài liên kết chéo, nên giải trực tiếp phần chuỗi và
+để phép lặp chỉ phân bổ sai số khép vòng biến trường hợp khó nhất thành dễ nhất —
+chuỗi 300 ô giờ hội tụ chính xác tuyệt đối.
+
+### Vì sao vẫn có thể trôi sau khi tối ưu
+
+Chỉ những liên kết giữa các ô **không chụp liền nhau** mới sửa được trôi tích luỹ. Một
+chuỗi liên kết liên tiếp **không có cách nào biết** là cả chuỗi đã bị bẻ cong: solver
+có thể thoả mãn từng liên kết một cách hoàn hảo (sai lệch dư = 0) mà nghiệm vẫn lệch
+đúng bằng lượng đã tích luỹ. Có test riêng cho việc này — *"a pure chain cannot detect
+its own bend, however well it converges"*.
+
+Nên app báo số **cặp chéo** riêng, và cảnh báo nếu nó gần bằng 0:
+
+> Đã tối ưu nhưng chỉ có 1 cặp "chéo" trên 214 cặp. Đó là loại cặp duy nhất sửa được
+> trôi tích luỹ. Cần quét sao cho các cột/hàng chồng lấn lên nhau, rồi chạy lại.
+
+Một liên kết khép vòng là đủ: trên chuỗi 300 ô có sai số tích luỹ 149.5px, thêm một
+liên kết đúng từ ô đầu tới ô cuối kéo nó về 0.5px.
 
 App báo lại con số cụ thể: `sai lệch trung bình giữa các cặp: 8.4px → 0.6px`. Đó là
 thước đo trực tiếp cho việc tối ưu đã làm được gì.

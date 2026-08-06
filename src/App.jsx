@@ -711,7 +711,7 @@ export default function App() {
       freeRef(s.refTile);
       s.refTile = { gray: s.refPrev.gray.clone(), scale, x, y };
       log('ok', `ô #${index + 1} tại (${Math.round(x)}, ${Math.round(y)}) · dịch ${fmt(dx)},${fmt(dy)}` +
-        ` · ${est.used}/${est.total} khung dò đồng ý (điểm ${est.score.toFixed(2)})` +
+        ` · ${est.used}/${est.total} khung dò đồng ý (điểm ${est.score.toFixed(2)}, tán ${est.spread.toFixed(1)}px)` +
         (chained ? ' · nối qua khung trước' : '') +
         (anchored ? ` · neo vào ảnh ghép (chỉnh ${anchored.correction.toFixed(1)}px)` : ''));
       setStatus({
@@ -1023,13 +1023,22 @@ export default function App() {
       setOptStats(r);
       setFused(null);
       await rebuild(); // re-allocates the mosaic exactly around the new positions
+      // The honest headline is not the residual, it is whether there were any
+      // cross-links at all: a chain of consecutive links cannot tell that the
+      // chain as a whole has bent, so with none of them the solve can converge
+      // beautifully and still leave the scan just as skewed as before.
+      const noCross = r.crossLinks < Math.max(2, r.links * 0.1);
       setStatus({
-        text: `Đã tối ưu ${s.tiles.length} ô từ ${r.links}/${r.pairs} cặp chồng lấn. ` +
-          `Sai lệch trung bình giữa các cặp: ${r.beforeResidual.toFixed(1)}px → ${r.afterResidual.toFixed(1)}px. ` +
-          `Ô dịch nhiều nhất ${r.maxMove.toFixed(0)}px.`,
-        kind: 'ok',
+        text: noCross
+          ? `Đã tối ưu nhưng chỉ có ${r.crossLinks} cặp "chéo" (giữa các ô không chụp liền nhau) trên ${r.links} cặp. ` +
+            'Đó là loại cặp duy nhất sửa được trôi tích luỹ — không có chúng thì chuỗi ô không có cách nào biết là nó đã bị bẻ cong. ' +
+            'Cần quét sao cho các cột/hàng chồng lấn lên nhau, rồi chạy lại.'
+          : `Đã tối ưu ${s.tiles.length} ô từ ${r.links}/${r.pairs} cặp (${r.crossLinks} cặp chéo). ` +
+            `Sai lệch trung bình: ${r.beforeResidual.toFixed(1)}px → ${r.afterResidual.toFixed(1)}px. ` +
+            `Ô dịch nhiều nhất ${r.maxMove.toFixed(0)}px.`,
+        kind: noCross ? 'warn' : 'ok',
       });
-      log('info', `tối ưu toàn cục: ${r.links}/${r.pairs} cặp, sai lệch ${r.beforeResidual.toFixed(1)}→${r.afterResidual.toFixed(1)}px, bỏ ${r.dropped} cặp lỗi`);
+      log('info', `tối ưu: ${r.links}/${r.pairs} cặp (${r.crossLinks} chéo), sai lệch ${r.beforeResidual.toFixed(1)}→${r.afterResidual.toFixed(1)}px, bỏ ${r.dropped} cặp lỗi`);
     } catch (e) {
       setStatus({ text: 'Tối ưu thất bại: ' + (e && e.message ? e.message : e), kind: 'warn' });
     } finally {
@@ -1368,9 +1377,16 @@ export default function App() {
             </label>
             <div className="note">
               Bật (khuyến nghị): vị trí mỗi ô được đo <b>so với ảnh ghép đã dựng</b>, không phải so với ô
-              liền trước. Ảnh ghép là hệ quy chiếu cố định nên sai số không cộng dồn — đó là thứ chặn hiện
-              tượng cả dải ảnh nghiêng dần. Khi quét zigzag đi ngược lại cạnh một cột cũ, vị trí được đo
-              từ chính phần chồng lấn với cột đó, nên vòng quét tự khép lại.
+              liền trước.
+            </div>
+            <div className="note amber">
+              Nhưng nó <b>không chặn được trôi ở mép đang quét</b>, và tôi đã nói quá điều này ở bản trước.
+              Ngay tại mép, thứ duy nhất có trong ảnh ghép quanh khung mới là chính ô vừa đặt — nên "neo vào
+              ảnh ghép" ở đó không khác gì neo vào ô liền trước, và sai số vẫn cộng dồn. Nó chỉ thật sự giúp
+              khi khung mới chồng lên <i>nhiều</i> ô cũ, tức khi đường quét đi ngược lại cạnh một cột đã quét.
+              <br /><br />
+              Thứ sửa được trôi đã tích luỹ là bước <b>Tối ưu vị trí toàn cục</b> ở dưới — và nó cần các
+              cột/hàng <b>chồng lấn lên nhau</b> mới có ràng buộc để giải.
             </div>
             <div className="note">
               Tắt nếu muốn thấy đúng chuỗi đo thô (chỉ để chẩn đoán). Nhật ký ghi
@@ -1511,9 +1527,13 @@ export default function App() {
             </div>
             {optStats && (
               <div className="note mono" style={{ color: 'var(--teal)' }}>
-                {optStats.links}/{optStats.pairs} cặp đo được · sai lệch trung bình{' '}
-                {optStats.beforeResidual.toFixed(1)}px → {optStats.afterResidual.toFixed(1)}px · bỏ{' '}
-                {optStats.dropped} cặp lỗi · dịch tối đa {optStats.maxMove.toFixed(0)}px
+                {optStats.links}/{optStats.pairs} cặp đo được, trong đó{' '}
+                <b style={{ color: optStats.crossLinks < 2 ? 'var(--amber)' : 'var(--teal)' }}>
+                  {optStats.crossLinks} cặp chéo
+                </b>{' '}
+                · sai lệch trung bình {optStats.beforeResidual.toFixed(1)}px →{' '}
+                {optStats.afterResidual.toFixed(1)}px · bỏ {optStats.dropped} cặp lỗi · dịch tối đa{' '}
+                {optStats.maxMove.toFixed(0)}px
               </div>
             )}
           </div>

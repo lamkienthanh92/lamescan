@@ -85,4 +85,66 @@ t('no links means no change rather than a crash', () => {
   assert.deepEqual(out.positions[1], { x: 5, y: 5 });
 });
 
-console.log(`\n${pass} checks passed.`);
+
+
+// --- what the solve can and cannot fix ---
+
+t('a pure chain cannot detect its own bend, however well it converges', () => {
+  // 20 tiles in one straight line, consecutive links only.
+  const tiles = [];
+  for (let i = 0; i < 20; i++) tiles.push({ x: i * STEP_X, y: 0, w: W, h: H });
+  const links = [];
+  for (let i = 1; i < tiles.length; i++) {
+    // Each measurement is wrong by the same 0.5px in y — a systematic bias.
+    links.push({ i: i - 1, j: i, dx: STEP_X, dy: 0.5, w: 1 });
+  }
+  const out = globalSolve(tiles.map(() => ({ x: 0, y: 0 })), links);
+  assert.ok(out.residual < 1e-9, `the solve satisfies every link exactly, residual ${out.residual}`);
+  // ...and is exactly wrong: the last tile is 19 * 0.5px off in y, and nothing in
+  // the data says otherwise. A perfect residual is not a correct answer.
+  assert.ok(Math.abs(out.positions[19].y - 9.5) < 1e-9,
+    `chain bias must accumulate unchecked, got ${out.positions[19].y}`);
+  assert.equal(links.filter((l) => l.j - l.i > 1).length, 0, 'no cross-links exist to catch it');
+});
+
+t('one cross-link closing the loop removes the accumulated bias', () => {
+  const tiles = [];
+  for (let i = 0; i < 20; i++) tiles.push({ x: i * STEP_X, y: 0, w: W, h: H });
+  const links = [];
+  for (let i = 1; i < tiles.length; i++) links.push({ i: i - 1, j: i, dx: STEP_X, dy: 0.5, w: 1 });
+  // The scan came back and overlapped tile 0 again: a single correct long link.
+  links.push({ i: 0, j: 19, dx: 19 * STEP_X, dy: 0, w: 1 });
+  const out = globalSolve(tiles.map(() => ({ x: 0, y: 0 })), links);
+  assert.ok(Math.abs(out.positions[19].y) < 1.0,
+    `the closing link should pull the end back, got ${out.positions[19].y.toFixed(2)}px`);
+});
+
+t('a 300-tile chain converges exactly, not approximately', () => {
+  // Iterating from the recorded positions with plain Gauss-Seidel left this case
+  // 4600px short: information travels about one tile per sweep along a chain, so a
+  // long scan needs ~N^2 sweeps. Solving the tree directly makes it exact.
+  const N = 300;
+  const links = [];
+  for (let i = 1; i < N; i++) links.push({ i: i - 1, j: i, dx: STEP_X, dy: 0.5, w: 1 });
+  const out = globalSolve(Array.from({ length: N }, () => ({ x: 0, y: 0 })), links);
+  const err = Math.abs(out.positions[N - 1].x - (N - 1) * STEP_X);
+  assert.ok(err < 1e-6, `end of a 300-tile chain off by ${err.toFixed(1)}px`);
+});
+
+t('one closing link straightens a 300-tile chain', () => {
+  const N = 300;
+  const links = [];
+  for (let i = 1; i < N; i++) links.push({ i: i - 1, j: i, dx: STEP_X, dy: 0.5, w: 1 });
+  links.push({ i: 0, j: N - 1, dx: (N - 1) * STEP_X, dy: 0, w: 1 });
+  const out = globalSolve(Array.from({ length: N }, () => ({ x: 0, y: 0 })), links);
+  assert.ok(Math.abs(out.positions[N - 1].y) < 2,
+    `expected the 149.5px accumulated bias to be pulled out, got ${out.positions[N - 1].y.toFixed(1)}px`);
+});
+
+t('tiles no link reaches keep the position they had', () => {
+  const links = [{ i: 0, j: 1, dx: 100, dy: 0, w: 1 }];
+  const out = globalSolve([{ x: 0, y: 0 }, { x: 999, y: 999 }, { x: 42, y: 7 }], links);
+  assert.deepEqual(out.positions[2], { x: 42, y: 7 });
+});
+console.log(`
+${pass} checks passed.`);
