@@ -249,6 +249,34 @@ Xử lý theo từng dải ngang nên bộ nhớ đỉnh không phụ thuộc k�
 Thứ tự đầy đủ trước khi xuất: **Tối ưu vị trí toàn cục** → bỏ ô xấu → chọn phương
 pháp gộp pixel → **Dựng lại & xem trước** → xuất.
 
+## Bản đồ vùng đã quét (cửa sổ nổi)
+
+Trong lúc quét bạn đang nhìn cửa sổ phần mềm camera, không nhìn app — nên ảnh ghép
+nằm sau ba cửa sổ khác thì vô dụng. Bản đồ này nhỏ và **nổi lên trên**.
+
+Nó hiện nhiều hơn "chỗ nào đã có pixel", vì đó không phải câu hỏi. Câu hỏi là chỗ nào
+còn phải làm, và có **hai** câu trả lời khác nhau:
+
+- **Trong suốt** — chưa quét. Thấy ngay.
+- **Vàng** — đã quét, nhưng **chỉ 1 lần**, chưa có ô thứ hai chồng lấn. Chỗ đó đã có
+  ảnh, nhưng không có ô nào để đối chiếu hay để chọn pixel tốt hơn ở khâu hậu kiểm,
+  nên nó xuất ra đúng như khung đã chụp — kể cả phần mép dính halo. Trên một phiên
+  quét xong, chỉ viền ngoài cùng nên còn vàng.
+
+Trường hợp thứ hai là thứ **không thấy được trên ảnh ghép** và cũng là thứ âm thầm
+làm giảm chất lượng kết quả, nên nó được tô. App còn báo con số:
+`23% diện tích đã quét hiện chỉ có 1 ô phủ`.
+
+Ô viền xanh = ô mới nhất, để biết mép nào đang để ngỏ.
+
+Cửa sổ nổi dùng Document Picture-in-Picture (Chrome 116+): DOM thật trong một cửa sổ
+luôn nằm trên, nên bản đồ và phần chú giải sang nguyên vẹn và vẫn tự cập nhật vì nó
+đúng là cùng một canvas. Trình duyệt không hỗ trợ thì dùng canvas capture stream qua
+video PiP — vẫn luôn nằm trên, chỉ là ảnh không kèm chú giải.
+
+Bản đồ vẽ bằng cách thu nhỏ chính canvas hiển thị (đã được scale sẵn), nên nó là một
+phép blit GPU chứ không phải thêm một lượt quét qua ảnh ghép.
+
 ## Nhật ký
 
 Mỗi tick đều ghi lại nó quyết định gì và vì sao, nên "app không chạy" luôn có câu
@@ -293,6 +321,7 @@ khai lên host tĩnh nào cũng được (đã có `netlify.toml`).
 - Vùng chồng lấn lúc đang quét: **ô mới ghi đè ô cũ** (nhanh). Việc chọn pixel tốt
   nhất diễn ra ở khâu hậu kiểm trước khi xuất — xem mục trên.
 - Phím **Space** bật/tắt chạy.
+- Bản đồ vùng đã quét mở được thành cửa sổ nổi luôn nằm trên cửa sổ camera.
 
 ## Giới hạn đã biết
 

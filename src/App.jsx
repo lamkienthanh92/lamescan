@@ -7,6 +7,7 @@ import * as M from './mosaic.js';
 import { alignToMosaic, relocalizeCoarse, buildCoarseMosaic, coarseScaleFor } from './anchor.js';
 import { fuseMosaic, FUSION_METHODS, medianSharpnessOf, tileQuality } from './fuse.js';
 import { optimizePositions } from './optimize.js';
+import { drawMinimap, pipSupport, openDocumentPiP } from './minimap.js';
 import * as db from './db.js';
 
 const TICK_MS = 200;          // how often a frame is sampled
@@ -80,9 +81,12 @@ export default function App() {
   const [patchPx, setPatchPx] = useState(0);
   const [lost, setLost] = useState(false);
   const [lastRect, setLastRect] = useState(null); // last tile, marked on the mosaic view
+  const [cover, setCover] = useState(null);       // { onceFrac } from the minimap
+  const [pipOn, setPipOn] = useState(false);
   const [anchor, setAnchor] = useState(true);
   const [fusion, setFusion] = useState('best');
   const [excluded, setExcluded] = useState(() => new Set());
+  const excludedRef = useRef(new Set());
   const [fused, setFused] = useState(null); // which method the current mosaic shows
   const [optStats, setOptStats] = useState(null);
   const anchorRef = useRef(true);
@@ -98,6 +102,8 @@ export default function App() {
   const patchRef = useRef(PATCH_DEFAULT);
   useEffect(() => { patchRef.current = patchFrac; }, [patchFrac]);
   useEffect(() => { anchorRef.current = anchor; }, [anchor]);
+  useEffect(() => { excludedRef.current = excluded; }, [excluded]);
+  useEffect(() => { refreshMinimap(); }, [excluded, refreshMinimap]);
 
   const S = useRef({
     mosaic: null,
@@ -131,6 +137,20 @@ export default function App() {
   });
   const ui = useRef({ capturing: false });
   useEffect(() => { ui.current.capturing = capturing; }, [capturing]);
+
+  // Redrawn on every mosaic change. Cheap: it blits the already-scaled display
+  // canvas down rather than touching the mosaic Mat again.
+  const refreshMinimap = useCallback(() => {
+    const s = S.current;
+    if (!miniRef.current || !s.mosaic) return;
+    const last = s.tiles.length ? s.tiles[s.tiles.length - 1] : null;
+    const r = drawMinimap(miniRef.current, s.mosaic, s.tiles, {
+      sourceCanvas: canvasRef.current,
+      lastRect: last ? { x: last.x, y: last.y, w: last.w, h: last.h } : null,
+      excluded: excludedRef.current,
+    });
+    if (r) setCover({ onceFrac: r.onceFrac });
+  }, []);
 
   const cv_originX = () => (S.current.mosaic ? S.current.mosaic.originX : 0);
   const cv_originY = () => (S.current.mosaic ? S.current.mosaic.originY : 0);
@@ -198,9 +218,10 @@ export default function App() {
       mat.delete();
     }
     paintAll();
+    refreshMinimap();
     setTileCount(s.tiles.length);
     setBusyLabel(null);
-  }, [paintAll]);
+  }, [paintAll, refreshMinimap]);
 
   // ---- capture source ----
   const start = async () => {
@@ -377,6 +398,7 @@ export default function App() {
     setTileCount(s.tiles.length);
     setFused(null); // mosaic no longer matches any reviewed fusion
     dropCoarse();
+    refreshMinimap();
     return index;
   };
 
@@ -705,6 +727,7 @@ export default function App() {
     setBorderWarn(false);
     setLost(false);
     setLastRect(null);
+    setCover(null);
     setExcluded(new Set());
     setFused(null);
     setOptStats(null);
@@ -716,6 +739,64 @@ export default function App() {
       canvasRef.current.height = 1;
     }
     setStatus({ text: 'Đã đặt lại.', kind: 'idle' });
+  };
+
+  // ---- floating overview ----
+  const closePip = () => {
+    const node = miniRef.current && miniRef.current.parentElement;
+    if (node && miniBoxRef.current && node !== miniBoxRef.current) {
+      miniBoxRef.current.append(miniRef.current);
+    }
+    if (pipVideoRef.current) {
+      pipVideoRef.current.pause();
+      pipVideoRef.current.srcObject = null;
+      pipVideoRef.current = null;
+    }
+    pipRef.current = null;
+    setPipOn(false);
+    refreshMinimap();
+  };
+
+  const openPip = async () => {
+    const mode = pipSupport();
+    try {
+      if (mode === 'document') {
+        // Real DOM in an always-on-top window: the map and its key move across
+        // intact, and it keeps updating because it is the same canvas element.
+        const wrap = document.createElement('div');
+        wrap.append(miniRef.current);
+        const key = document.createElement('div');
+        key.className = 'k';
+        key.innerHTML =
+          'Vùng <b>vàng</b> = mới quét 1 lần, chưa có ô chồng lấn.<br>' +
+          'Ô viền <i>xanh</i> = ô mới nhất.<br>' +
+          'Chỗ trong suốt = chưa quét.';
+        wrap.append(key);
+        pipRef.current = await openDocumentPiP(wrap, { onClose: closePip });
+        setPipOn(true);
+        refreshMinimap();
+      } else if (mode === 'video') {
+        // No DOM PiP available: stream the canvas into a video instead. Same
+        // always-on-top behaviour, just a picture with no caption.
+        const stream = miniRef.current.captureStream(2);
+        const v = document.createElement('video');
+        v.muted = true;
+        v.srcObject = stream;
+        await v.play();
+        pipVideoRef.current = v;
+        v.addEventListener('leavepictureinpicture', closePip);
+        await v.requestPictureInPicture();
+        setPipOn(true);
+      } else {
+        setStatus({
+          text: 'Trình duyệt này không hỗ trợ cửa sổ nổi. Bản đồ vẫn dùng được trong thanh bên; hoặc mở app ở cửa sổ nhỏ cạnh cửa sổ camera.',
+          kind: 'warn',
+        });
+      }
+    } catch (e) {
+      setStatus({ text: 'Không mở được cửa sổ nổi: ' + (e && e.message ? e.message : e), kind: 'warn' });
+      closePip();
+    }
   };
 
   // ---- review & fuse before export ----
@@ -731,6 +812,7 @@ export default function App() {
           setBusyLabel(`Đang dựng lại ảnh ghép (${FUSION_METHODS[method].label}) — dải ${done}/${total}…`),
       });
       paintAll();
+      refreshMinimap();
       setFused(method);
       const n = excluded.size;
       setStatus({
@@ -1095,6 +1177,37 @@ export default function App() {
               khung đó vào đúng vị trí. Đo so với ô cuối cùng đã đặt; nếu ngoài tầm với thì so với khung
               ngay trước đó — nên một cú giật khi đổi trục chỉ mất 1 khung, không mất cả phiên.
             </div>
+          </div>
+
+          <div className="block">
+            <h2>Bản đồ vùng đã quét</h2>
+            <div className="mini-box" ref={miniBoxRef}>
+              {tileCount === 0 ? (
+                <div className="note" style={{ marginTop: 0 }}>Chưa có gì để hiện.</div>
+              ) : pipOn ? (
+                <div className="note" style={{ marginTop: 0 }}>Đang hiện ở cửa sổ nổi.</div>
+              ) : null}
+              <canvas ref={miniRef} className="mini" style={{ display: tileCount === 0 ? 'none' : 'block' }}></canvas>
+            </div>
+            <div className="gap" />
+            {!pipOn ? (
+              <button onClick={openPip} disabled={tileCount === 0}>Mở cửa sổ nổi (luôn nằm trên)</button>
+            ) : (
+              <button className="warn" onClick={closePip}>Đóng cửa sổ nổi</button>
+            )}
+            <div className="note">
+              Vùng <span className="amber">vàng</span> = mới quét <b>1 lần</b>, chưa có ô nào chồng lấn:
+              đã có ảnh, nhưng không có ô thứ hai để đối chiếu hay để chọn pixel tốt hơn ở khâu hậu kiểm,
+              nên chỗ đó xuất ra đúng như khung đã chụp — kể cả phần mép dính halo. Trên một phiên quét
+              xong, chỉ viền ngoài cùng nên còn vàng.
+              <br />
+              Chỗ <b>trong suốt</b> = chưa quét. Ô viền <span style={{ color: 'var(--teal)' }}>xanh</span> = ô mới nhất.
+            </div>
+            {cover && (
+              <div className="note mono">
+                {Math.round(cover.onceFrac * 100)}% diện tích đã quét hiện chỉ có 1 ô phủ.
+              </div>
+            )}
           </div>
 
           <div className="block">
