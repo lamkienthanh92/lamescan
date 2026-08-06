@@ -18,7 +18,7 @@ const EXTRAPOLATE_MIN_PX = 3; // minimum recent motion before it's worth extrapo
 const RELAX_ITERS_PER_TICK = 20; // small warm-started relaxation pass, run every tick — needs more than a handful now that rotation is solved too (coupled rotation+translation converges slower than translation alone), still cheap since it's plain arithmetic over edges
 const GUESS_EDGE_WEIGHT = 1; // low confidence for extrapolated (unmatched) placements
 const MAX_CONSECUTIVE_GUESSES = 2; // stop auto-accepting guesses after this many in a row without a real match confirming them
-const CANDIDATE_POOL_SIZE = 4; // how many nearby-by-prediction tiles a capture is tried against, not just the last one
+const CANDIDATE_POOL_SIZE = 2; // how many nearby-by-prediction tiles a capture is tried against, not just the last one — kept small since each candidate costs a full match
 const REBUILD_DRIFT_PX = 20; // repaint the mosaic once any already-painted tile drifts this much — a few px of residual jitter from iterative relax isn't worth a full expensive repaint; only real loop-closure corrections should trigger one
 const REBUILD_MIN_TILES = 25; // ...but don't repaint more often than every N new tiles
 const REBUILD_MAX_MS = 8000; // ...or longer than this since the last repaint, if dirty
@@ -919,6 +919,9 @@ export default function App() {
       let m = null;
       let prevIndex = null;
       let prevTile = null;
+      // Pass 1 (cheap): ORB-only axis fit for every candidate, no cross-
+      // correlation — just enough to rank them.
+      const trialResults = [];
       for (const cand of candidates) {
         const candFeat = await getTileFeatures(cand.tile);
         const [localExpDX, localExpDY] = applyInverseLinear(
@@ -927,13 +930,26 @@ export default function App() {
           predictedTransform[5] - cand.tile.transform[5]
         );
         const trial = matchTiles(featNew.kp, featNew.desc, candFeat.kp, candFeat.desc, {
-          axisLock: true, expectedDX: localExpDX, expectedDY: localExpDY,
-          newSmall: featNew.small, prevSmall: candFeat.small, tileW: w, tileH: h,
+          axisLock: true, expectedDX: localExpDX, expectedDY: localExpDY, skipCrossCheck: true,
         });
-        if (trial.ok && (!m || trial.inliers > m.inliers)) {
-          m = trial;
-          prevIndex = cand.index;
-          prevTile = cand.tile;
+        if (trial.ok) trialResults.push({ cand, candFeat, localExpDX, localExpDY, inliers: trial.inliers });
+      }
+      trialResults.sort((a, b) => b.inliers - a.inliers);
+      // Pass 2 (only as many as needed): re-check the top candidate(s) with
+      // the pixel cross-correlation consensus enabled, falling through to the
+      // next-best only if the leader doesn't actually pass it — so on a
+      // normal tick this runs the expensive check exactly once, not once per
+      // candidate.
+      for (const r of trialResults) {
+        const verified = matchTiles(featNew.kp, featNew.desc, r.candFeat.kp, r.candFeat.desc, {
+          axisLock: true, expectedDX: r.localExpDX, expectedDY: r.localExpDY,
+          newSmall: featNew.small, prevSmall: r.candFeat.small, tileW: w, tileH: h,
+        });
+        if (verified.ok) {
+          m = verified;
+          prevIndex = r.cand.index;
+          prevTile = r.cand.tile;
+          break;
         }
       }
       if (!m) m = { ok: false, inliers: 0, total: 0 };
@@ -1118,7 +1134,7 @@ export default function App() {
       setMatchInfo({
         text:
           (usedAnchor
-            ? `Đã nối tự động, phát hiện trùng vùng cũ — đang điều hoà toàn cục (${m.inliers}/${m.total} điểm nội).`
+            ? `Phát hiện trùng vùng đã quét trước đó — đang chỉnh lại vị trí các ô liên quan cho khớp hơn (bình thường, không phải lỗi). ${m.inliers}/${m.total} điểm nội.`
             : `Đã nối tự động — ${m.inliers}/${m.total} điểm nội (${Math.round((m.inliers / m.total) * 100)}%).`) +
           (sharp.blurry ? ' Ô này có thể bị mờ — xem trong "Ô đã chụp".' : ''),
         kind: sharp.blurry ? 'warn' : 'ok',

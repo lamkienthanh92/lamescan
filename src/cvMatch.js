@@ -417,9 +417,14 @@ function estimateGeneralTransform(keep, kpNew, kpPrev) {
 // agree" consensus check: ORB keypoint matching and whole-strip pixel
 // correlation fail in different ways, so requiring both catches mistakes
 // neither alone reliably would.
+// `skipCrossCheck`: when true, skips the pixel cross-correlation consensus
+// step even if newSmall/prevSmall are supplied — used by callers doing their
+// own multi-candidate search, so the (relatively expensive) cross-check only
+// has to run once on the winning candidate afterward, not on every candidate
+// during selection.
 export function matchTiles(
   kpNew, descNew, kpPrev, descPrev,
-  { axisLock = false, expectedDX = null, expectedDY = null, newSmall = null, prevSmall = null, tileW = null, tileH = null } = {}
+  { axisLock = false, expectedDX = null, expectedDY = null, newSmall = null, prevSmall = null, tileW = null, tileH = null, skipCrossCheck = false } = {}
 ) {
   if (descNew.rows < 4 || descPrev.rows < 4) return { ok: false, inliers: 0, total: 0 };
 
@@ -501,7 +506,7 @@ export function matchTiles(
     // when the caller supplied the downscaled tile copies; skipped (not
     // rejected) otherwise so callers without them still work.
     let finalT = best.t;
-    if (newSmall && prevSmall) {
+    if (!skipCrossCheck && newSmall && prevSmall) {
       const origDim = best.axis === 'x' ? tileW : tileH;
       const cc = origDim ? crossCorrelateAxis(newSmall, prevSmall, best.axis, best.t, origDim) : null;
       const AGREEMENT_PX = 15;
