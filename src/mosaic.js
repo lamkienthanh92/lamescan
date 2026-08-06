@@ -16,6 +16,8 @@ export const EXPORT_MAX_DIM = 16000;
 export const EXPORT_MAX_AREA = 200e6;
 // Grow in chunks: each growth reallocates and copies the whole Mat, so growing
 // once every several tiles beats growing a few hundred pixels every tile.
+import { readbackCanvas } from './canvasutil.js';
+
 const GROW_CHUNK = 1024;
 const INIT_PAD = 32;
 
@@ -128,7 +130,7 @@ export function paintRegion(m, canvas, rect, scale) {
   const cont = new cv.Mat();
   roi.copyTo(cont); // an ROI shares its parent's stride, which imshow would misread
   roi.delete();
-  if (!regionCanvas) regionCanvas = document.createElement('canvas');
+  if (!regionCanvas) regionCanvas = readbackCanvas(); // cv.imshow writes, drawImage reads
   const tmp = regionCanvas;
   cv.imshow(tmp, cont);
   cont.delete();

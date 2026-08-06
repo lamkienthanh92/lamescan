@@ -17,6 +17,8 @@
 // The second case is the one that is invisible on the mosaic itself and the one
 // that quietly degrades the result, so it gets the highlight.
 
+import { readbackCanvas } from './canvasutil.js';
+
 const MAX_DIM = 320;
 
 // How many tiles cover each cell of the map, capped at 2 — the only distinction
@@ -82,7 +84,7 @@ export function drawMinimap(
     return { scale, w: cw, h: ch, onceFrac: coveredCells > 0 ? onceCells / coveredCells : 0 };
   }
 
-  if (!overlayCanvas) overlayCanvas = document.createElement('canvas');
+  if (!overlayCanvas) overlayCanvas = readbackCanvas(); // createImageData/putImageData
   if (overlayCanvas.width !== cw || overlayCanvas.height !== ch) {
     overlayCanvas.width = cw;
     overlayCanvas.height = ch;

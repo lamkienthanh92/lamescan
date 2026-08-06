@@ -9,6 +9,7 @@ import { fuseMosaic, FUSION_METHODS, medianSharpnessOf, tileQuality } from './fu
 import { optimizePositions } from './optimize.js';
 import { drawMinimap, pipSupport, openDocumentPiP } from './minimap.js';
 import * as db from './db.js';
+import { readbackCanvas } from './canvasutil.js';
 
 const TICK_MS = 200;          // how often a frame is sampled
 const MIN_SCORE = 0.32;       // a single patch scoring below this isn't a measurement
@@ -96,11 +97,19 @@ export default function App() {
   const videoRef = useRef(null);
   const previewRef = useRef(null);
   const canvasRef = useRef(null);
-  const workRef = useRef(document.createElement('canvas'));
+  const workRef = useRef(readbackCanvas()); // cv.imread reads this back every tick
   const streamRef = useRef(null);
   const timerRef = useRef(null);
-  const miniRef = useRef(null);     // the overview map canvas
-  const miniBoxRef = useRef(null);  // its home in the sidebar, to put it back after PiP
+  const miniRef = useRef(null);      // sidebar overview canvas (React-owned)
+  // The floating window gets its OWN plain canvas, created imperatively.
+  // Re-parenting the sidebar canvas into the other document is what broke the app:
+  // React still had that node recorded as a child of its original parent, so the
+  // next render called insertBefore against a node that was no longer there
+  // ("The node before which the new node is to be inserted is not a child of this
+  // node"), which killed the whole tree — the UI froze and stitching stopped.
+  // A React-rendered node must never be moved out from under React; drawing the
+  // same picture into a second canvas costs nothing and keeps ownership clean.
+  const pipCanvasRef = useRef(null);
   const pipRef = useRef(null);
   const pipVideoRef = useRef(null);
   const cropRef = useRef(null);
@@ -148,14 +157,16 @@ export default function App() {
   // canvas down rather than touching the mosaic Mat again.
   const refreshMinimap = useCallback(() => {
     const s = S.current;
-    if (!miniRef.current || !s.mosaic) return;
+    if (!s.mosaic || (!miniRef.current && !pipCanvasRef.current)) return;
     const last = s.tiles.length ? s.tiles[s.tiles.length - 1] : null;
-    const r = drawMinimap(miniRef.current, s.mosaic, s.tiles, {
+    const opts = {
       sourceCanvas: canvasRef.current,
       lastRect: last ? { x: last.x, y: last.y, w: last.w, h: last.h } : null,
       excluded: excludedRef.current,
       showCoverage: showCovRef.current,
-    });
+    };
+    const r = drawMinimap(miniRef.current, s.mosaic, s.tiles, opts);
+    if (pipCanvasRef.current) drawMinimap(pipCanvasRef.current, s.mosaic, s.tiles, opts);
     if (r) setCover({ onceFrac: r.onceFrac });
   }, []);
 
@@ -221,9 +232,7 @@ export default function App() {
     for (const t of s.tiles) {
       M.growFor(s.mosaic, t.x, t.y, t.w, t.h);
       const bmp = await createImageBitmap(t.blob);
-      const c = document.createElement('canvas');
-      c.width = bmp.width;
-      c.height = bmp.height;
+      const c = readbackCanvas(bmp.width, bmp.height);
       c.getContext('2d').drawImage(bmp, 0, 0);
       bmp.close();
       const mat = cv.imread(c);
@@ -281,9 +290,7 @@ export default function App() {
         if (tries++ < 120) requestAnimationFrame(attempt);
         return;
       }
-      const c = document.createElement('canvas');
-      c.width = v.videoWidth;
-      c.height = v.videoHeight;
+      const c = readbackCanvas(v.videoWidth, v.videoHeight);
       c.getContext('2d').drawImage(v, 0, 0);
       const mat = cv.imread(c);
       const rect = detectFieldRect(mat);
@@ -756,9 +763,10 @@ export default function App() {
 
   // ---- floating overview ----
   const closePip = () => {
-    const node = miniRef.current && miniRef.current.parentElement;
-    if (node && miniBoxRef.current && node !== miniBoxRef.current) {
-      miniBoxRef.current.append(miniRef.current);
+    pipCanvasRef.current = null;
+    if (pipRef.current) {
+      try { pipRef.current.close(); } catch { /* window already gone */ }
+      pipRef.current = null;
     }
     if (pipVideoRef.current) {
       pipVideoRef.current.pause();
@@ -777,7 +785,8 @@ export default function App() {
         // Real DOM in an always-on-top window: the map and its key move across
         // intact, and it keeps updating because it is the same canvas element.
         const wrap = document.createElement('div');
-        wrap.append(miniRef.current);
+        const c = document.createElement('canvas');
+        wrap.append(c);
         const key = document.createElement('div');
         key.className = 'k';
         key.innerHTML =
@@ -786,12 +795,18 @@ export default function App() {
           'Chỗ trong suốt = chưa quét.';
         wrap.append(key);
         pipRef.current = await openDocumentPiP(wrap, { onClose: closePip });
+        pipCanvasRef.current = c;
         setPipOn(true);
         refreshMinimap();
       } else if (mode === 'video') {
         // No DOM PiP available: stream the canvas into a video instead. Same
         // always-on-top behaviour, just a picture with no caption.
-        const stream = miniRef.current.captureStream(2);
+        // Same idea for the video fallback: stream a canvas of our own, not the
+        // one React is rendering.
+        const c = document.createElement('canvas');
+        pipCanvasRef.current = c;
+        refreshMinimap();
+        const stream = c.captureStream(2);
         const v = document.createElement('video');
         v.muted = true;
         v.srcObject = stream;
@@ -1194,12 +1209,10 @@ export default function App() {
 
           <div className="block">
             <h2>Bản đồ vùng đã quét</h2>
-            <div className="mini-box" ref={miniBoxRef}>
-              {tileCount === 0 ? (
+            <div className="mini-box">
+              {tileCount === 0 && (
                 <div className="note" style={{ marginTop: 0 }}>Chưa có gì để hiện.</div>
-              ) : pipOn ? (
-                <div className="note" style={{ marginTop: 0 }}>Đang hiện ở cửa sổ nổi.</div>
-              ) : null}
+              )}
               <canvas ref={miniRef} className="mini" style={{ display: tileCount === 0 ? 'none' : 'block' }}></canvas>
             </div>
             <div className="gap" />

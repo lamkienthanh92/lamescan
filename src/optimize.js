@@ -1,5 +1,6 @@
 /* global cv */
 import { subpixelPeakOf } from './align.js';
+import { readbackCanvas } from './canvasutil.js';
 
 // Global position optimisation — the one thing Fiji's Grid/Collection stitching
 // does that sequential tracking cannot.
@@ -119,9 +120,7 @@ const MIN_PAIR_SCORE = 0.35;
 
 async function grayAt(blob, maxDim) {
   const bmp = await createImageBitmap(blob);
-  const c = document.createElement('canvas');
-  c.width = bmp.width;
-  c.height = bmp.height;
+  const c = readbackCanvas(bmp.width, bmp.height);
   c.getContext('2d').drawImage(bmp, 0, 0);
   bmp.close();
   const mat = cv.imread(c);

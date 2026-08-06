@@ -15,6 +15,8 @@
 // smooths the seams at the risk of blurring anything the alignment got slightly
 // wrong.
 
+import { readbackCanvas } from './canvasutil.js';
+
 export const FUSION_METHODS = {
   best: {
     label: 'Chọn pixel tốt nhất',
@@ -61,10 +63,8 @@ export function hannWeights(w, h) {
 
 async function decodeTile(blob) {
   const bmp = await createImageBitmap(blob);
-  const c = document.createElement('canvas');
-  c.width = bmp.width;
-  c.height = bmp.height;
-  const ctx = c.getContext('2d', { willReadFrequently: true });
+  const c = readbackCanvas(bmp.width, bmp.height);
+  const ctx = c.getContext('2d');
   ctx.drawImage(bmp, 0, 0);
   bmp.close();
   const img = ctx.getImageData(0, 0, c.width, c.height);

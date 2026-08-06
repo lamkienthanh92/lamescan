@@ -274,9 +274,17 @@ làm giảm chất lượng kết quả, nên nó được tô. App còn báo co
 Ô viền xanh = ô mới nhất, để biết mép nào đang để ngỏ.
 
 Cửa sổ nổi dùng Document Picture-in-Picture (Chrome 116+): DOM thật trong một cửa sổ
-luôn nằm trên, nên bản đồ và phần chú giải sang nguyên vẹn và vẫn tự cập nhật vì nó
-đúng là cùng một canvas. Trình duyệt không hỗ trợ thì dùng canvas capture stream qua
-video PiP — vẫn luôn nằm trên, chỉ là ảnh không kèm chú giải.
+luôn nằm trên. Trình duyệt không hỗ trợ thì dùng canvas capture stream qua video PiP —
+vẫn luôn nằm trên, chỉ là ảnh không kèm chú giải.
+
+Cửa sổ nổi có **canvas riêng**, tạo bằng DOM thuần, và bản đồ được vẽ vào cả hai
+canvas. Đây không phải chi tiết thẩm mỹ: cách làm hiển nhiên hơn — chuyển canvas ở
+thanh bên sang cửa sổ kia — **làm chết cả app**. React vẫn ghi nhận node đó là con của
+phần tử cha ban đầu, nên lần render sau nó gọi `insertBefore` với một node không còn ở
+đó nữa (`The node before which the new node is to be inserted is not a child of this
+node`), toàn bộ cây React sập, UI đóng băng và việc ghép ảnh dừng luôn. Một node do
+React render **không được** đem ra khỏi tay React; vẽ cùng một hình vào canvas thứ hai
+không tốn gì và giữ quyền sở hữu rạch ròi.
 
 Bản đồ vẽ bằng cách thu nhỏ chính canvas hiển thị (đã được scale sẵn), nên nó là một
 phép blit GPU chứ không phải thêm một lượt quét qua ảnh ghép.
@@ -332,7 +340,17 @@ không được thêm vào nhưng chỗ dùng thì có. `env`/`globals` được
 `cv` và `documentPictureInPicture` để rule này không báo sai.
 
 Rule cũng được kiểm chứng bằng cách xoá lại đúng dòng khai báo đã thiếu:
-`x eslint(no-undef): 'miniBoxRef' is not defined` — 4 lỗi, exit code 1.
+`x eslint(no-undef): 'miniBoxRef' is not defined` — 4 lỗi, exit code 1. Và nó đã bắt
+được một lần lặp lại y hệt ngay trong lượt sửa sau đó (`'readbackCanvas' is not
+defined` trong `fuse.js`, thiếu import) — trước khi đóng gói, không phải sau.
+
+`readbackCanvas()` trong `src/canvasutil.js`: mọi canvas bị đọc lại pixel — bởi
+`cv.imread`, vốn gọi `getImageData` bên trong, hoặc bởi `getImageData` trực tiếp — phải
+được tạo với `willReadFrequently`. Thiếu nó thì trình duyệt giữ canvas trên GPU và mỗi
+lần đọc lại là một lần dừng đồng bộ để kéo pixel về, đúng cái console cảnh báo. Thuộc
+tính này chốt cứng khi context 2D được tạo lần đầu và không đổi được sau đó, nên phải
+yêu cầu trước khi bất cứ thứ gì chạm vào canvas — kể cả trước khi đưa cho `cv.imread`,
+vì nếu không chính nó sẽ tạo context với thiết lập mặc định.
 
 ## Chạy thử
 
