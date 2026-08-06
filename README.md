@@ -201,3 +201,125 @@ Thư mục `dist/` sau khi build có thể triển khai lên bất kỳ static h
 - `src/cvMatch.js` — bọc các lời gọi OpenCV.js (ORB detect, BFMatcher,
   `findHomography` với RANSAC) để tìm phép biến đổi giữa 2 ô liên tiếp.
 - `src/App.css` — giao diện.
+
+## Bản sửa lỗi (changelog)
+
+Bản này sửa một loạt lỗi khiến app không dùng được ở quy mô thật (một lame ~300 ô
+theo chuẩn WHO). Chạy `npm run test` để kiểm tra các module logic thuần, và
+`npm run build` để verify.
+
+### Lỗi làm app chết giữa phiên quét
+
+- **Rò rỉ bộ nhớ WASM (`src/App.jsx`).** Ba nhánh — mất khớp, "di chuyển chưa đủ",
+  và `confirmTarget` khi không khớp — giải phóng `kp`/`desc` nhưng **quên `small`**
+  (ảnh grayscale thu nhỏ ~90KB trong WASM heap, không được GC). Đây là hai đường
+  chạy thường xuyên nhất của vòng lặp, nên chỉ sau vài chục phút quét là heap cạn
+  và cả trang bị abort. Nay dùng `freeFeatures()` (mới, trong `cvMatch.js`) để
+  không thể giải phóng thiếu.
+- **`composite()` warp vào buffer bằng cả khung mosaic.** `cv.warpPerspective`
+  nhận `Size(c.w, c.h)` rồi mới `.roi()` xuống vùng nhỏ — tức mỗi ô cấp phát một
+  Mat tạm bằng kích thước toàn bộ ảnh ghép (~675MB ở 300 ô), cộng thêm mosaic
+  chính. Nay gấp phép dịch `(-rx, -ry)` vào transform và warp trực tiếp vào
+  bounding box của ô: chi phí tỉ lệ với kích thước 1 ô, không phụ thuộc độ lớn
+  vùng đã quét.
+- **Vẽ lại toàn khung mosaic mỗi ô.** `cv.imshow` chuyển đổi từng pixel của Mat
+  được truyền vào, nên repaint toàn bộ ở mỗi lần chụp làm chi phí mỗi ô tăng theo
+  tổng diện tích — quadratic. Nay ảnh ghép được cập nhật **tăng dần**: chỉ blit
+  đúng hình chữ nhật vừa thay đổi (`paintRegion`), full repaint chỉ khi thực sự cần.
+- **Giới hạn canvas của trình duyệt.** Quá ~16384px/chiều (và giới hạn diện tích
+  thấp hơn nhiều), canvas không báo lỗi mà **im lặng trả về trắng**. Nay khung xem
+  tự thu nhỏ khi vượt ngưỡng (`DISPLAY_MAX_DIM/AREA`) và hiển thị % thu nhỏ; pixel
+  gốc vẫn nằm nguyên trong Mat, và `exportPNG` render lại từ Mat (không đọc lại
+  canvas đã thu nhỏ) nên ảnh xuất ra vẫn đủ độ phân giải.
+- **Cache đặc trưng không có giới hạn.** Nay có LRU: giữ tối đa
+  `MAX_CACHED_FEATURES` ô, pin 12 ô mới nhất + ô tham chiếu đang dùng. Ô bị loại
+  chỉ đơn giản là được tính lại từ blob khi cần.
+
+### Lỗi làm hỏng dữ liệu / hỏng phiên
+
+- **`removeEdgesForTile()` chỉ unlink một đầu (`src/graph.js`).** Nó xoá edge khỏi
+  danh sách `edges` và clear `adjacency[idx]`, nhưng **adjacency của ô láng giềng
+  vẫn giữ nguyên chính các edge object đó**. Hai hậu quả: (a) sau "Hoàn tác ô
+  cuối", `relax()` deref một index không còn tồn tại và **throw ở mọi tick sau
+  đó** — tức một lần undo là kết thúc phiên quét; (b) sau mỗi "Chụp lại"/"Quét Z",
+  edge cũ vẫn sống và kéo ô về vị trí cũ, mỗi lần chụp lại thêm một lớp rác.
+  Có test cho cả hai (`test-graph.mjs`).
+- **`activeRefIndex` treo sau undo.** Nó được set bằng index của ô mới ở mỗi lần
+  chụp, nên sau khi pop ô cuối nó trỏ ra ngoài mảng → `tiles[undefined]`.
+- **`manifest.csv` / `TileConfiguration.txt` xuất toạ độ TRƯỚC tối ưu.**
+  `tile.bbox` chỉ được tính lúc ô được đặt và **không bao giờ cập nhật sau
+  `relax()`**, nhưng export lại đọc chính bbox đó. Nghĩa là file toạ độ — thứ duy
+  nhất nối một kết quả đếm về đúng chỗ trên lame — mô tả một layout khác với ảnh
+  ghép xuất kèm, và "Tối ưu & vẽ lại ngay" không sửa được. Nay có
+  `refreshBBoxes()` chạy sau mọi lần relax. Việc này cũng khôi phục độ chính xác
+  của tìm anchor/candidate theo độ chồng lấn, vốn đang kém dần đúng lúc sai số
+  tích luỹ lớn nhất.
+- **Vị trí đã tối ưu không được lưu.** Record của từng ô chỉ ghi một lần lúc chụp,
+  với transform *trước* relax. Nay `persistMeta()` snapshot transform hiện tại
+  (9 số/ô, không đáng kể so với blob) và "Tiếp tục phiên cũ" khôi phục đúng vị trí
+  đã hội tụ thay vì lùi về chuỗi thô.
+- **IndexedDB trộn hai phiên.** Nếu bỏ qua banner "Tìm thấy phiên quét dở" rồi quét
+  mới, record cũ ở index cao vẫn nằm đó trong khi ô mới ghi đè index thấp — crash
+  lần sau sẽ khôi phục ra một phiên lắp ghép từ hai lame. Nay DB được xoá tự động
+  khi ô đầu tiên của phiên mới được đặt.
+- **Edge trỏ vào ô không tồn tại khi load.** Thêm `rebuildAdjacency()` lọc và dựng
+  lại index, dùng cho cả "Tiếp tục phiên cũ" và "Nhập lại từ ZIP".
+
+### Lỗi làm tính năng không chạy
+
+- **"Quét Z" chết hoàn toàn (`ReferenceError`).** `finishZCapture` truyền
+  `tileW: w, tileH: h` nhưng **không có `w`/`h` nào trong scope đó** (các hàm khác
+  destructure chúng từ `grabVideoFrame()`, hàm này thì không). Try/catch bắt lại
+  và chỉ hiện "Quét lớp Z thất bại: w is not defined". Nay dùng `best.w`/`best.h`.
+- **`quickOverlapCheck` chưa từng hoạt động.** Nó thu nhỏ frame live về max
+  **220px** rồi `matchTemplate` với bản cache `_small` ở max **300px** — tức so
+  khớp hai độ phóng đại khác nhau của cùng cảnh, điểm gần như luôn dưới ngưỡng
+  0.25 → luôn trả `null` → không bao giờ skip tick nào. Nay dùng đúng
+  `CROSSCHECK_MAX_DIM`.
+- **`expectedDX/DY` sai hệ toạ độ** trong "Chụp lại" và "Quét Z": truyền delta
+  world-space vào chỗ `matchTiles` mong đợi offset trong frame riêng của ô láng
+  giềng. Nay đi qua `applyInverseLinear` như đường quét chính.
+- **Ngoại suy khi `prevIndex === 0`.** Guard cũ là `tiles.length >= 2`, chưa đủ:
+  ô tham chiếu có thể chính là ô 0, vốn không có ô trước để lấy vector di chuyển
+  → `undefined.transform`.
+
+### Lỗi im lặng
+
+- **`autoTick` không có `catch`** (chỉ `try/finally`). Mọi exception thành
+  unhandled rejection: timer vẫn chạy, khối Trạng thái vẫn hiện thông báo thành
+  công cũ, và app **lặng lẽ ngừng ghi ô**. Với công việc đọc lame thì đây là kiểu
+  lỗi tệ nhất. Nay dừng hẳn và báo rõ, dữ liệu đã chụp vẫn giữ.
+- **Poll `opencv.js` vô hạn.** Nếu script 404 (đúng tình huống cấu hình sai
+  build/publish mà README đã cảnh báo), trang treo mãi ở "Đang tải bộ xử lý
+  ảnh…". Nay timeout 25s kèm hướng dẫn kiểm tra cụ thể.
+- `maxRenderedDrift()` chỉ so tịnh tiến, nên chỉnh sửa **thuần xoay** không
+  trigger vẽ lại — ảnh ghép hiện lệch mà app tưởng không có gì thay đổi. Nay quy
+  đổi sai lệch góc thành dịch chuyển góc ảnh xấu nhất.
+- `relax()` giờ bỏ qua edge treo thay vì throw (phòng vệ, không thay thế các fix trên).
+
+### Còn cần làm (chưa sửa trong bản này)
+
+- **Đưa ORB/matching sang Web Worker.** Toàn bộ OpenCV vẫn chạy trên main thread;
+  ORB(1500) + BFMatcher crossCheck cho mỗi cặp là khá nặng và có thể vượt
+  `AUTO_INTERVAL_MS = 350`, khiến tick bị bỏ và UI đứng khi rebuild.
+- **Ngưỡng axis-lock cần hiệu chỉnh trên máy thật.** `AXIS_THRESH_PX = 5`, cấm
+  hoàn toàn xoay, cần ≥15 inliers *và* ratio ≥0.25, và reject thẳng nếu cả hai
+  trục fail. Hợp lý với stage cơ khí 2 núm x/y; nếu kéo tiêu bản bằng tay thì lệch
+  chéo >5px là chuyện thường và sẽ mất khớp liên tục. Đây là quyết định thiết kế có
+  chủ đích của bản gốc nên không bị thay đổi ở đây — nhưng nếu thực tế mất khớp
+  nhiều, đây là chỗ cần nới trước tiên.
+- **Nguồn ảnh.** `getDisplayMedia` là màn hình đã qua nén/resample của phần mềm
+  camera, không phải luồng gốc. Nếu camera là UVC thì `getUserMedia` sẽ cho ảnh
+  gốc và không cần dò vignette bằng heuristic.
+- **Chưa có calibration µm/pixel**, nên manifest chỉ có toạ độ pixel, không map
+  được về vernier của stage.
+- Không multi-band blending (chỉ feather 8px), không EDF, `App.jsx` vẫn là một file
+  lớn, và chỉ có test cho phần logic thuần (phần OpenCV chưa có test).
+
+### Lưu ý về thẩm định
+
+Nếu app được dùng để hỗ trợ đọc AFB thật, cần một bước thẩm định song song (đọc
+thủ công so với đọc qua app trên cùng bộ lame) trước khi tin vào kết quả, và giữ
+nguyên nguyên tắc đã ghi ở trên: **đếm trên từng ảnh gốc, ảnh ghép chỉ để định
+vị**. Lỗi toạ độ manifest ở trên đặc biệt quan trọng vì nó phá đúng sợi dây truy
+vết đó.

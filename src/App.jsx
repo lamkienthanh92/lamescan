@@ -2,9 +2,9 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
 import JSZip from 'jszip';
 import './App.css';
-import { IDENT, matMul3, translateM, cornersOf, bboxOf, findAnchorTile, findCandidateTiles, angleOf, applyInverseLinear } from './matrix.js';
-import { computeFeatures, matchTiles, computeSharpness, detectVignetteRect } from './cvMatch.js';
-import { addEdge, removeEdgesForTile, relax, maxRenderedDrift } from './graph.js';
+import { IDENT, matMul3, translateM, cornersOf, bboxOf, findAnchorTile, findCandidateTiles, angleOf, applyInverseLinear, refreshBBoxes } from './matrix.js';
+import { computeFeatures, freeFeatures, matchTiles, computeSharpness, detectVignetteRect, CROSSCHECK_MAX_DIM } from './cvMatch.js';
+import { addEdge, removeEdgesForTile, rebuildAdjacency, relax, maxRenderedDrift } from './graph.js';
 import * as db from './db.js';
 
 const INIT_PAD = 40;
@@ -17,7 +17,7 @@ const ANCHOR_MIN_TILES = ANCHOR_EXCLUDE_COUNT + 2;
 const EXTRAPOLATE_MIN_PX = 3; // minimum recent motion before it's worth extrapolating a guess
 const RELAX_ITERS_PER_TICK = 20; // small warm-started relaxation pass, run every tick — needs more than a handful now that rotation is solved too (coupled rotation+translation converges slower than translation alone), still cheap since it's plain arithmetic over edges
 const GUESS_EDGE_WEIGHT = 1; // low confidence for extrapolated (unmatched) placements
-const MAX_CONSECUTIVE_GUESSES = 4; // stop auto-accepting guesses after this many in a row without a real match confirming them
+const MAX_CONSECUTIVE_GUESSES = 2; // stop auto-accepting guesses after this many in a row without a real match confirming them
 const CANDIDATE_POOL_SIZE = 2; // how many nearby-by-prediction tiles a capture is tried against, not just the last one — kept small since each candidate costs a full match
 const REBUILD_DRIFT_PX = 20; // repaint the mosaic once any already-painted tile drifts this much — a few px of residual jitter from iterative relax isn't worth a full expensive repaint; only real loop-closure corrections should trigger one
 const REBUILD_MIN_TILES = 25; // ...but don't repaint more often than every N new tiles
@@ -25,6 +25,36 @@ const REBUILD_MAX_MS = 8000; // ...or longer than this since the last repaint, i
 const SHARPNESS_HISTORY_SIZE = 30; // recent "good" tiles used as the running focus baseline
 const SHARPNESS_MIN_SAMPLES = 5; // don't flag anything until we have a baseline
 const SHARPNESS_BLUR_RATIO = 0.4; // flag a tile if its sharpness < 40% of the recent median
+
+// Browsers cap how big a <canvas> can be — roughly 16384px per side, and a total
+// area limit well under what a 300-field WHO slide scan reaches (a 15000x11250
+// mosaic is ~170 megapixels). Past the cap the canvas silently goes blank
+// instead of erroring, so the on-screen mosaic is kept inside these bounds and
+// downscaled when it has to be. The full-resolution pixels always stay in the
+// OpenCV Mat; only the *display* copy is reduced.
+const DISPLAY_MAX_DIM = 8192;
+const DISPLAY_MAX_AREA = 40e6;
+// Export can afford to be closer to the real browser ceiling than the live view.
+const EXPORT_MAX_DIM = 16000;
+const EXPORT_MAX_AREA = 200e6;
+// Grow the mosaic in generous chunks rather than by exactly what the newest tile
+// needs: every growth reallocates the whole mosaic Mat and forces the display
+// canvas to be rebuilt, so growing once per several tiles is much cheaper than
+// growing a few hundred pixels at a time on every single capture.
+const GROW_CHUNK_PX = 1024;
+// Cap on how many tiles keep their ORB features cached in the WASM heap at once
+// (~180KB each). Caching is what makes repeated anchor checks fast, but an
+// uncapped cache grows without bound across a long scan.
+const MAX_CACHED_FEATURES = 120;
+const FEATURE_CACHE_PROTECT_RECENT = 12; // newest N tiles are never evicted
+const CV_LOAD_TIMEOUT_MS = 25000; // give up waiting for opencv.js and say so
+
+// Largest dimension the display canvas may have for a given mosaic size, as a
+// scale factor <= 1.
+function fitScale(w, h, maxDim, maxArea) {
+  if (!w || !h) return 1;
+  return Math.min(1, maxDim / Math.max(w, h), Math.sqrt(maxArea / (w * h)));
+}
 
 function tileBBox(transform, w, h) {
   return bboxOf(cornersOf(transform, w, h));
@@ -77,11 +107,12 @@ function ZStackScrubber({ zstack }) {
 
 export default function App() {
   const [cvReady, setCvReady] = useState(false);
+  const [cvLoadFailed, setCvLoadFailed] = useState(false);
   const [capturing, setCapturing] = useState(false);
   const [autoRunning, setAutoRunning] = useState(false);
   const [tileCount, setTileCount] = useState(0);
   const [matchInfo, setMatchInfo] = useState({ text: 'Chưa có ô nào', kind: 'idle' });
-  const [canvasDims, setCanvasDims] = useState({ w: 0, h: 0 });
+  const [canvasDims, setCanvasDims] = useState({ w: 0, h: 0, scale: 1 });
   const [pipActive, setPipActive] = useState(false);
   const [pipSupported, setPipSupported] = useState(true);
   const [exportingZip, setExportingZip] = useState(false);
@@ -120,6 +151,7 @@ export default function App() {
   const mosaicCanvasRef = useRef(null);
   const workCanvasRef = useRef(document.createElement('canvas'));
   const quickCanvasRef = useRef(document.createElement('canvas')); // scratch canvas for the cheap pre-capture overlap check
+  const regionCanvasRef = useRef(document.createElement('canvas')); // scratch canvas for incremental mosaic blits
   const streamRef = useRef(null);
   const autoTimerRef = useRef(null);
   const cropRef = useRef(null); // {x,y,w,h} in native video px, read by grabVideoFrame
@@ -136,6 +168,9 @@ export default function App() {
     adjacency: [], // adjacency[tileIndex] -> list of edges touching that tile
     autoFails: 0,
     busy: false,
+    displayScale: 1, // mosaic px -> display canvas px (see DISPLAY_MAX_*)
+    dbCleared: false, // has IndexedDB been cleared for THIS session yet?
+    featSeq: 0, // monotonic counter for feature-cache LRU eviction
     lastRebuildTileCount: 0,
     lastRebuildTime: 0,
     sharpnessHistory: [],
@@ -149,11 +184,19 @@ export default function App() {
   useEffect(() => { uiRef.current.capturing = capturing; }, [capturing]);
 
   // ---- load opencv.js (script tag is included in index.html) ----
+  // Polling with no ceiling meant a failed script load (404 from a misconfigured
+  // publish directory, blocked response, corrupted asset) left the page sitting
+  // on "loading image processor…" forever with nothing to act on. Give up after
+  // a bounded wait and say what actually went wrong.
   useEffect(() => {
+    const started = Date.now();
     const check = setInterval(() => {
       if (window.cv && window.cv.Mat) {
         clearInterval(check);
         setCvReady(true);
+      } else if (Date.now() - started > CV_LOAD_TIMEOUT_MS) {
+        clearInterval(check);
+        setCvLoadFailed(true);
       }
     }, 150);
     return () => clearInterval(check);
@@ -178,15 +221,30 @@ export default function App() {
     try {
       const [tiles, meta] = await Promise.all([db.loadAllTiles(), db.loadMeta()]);
       freeAllTileFeatures(c.tiles);
-      c.tiles = tiles.map((t) => ({ ...t, renderedTx: undefined, renderedTy: undefined }));
-      c.edges = (meta && meta.edges) || [];
-      c.adjacency = [];
-      for (const e of c.edges) {
-        (c.adjacency[e.a] ||= []).push(e);
-        (c.adjacency[e.b] ||= []).push(e);
+      c.tiles = tiles.map((t) => ({ ...t, renderedTx: undefined, renderedTy: undefined, renderedTheta: undefined }));
+
+      // Per-tile records are written once, at capture time, with the transform
+      // the tile had *before* global relaxation touched it. The meta record is
+      // rewritten continuously and carries the current (post-relax) transforms,
+      // so prefer those — otherwise resuming silently threw away every
+      // loop-closure correction earned during the previous session.
+      const savedTransforms = meta && meta.transforms;
+      if (Array.isArray(savedTransforms) && savedTransforms.length === c.tiles.length) {
+        c.tiles.forEach((t, i) => {
+          const m = savedTransforms[i];
+          if (Array.isArray(m) && m.length === 9) t.transform = m.slice();
+        });
       }
+
+      // A persisted edge list can outlive the tiles it referenced (e.g. the last
+      // action before the tab died was an undo), so validate before trusting it.
+      const graph = rebuildAdjacency((meta && meta.edges) || [], c.tiles.length);
+      c.edges = graph.edges;
+      c.adjacency = graph.adjacency;
+      refreshBBoxes(c.tiles);
       c.sharpnessHistory = tiles.filter((t) => !t.blurry && t.sharpness).map((t) => t.sharpness).slice(-SHARPNESS_HISTORY_SIZE);
       c.activeRefIndex = null;
+      c.dbCleared = true; // we're continuing this DB content, not replacing it
       setBlurryCount(tiles.filter((t) => t.blurry).length);
       setResumePrompt(null);
       setMatchInfo({ text: `Đang khôi phục ${tiles.length} ô từ phiên trước…`, kind: 'idle' });
@@ -204,6 +262,7 @@ export default function App() {
     } catch (e) {
       // ignore
     }
+    cv_.current.dbCleared = true;
     setResumePrompt(null);
   };
 
@@ -250,10 +309,97 @@ export default function App() {
     }
   };
 
-  const paintCanvas = useCallback((mat) => {
-    if (!mosaicCanvasRef.current) return;
-    cv.imshow(mosaicCanvasRef.current, mat);
-    setCanvasDims({ w: mat.cols, h: mat.rows });
+  // ---- display canvas ----
+  // The mosaic Mat is the source of truth at full resolution; the <canvas> is
+  // only a view of it. Two things follow from that:
+  //   * the view is downscaled when the mosaic outgrows what a browser canvas
+  //     can hold (past that limit a canvas silently renders blank), and
+  //   * it is updated *incrementally*. `cv.imshow` walks and converts every
+  //     pixel of whatever Mat it is handed, so repainting the entire mosaic on
+  //     every captured tile made per-tile cost grow with total scan area —
+  //     quadratic overall, and by a few hundred tiles slow enough to stall the
+  //     live loop on its own.
+  const paintFull = useCallback(() => {
+    const c = cv_.current;
+    const canvas = mosaicCanvasRef.current;
+    if (!canvas || !c.mosaicMat) return;
+    const scale = fitScale(c.w, c.h, DISPLAY_MAX_DIM, DISPLAY_MAX_AREA);
+    c.displayScale = scale;
+    if (scale < 1) {
+      const dw = Math.max(1, Math.round(c.w * scale));
+      const dh = Math.max(1, Math.round(c.h * scale));
+      const small = new cv.Mat();
+      cv.resize(c.mosaicMat, small, new cv.Size(dw, dh), 0, 0, cv.INTER_AREA);
+      cv.imshow(canvas, small);
+      small.delete();
+    } else {
+      cv.imshow(canvas, c.mosaicMat);
+    }
+    setCanvasDims({ w: c.w, h: c.h, scale });
+  }, []);
+
+  // Repaints just one rectangle of the mosaic (in mosaic pixel coords) onto the
+  // display canvas, scaled into place.
+  const paintRegion = useCallback((rect) => {
+    const c = cv_.current;
+    const canvas = mosaicCanvasRef.current;
+    if (!canvas || !c.mosaicMat || !rect) return;
+    if (rect.width <= 0 || rect.height <= 0) return;
+    const s = c.displayScale || 1;
+    // The display canvas must already be sized for the current mosaic, otherwise
+    // a partial blit would land at the wrong place (this is the case on the very
+    // first tile, when the canvas is still at its default 300x150). Fall back to a
+    // full render whenever that invariant doesn't hold.
+    if (canvas.width !== Math.max(1, Math.round(c.w * s)) || canvas.height !== Math.max(1, Math.round(c.h * s))) {
+      paintFull();
+      return;
+    }
+    const roi = c.mosaicMat.roi(new cv.Rect(rect.x, rect.y, rect.width, rect.height));
+    // An ROI shares its parent's row stride, which imshow would misread — copy
+    // it into a continuous Mat first.
+    const cont = new cv.Mat();
+    roi.copyTo(cont);
+    roi.delete();
+    const tmp = regionCanvasRef.current;
+    cv.imshow(tmp, cont);
+    cont.delete();
+
+    const dx = Math.floor(rect.x * s);
+    const dy = Math.floor(rect.y * s);
+    const dw = Math.max(1, Math.ceil(rect.width * s));
+    const dh = Math.max(1, Math.ceil(rect.height * s));
+    const ctx = canvas.getContext('2d');
+    // clear first: drawImage composites source-over, and unpainted mosaic area
+    // must stay transparent so the empty-area backdrop shows through.
+    ctx.clearRect(dx, dy, dw, dh);
+    ctx.drawImage(tmp, 0, 0, rect.width, rect.height, dx, dy, dw, dh);
+  }, [paintFull]);
+
+  // Resizes the display canvas after the mosaic grew, translating the pixels
+  // already on it instead of re-converting the whole mosaic. Setting
+  // canvas.width/height wipes the canvas, so the old content is copied aside
+  // first and blitted back at its new offset.
+  const shiftDisplayCanvas = useCallback((growLeft, growTop) => {
+    const c = cv_.current;
+    const canvas = mosaicCanvasRef.current;
+    if (!canvas) return;
+    const s = c.displayScale;
+    const newW = Math.max(1, Math.round(c.w * s));
+    const newH = Math.max(1, Math.round(c.h * s));
+    const hadContent = canvas.width > 1 && canvas.height > 1;
+    let keep = null;
+    if (hadContent) {
+      keep = document.createElement('canvas');
+      keep.width = canvas.width;
+      keep.height = canvas.height;
+      keep.getContext('2d').drawImage(canvas, 0, 0);
+    }
+    canvas.width = newW;
+    canvas.height = newH;
+    const ctx = canvas.getContext('2d');
+    ctx.clearRect(0, 0, newW, newH);
+    if (keep) ctx.drawImage(keep, Math.round(growLeft * s), Math.round(growTop * s));
+    setCanvasDims({ w: c.w, h: c.h, scale: s });
   }, []);
 
   const ensureMosaic = useCallback((w, h) => {
@@ -269,33 +415,72 @@ export default function App() {
     const c = cv_.current;
     const corners = cornersOf(matMul3(translateM(c.originX, c.originY), transform), tw, th);
     const { minX, minY, maxX, maxY } = bboxOf(corners);
-    const growLeft = Math.max(0, Math.ceil(-minX));
-    const growTop = Math.max(0, Math.ceil(-minY));
-    const growRight = Math.max(0, Math.ceil(maxX - c.w));
-    const growBottom = Math.max(0, Math.ceil(maxY - c.h));
-    if (growLeft || growTop || growRight || growBottom) {
-      const newW = c.w + growLeft + growRight;
-      const newH = c.h + growTop + growBottom;
-      const newMat = new cv.Mat(newH, newW, cv.CV_8UC4, new cv.Scalar(0, 0, 0, 0));
-      const roi = newMat.roi(new cv.Rect(growLeft, growTop, c.w, c.h));
-      c.mosaicMat.copyTo(roi);
-      roi.delete();
-      c.mosaicMat.delete();
-      c.mosaicMat = newMat;
-      c.originX += growLeft;
-      c.originY += growTop;
-      c.w = newW;
-      c.h = newH;
-      paintCanvas(c.mosaicMat);
-    }
-  }, [paintCanvas]);
+    let growLeft = Math.max(0, Math.ceil(-minX));
+    let growTop = Math.max(0, Math.ceil(-minY));
+    let growRight = Math.max(0, Math.ceil(maxX - c.w));
+    let growBottom = Math.max(0, Math.ceil(maxY - c.h));
+    if (!growLeft && !growTop && !growRight && !growBottom) return false;
 
+    // Pad whichever sides had to grow. Each growth reallocates and copies the
+    // entire mosaic Mat and rebuilds the display canvas, so growing by a
+    // generous chunk once every several tiles is far cheaper than growing by
+    // the exact few hundred pixels the newest tile needed, every single tile.
+    if (growLeft) growLeft += GROW_CHUNK_PX;
+    if (growTop) growTop += GROW_CHUNK_PX;
+    if (growRight) growRight += GROW_CHUNK_PX;
+    if (growBottom) growBottom += GROW_CHUNK_PX;
+
+    const newW = c.w + growLeft + growRight;
+    const newH = c.h + growTop + growBottom;
+    const newMat = new cv.Mat(newH, newW, cv.CV_8UC4, new cv.Scalar(0, 0, 0, 0));
+    const roi = newMat.roi(new cv.Rect(growLeft, growTop, c.w, c.h));
+    c.mosaicMat.copyTo(roi);
+    roi.delete();
+    c.mosaicMat.delete();
+    c.mosaicMat = newMat;
+    c.originX += growLeft;
+    c.originY += growTop;
+    c.w = newW;
+    c.h = newH;
+
+    if (!c.suppressPaint) {
+      // If growing pushed the mosaic across a display-scale threshold the whole
+      // view has to be re-rendered at the new scale; otherwise the existing
+      // pixels are still valid and only need translating.
+      const newScale = fitScale(c.w, c.h, DISPLAY_MAX_DIM, DISPLAY_MAX_AREA);
+      if (newScale !== c.displayScale) paintFull();
+      else shiftDisplayCanvas(growLeft, growTop);
+    }
+    return true;
+  }, [paintFull, shiftDisplayCanvas]);
+
+  // Blends one tile into `targetMat` and returns the mosaic-space rectangle it
+  // touched (or null if it fell entirely outside), so the caller can repaint
+  // just that region of the display canvas.
   const composite = useCallback((mat, transform, tw, th, targetMat) => {
     const c = cv_.current;
     const Tc = matMul3(translateM(c.originX, c.originY), transform);
-    const Tmat = cv.matFromArray(3, 3, cv.CV_64FC1, Tc);
+
+    // Bound the work to this tile's own footprint in mosaic coordinates.
+    const corners = cornersOf(Tc, tw, th);
+    const { minX, minY, maxX, maxY } = bboxOf(corners);
+    const rx = Math.max(0, Math.floor(minX));
+    const ry = Math.max(0, Math.floor(minY));
+    const rw = Math.min(c.w, Math.ceil(maxX)) - rx;
+    const rh = Math.min(c.h, Math.ceil(maxY)) - ry;
+    if (rw <= 0 || rh <= 0) return null;
+
+    // Warp straight into that footprint by folding the (-rx, -ry) shift into the
+    // transform, rather than warping into a full mosaic-sized buffer and then
+    // taking an ROI out of it. Warping mosaic-sized allocated width*height*4
+    // bytes per tile — on a 300-field slide that is a ~675MB temporary Mat for
+    // every single capture, on top of the mosaic itself, which exhausts the WASM
+    // heap and aborts the page long before the scan finishes. Cost is now
+    // proportional to tile size and independent of how far the scan has grown.
+    const Toffset = matMul3(translateM(-rx, -ry), Tc);
+    const Tmat = cv.matFromArray(3, 3, cv.CV_64FC1, Toffset);
     const warped = new cv.Mat();
-    cv.warpPerspective(mat, warped, Tmat, new cv.Size(c.w, c.h), cv.INTER_LINEAR, cv.BORDER_CONSTANT, new cv.Scalar());
+    cv.warpPerspective(mat, warped, Tmat, new cv.Size(rw, rh), cv.INTER_LINEAR, cv.BORDER_CONSTANT, new cv.Scalar());
     Tmat.delete();
 
     // Every cv.Mat/MatVector allocated below gets pushed here and deleted once
@@ -304,18 +489,8 @@ export default function App() {
     const trash = [warped];
     const track = (m) => { trash.push(m); return m; };
 
-    // Bound the blending work to this tile's own footprint in canvas
-    // coordinates, not the whole (possibly huge) mosaic, so cost stays
-    // proportional to tile size regardless of how large the scan has grown.
-    const corners = cornersOf(Tc, tw, th);
-    const { minX, minY, maxX, maxY } = bboxOf(corners);
-    const rx = Math.max(0, Math.floor(minX));
-    const ry = Math.max(0, Math.floor(minY));
-    const rw = Math.min(c.w, Math.ceil(maxX)) - rx;
-    const rh = Math.min(c.h, Math.ceil(maxY)) - ry;
-    if (rw <= 0 || rh <= 0) { warped.delete(); return; }
     const rect = new cv.Rect(rx, ry, rw, rh);
-    const warpedRoi = track(warped.roi(rect));
+    const warpedRoi = warped; // already exactly the footprint
     const targetRoi = track(targetMat.roi(rect));
 
     const channels = track(new cv.MatVector());
@@ -431,6 +606,7 @@ export default function App() {
     blended.copyTo(targetRoi, mask);
 
     trash.forEach((m) => m.delete());
+    return { x: rx, y: ry, width: rw, height: rh };
   }, []);
 
   const blobToMat = useCallback(async (blob) => {
@@ -481,9 +657,18 @@ export default function App() {
     });
   };
 
+  // Also snapshots the current transforms. Per-tile records are only written
+  // once, at capture time, so without this the globally-relaxed positions were
+  // never saved anywhere and resuming a session silently reverted to the raw
+  // chained placements. Nine numbers per tile is negligible next to the blobs.
   const persistMeta = () => {
     const c = cv_.current;
-    db.saveMeta({ edges: c.edges, tileCount: c.tiles.length, updatedAt: Date.now() }).catch(() => {});
+    db.saveMeta({
+      edges: c.edges,
+      transforms: c.tiles.map((t) => Array.from(t.transform)),
+      tileCount: c.tiles.length,
+      updatedAt: Date.now(),
+    }).catch(() => {});
   };
 
   // Every tile permanently caches its own ORB features (kp/desc) once computed,
@@ -493,15 +678,55 @@ export default function App() {
   // — without this, every such check was re-decoding the tile's PNG blob and
   // re-running ORB detection from scratch, every single time, even for tiles
   // checked repeatedly (e.g. a busy anchor spot revisited across a zigzag).
-  const getTileFeatures = async (tile) => {
-    if (tile._kp && tile._desc && tile._small) return { kp: tile._kp, desc: tile._desc, small: tile._small };
-    const mat = await blobToMat(tile.blob);
-    const feat = computeFeatures(mat);
-    mat.delete();
+  // Hands a freshly-computed feature set over to a tile. Ownership transfers:
+  // the tile is now responsible for freeing it (via freeTileFeatures or cache
+  // eviction), and the caller must not free it.
+  const attachFeatures = (tile, feat) => {
+    const c = cv_.current;
     tile._kp = feat.kp;
     tile._desc = feat.desc;
     tile._small = feat.small;
+    tile._featSeq = ++c.featSeq;
+  };
+
+  const getTileFeatures = async (tile) => {
+    const c = cv_.current;
+    if (tile._kp && tile._desc && tile._small) {
+      tile._featSeq = ++c.featSeq;
+      return { kp: tile._kp, desc: tile._desc, small: tile._small };
+    }
+    const mat = await blobToMat(tile.blob);
+    const feat = computeFeatures(mat);
+    mat.delete();
+    attachFeatures(tile, feat);
     return feat;
+  };
+
+  // Caching every tile's features forever is what makes revisiting an old anchor
+  // fast, but it is also ~180KB of non-GC'd WASM heap per tile with no ceiling.
+  // Keep the most recently used ones and drop the rest; anything evicted is
+  // simply recomputed from its blob the next time it's needed. The newest tiles
+  // and the active reference are pinned, since those are certain to be used
+  // again on the very next tick.
+  const evictFeatureCache = () => {
+    const c = cv_.current;
+    const cached = [];
+    const protectFrom = c.tiles.length - FEATURE_CACHE_PROTECT_RECENT;
+    for (let i = 0; i < c.tiles.length; i++) {
+      const t = c.tiles[i];
+      if (!t._desc) continue;
+      if (i >= protectFrom || i === c.activeRefIndex) continue;
+      cached.push({ i, seq: t._featSeq || 0 });
+    }
+    const total = c.tiles.reduce((n, t) => n + (t._desc ? 1 : 0), 0);
+    let over = total - MAX_CACHED_FEATURES;
+    if (over <= 0) return;
+    cached.sort((a, b) => a.seq - b.seq);
+    for (const { i } of cached) {
+      if (over <= 0) break;
+      freeTileFeatures(c.tiles[i]);
+      over--;
+    }
   };
 
   // cv.Mat isn't garbage-collected — any tile we discard (undo, replace via
@@ -520,6 +745,7 @@ export default function App() {
       tile._small.delete();
       tile._small = null;
     }
+    tile._featSeq = 0;
   };
 
   const freeAllTileFeatures = (tiles) => {
@@ -538,19 +764,27 @@ export default function App() {
     c.w = (first ? first.w : 800) + INIT_PAD * 2;
     c.h = (first ? first.h : 600) + INIT_PAD * 2;
     c.mosaicMat = new cv.Mat(c.h, c.w, cv.CV_8UC4, new cv.Scalar(0, 0, 0, 0));
-    for (const tile of c.tiles) {
-      growCanvasIfNeeded(tile.transform, tile.w, tile.h);
-      const mat = await blobToMat(tile.blob);
-      composite(mat, tile.transform, tile.w, tile.h, c.mosaicMat);
-      mat.delete();
-      tile.renderedTx = tile.transform[2];
-      tile.renderedTy = tile.transform[5];
+    // Every tile is about to be repainted anyway, so skip the per-tile display
+    // updates growCanvasIfNeeded would otherwise trigger and paint once at the end.
+    c.suppressPaint = true;
+    try {
+      for (const tile of c.tiles) {
+        growCanvasIfNeeded(tile.transform, tile.w, tile.h);
+        const mat = await blobToMat(tile.blob);
+        composite(mat, tile.transform, tile.w, tile.h, c.mosaicMat);
+        mat.delete();
+        tile.renderedTx = tile.transform[2];
+        tile.renderedTy = tile.transform[5];
+        tile.renderedTheta = angleOf(tile.transform);
+      }
+    } finally {
+      c.suppressPaint = false;
     }
-    paintCanvas(c.mosaicMat);
+    paintFull();
     c.lastRebuildTileCount = c.tiles.length;
     c.lastRebuildTime = Date.now();
     setTileCount(c.tiles.length);
-  }, [composite, blobToMat, growCanvasIfNeeded, paintCanvas]);
+  }, [composite, blobToMat, growCanvasIfNeeded, paintFull]);
 
   // ---- screen capture ----
   const startCapture = async () => {
@@ -789,7 +1023,12 @@ export default function App() {
     const sw = crop ? crop.w : v.videoWidth, sh = crop ? crop.h : v.videoHeight;
     if (!sw || !sh) return null;
 
-    const scale = 220 / Math.max(sw, sh);
+    // Must match the scale computeFeatures used for the cached `_small` copies:
+    // template-matching a 220px-wide live frame against a 300px-wide reference is
+    // correlating two different magnifications of the same scene, which scores
+    // below threshold essentially always — so the gate never fired and the
+    // expensive full pipeline ran on every tick regardless.
+    const scale = Math.min(1, CROSSCHECK_MAX_DIM / Math.max(sw, sh));
     const qw = Math.max(8, Math.round(sw * scale));
     const qh = Math.max(8, Math.round(sh * scale));
     const qc = quickCanvasRef.current;
@@ -855,23 +1094,30 @@ export default function App() {
       const { mat, w, h, blobPromise } = grabVideoFrame();
 
       if (c.tiles.length === 0) {
+        // Starting a genuinely new scan: wipe whatever a previous session left in
+        // IndexedDB first. Otherwise, if the user dismissed nothing and simply
+        // ignored the "unfinished session found" banner, the old records at
+        // higher indices survive, new tiles overwrite the low indices, and a
+        // later crash-resume loads a spliced-together mixture of two scans.
+        if (!c.dbCleared) {
+          await db.clearAll().catch(() => {});
+          c.dbCleared = true;
+          setResumePrompt(null);
+        }
         ensureMosaic(w + INIT_PAD * 2, h + INIT_PAD * 2);
-        composite(mat, IDENT, w, h, c.mosaicMat);
-        paintCanvas(c.mosaicMat);
+        const rect0 = composite(mat, IDENT, w, h, c.mosaicMat);
+        paintRegion(rect0);
         const blob = await blobPromise;
         const sharp = evaluateSharpness(mat);
         const baseTile = {
           transform: IDENT.slice(), w, h, blob, bbox: tileBBox(IDENT, w, h), capturedAt: Date.now(),
-          renderedTx: 0, renderedTy: 0, sharpness: sharp.value, blurry: sharp.blurry,
+          renderedTx: 0, renderedTy: 0, renderedTheta: 0, sharpness: sharp.value, blurry: sharp.blurry,
         };
         c.tiles.push(baseTile);
         persistTile(0, baseTile);
         persistMeta();
         if (sharp.blurry) setBlurryCount((n) => n + 1);
-        const baseFeat = computeFeatures(mat);
-        baseTile._kp = baseFeat.kp;
-        baseTile._desc = baseFeat.desc;
-        baseTile._small = baseFeat.small;
+        attachFeatures(baseTile, computeFeatures(mat));
         mat.delete();
         c.autoFails = 0;
         c.lastRebuildTileCount = 1;
@@ -963,6 +1209,10 @@ export default function App() {
       // to justify the cost of a full mosaic repaint.
       const relaxAndMaybeRebuild = async () => {
         relax(c.tiles, c.adjacency, 0, RELAX_ITERS_PER_TICK);
+        // relax() moves tiles, so the cached world-space bboxes every overlap
+        // search and the ZIP export read from are now out of date.
+        refreshBBoxes(c.tiles);
+        evictFeatureCache();
         const drift = maxRenderedDrift(c.tiles);
         const dueForRebuild =
           drift > REBUILD_DRIFT_PX &&
@@ -978,6 +1228,7 @@ export default function App() {
           c.justResumed = true;
           c.consecutiveGuesses = 0;
         }
+        persistMeta(); // snapshot the post-relax transforms, not the raw chained ones
       };
 
       if (!m.ok) {
@@ -989,8 +1240,11 @@ export default function App() {
         // match before placing anything in that situation instead of risking
         // a bad anchor that every later tile then chains from.
         let usedGuess = false;
+        // prevIndex >= 1 matters independently of tiles.length: the reference the
+        // candidate search settled on can be tile 0, which has no predecessor to
+        // extrapolate a motion vector from.
         const guessAllowed = !c.justResumed && c.consecutiveGuesses < MAX_CONSECUTIVE_GUESSES;
-        if (guessAllowed && c.tiles.length >= 2) {
+        if (guessAllowed && c.tiles.length >= 2 && prevIndex >= 1) {
           const prev2 = c.tiles[prevIndex - 1];
           const dx = prevTile.transform[2] - prev2.transform[2];
           const dy = prevTile.transform[5] - prev2.transform[5];
@@ -1001,18 +1255,17 @@ export default function App() {
             const blob = await blobPromise;
             const sharp = evaluateSharpness(mat);
             growCanvasIfNeeded(guessTransform, w, h);
-            composite(mat, guessTransform, w, h, c.mosaicMat);
-            paintCanvas(c.mosaicMat);
+            const rectG = composite(mat, guessTransform, w, h, c.mosaicMat);
+            paintRegion(rectG);
             const newIndex = c.tiles.length;
             const guessTile = {
               transform: guessTransform, w, h, blob, bbox: tileBBox(guessTransform, w, h), capturedAt: Date.now(),
               estimated: true, renderedTx: guessTransform[2], renderedTy: guessTransform[5],
+              renderedTheta: angleOf(guessTransform),
               sharpness: sharp.value, blurry: sharp.blurry,
             };
             c.tiles.push(guessTile);
-            guessTile._kp = featNew.kp;
-            guessTile._desc = featNew.desc;
-            guessTile._small = featNew.small;
+            attachFeatures(guessTile, featNew); // ownership transfers; not freed below
             persistTile(newIndex, guessTile);
             if (sharp.blurry) setBlurryCount((n) => n + 1);
             // Low-weight edge: a rough guess, easily outweighed by any real match later.
@@ -1032,8 +1285,10 @@ export default function App() {
           }
         }
         if (!usedGuess) {
-          featNew.kp.delete();
-          featNew.desc.delete();
+          // Nothing took ownership of these features, so free all three Mats.
+          // Freeing only kp/desc here leaked `small` (~90KB of WASM heap) on
+          // what is one of the two most frequently taken paths in the loop.
+          freeFeatures(featNew);
           c.autoFails += 1;
           if (m.unsupported) {
             setMatchInfo({ text: 'Trình duyệt/bản OpenCV.js hiện tại thiếu hàm cần thiết để so khớp ảnh — không thể ghép tự động. Thử lại bằng Chrome/Edge bản mới nhất.', kind: 'warn' });
@@ -1057,8 +1312,7 @@ export default function App() {
       const moveMag = Math.hypot(m.H[2], m.H[5]);
       const threshold = Math.max(AUTO_MOVE_MIN_PX, w * AUTO_MOVE_MIN_RATIO);
       if (moveMag < threshold) {
-        featNew.kp.delete();
-        featNew.desc.delete();
+        freeFeatures(featNew); // same leak as above — `small` was never released here
         mat.delete();
         c.autoFails = 0;
         return;
@@ -1070,16 +1324,15 @@ export default function App() {
       const blob = await blobPromise;
       const sharp = evaluateSharpness(mat);
       growCanvasIfNeeded(transform, w, h);
-      composite(mat, transform, w, h, c.mosaicMat);
-      paintCanvas(c.mosaicMat);
+      const rectN = composite(mat, transform, w, h, c.mosaicMat);
+      paintRegion(rectN);
       const newTile = {
         transform, w, h, blob, bbox: tileBBox(transform, w, h), capturedAt: Date.now(),
-        renderedTx: transform[2], renderedTy: transform[5], sharpness: sharp.value, blurry: sharp.blurry,
+        renderedTx: transform[2], renderedTy: transform[5], renderedTheta: angleOf(transform),
+        sharpness: sharp.value, blurry: sharp.blurry,
       };
       c.tiles.push(newTile);
-      newTile._kp = featNew.kp;
-      newTile._desc = featNew.desc;
-      newTile._small = featNew.small;
+      attachFeatures(newTile, featNew);
       persistTile(newIndex, newTile);
       if (sharp.blurry) setBlurryCount((n) => n + 1);
       // m.H is already the local match: new tile's offset/rotation expressed in
@@ -1118,7 +1371,7 @@ export default function App() {
               anchor.transform, transform[2] - anchor.transform[2], transform[5] - anchor.transform[5]
             );
             const offErr = Math.hypot(am.H[2] - expLdx, am.H[5] - expLdy);
-            const maxOffErr = Math.max(w, h) * 0.8;
+            const maxOffErr = Math.max(w, h) * 0.5;
             if (offErr <= maxOffErr) {
               // Same as the chain edge above: am.H is already local to the anchor's frame.
               addEdge(c.edges, c.adjacency, anchorIndex, newIndex, am.H[2], am.H[5], angleOf(am.H), am.inliers);
@@ -1139,11 +1392,27 @@ export default function App() {
           (sharp.blurry ? ' Ô này có thể bị mờ — xem trong "Ô đã chụp".' : ''),
         kind: sharp.blurry ? 'warn' : 'ok',
       });
+    } catch (err) {
+      // Without this, any exception in here (an OpenCV abort, a WASM allocation
+      // failure, a bug like the ones above) became an unhandled promise
+      // rejection: the timer kept firing, the status block kept showing the last
+      // successful message, and the scan simply stopped recording tiles with no
+      // indication anything was wrong. For a tool someone is relying on mid-slide
+      // that is the worst possible failure mode — stop loudly instead.
+      stopAuto();
+      const msg = err && err.message ? err.message : String(err);
+      setMatchInfo({
+        text: 'Đã dừng ghép tự động do lỗi xử lý ảnh: ' + msg +
+          ' — dữ liệu đã chụp vẫn được giữ. Thử bấm "Tối ưu & vẽ lại ngay", hoặc xuất ZIP để giữ kết quả rồi tải lại trang.',
+        kind: 'warn',
+      });
+      // eslint-disable-next-line no-console
+      console.error('[panorama] autoTick failed', err);
     } finally {
       c.busy = false;
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [composite, ensureMosaic, growCanvasIfNeeded, paintCanvas, blobToMat, rebuildMosaic]);
+  }, [composite, ensureMosaic, growCanvasIfNeeded, paintFull, paintRegion, blobToMat, rebuildMosaic]);
 
   const autoTickRef = useRef(autoTick);
   useEffect(() => { autoTickRef.current = autoTick; }, [autoTick]);
@@ -1191,12 +1460,15 @@ export default function App() {
     if (!targetMode || !mosaicCanvasRef.current) return;
     const canvas = mosaicCanvasRef.current;
     const rect = canvas.getBoundingClientRect();
-    const scaleX = canvas.width / rect.width;
-    const scaleY = canvas.height / rect.height;
-    const canvasX = (e.clientX - rect.left) * scaleX;
-    const canvasY = (e.clientY - rect.top) * scaleY;
+    // Two separate scales are in play: CSS layout size vs. canvas backing store,
+    // and canvas backing store vs. the full-resolution mosaic (the display canvas
+    // is downscaled once the mosaic outgrows the browser's canvas limits). Both
+    // have to be undone to land on a mosaic pixel.
+    const canvasX = ((e.clientX - rect.left) * canvas.width) / rect.width;
+    const canvasY = ((e.clientY - rect.top) * canvas.height) / rect.height;
     const c = cv_.current;
-    setTargetWorld({ x: canvasX - c.originX, y: canvasY - c.originY });
+    const s = c.displayScale || 1;
+    setTargetWorld({ x: canvasX / s - c.originX, y: canvasY / s - c.originY });
   };
 
   const clearTarget = () => {
@@ -1239,8 +1511,7 @@ export default function App() {
       }
 
       if (!best) {
-        featNew.kp.delete();
-        featNew.desc.delete();
+        freeFeatures(featNew); // `small` was leaking here too
         mat.delete();
         setMatchInfo({ text: 'Không khớp được với vùng quanh điểm đã chọn — chỉnh lại kính hiển vi rồi thử lại, hoặc chọn điểm khác.', kind: 'warn' });
         return;
@@ -1252,16 +1523,15 @@ export default function App() {
       const blob = await blobPromise;
       const sharp = evaluateSharpness(mat);
       growCanvasIfNeeded(transform, w, h);
-      composite(mat, transform, w, h, c.mosaicMat);
-      paintCanvas(c.mosaicMat);
+      const rectT = composite(mat, transform, w, h, c.mosaicMat);
+      paintRegion(rectT);
       const newTile = {
         transform, w, h, blob, bbox: tileBBox(transform, w, h), capturedAt: Date.now(),
-        renderedTx: transform[2], renderedTy: transform[5], sharpness: sharp.value, blurry: sharp.blurry,
+        renderedTx: transform[2], renderedTy: transform[5], renderedTheta: angleOf(transform),
+        sharpness: sharp.value, blurry: sharp.blurry,
       };
       c.tiles.push(newTile);
-      newTile._kp = featNew.kp;
-      newTile._desc = featNew.desc;
-      newTile._small = featNew.small;
+      attachFeatures(newTile, featNew);
       persistTile(newIndex, newTile);
       if (sharp.blurry) setBlurryCount((n) => n + 1);
       addEdge(c.edges, c.adjacency, best.index, newIndex, best.m.H[2], best.m.H[5], angleOf(best.m.H), best.m.inliers);
@@ -1269,6 +1539,8 @@ export default function App() {
       c.autoFails = 0;
       c.activeRefIndex = newIndex; // continuous scanning will now chain from here
       relax(c.tiles, c.adjacency, 0, RELAX_ITERS_PER_TICK);
+      refreshBBoxes(c.tiles);
+      persistMeta();
       setTileCount(c.tiles.length);
       setTargetMode(false);
       setTargetWorld(null);
@@ -1306,8 +1578,14 @@ export default function App() {
         // Old position is still a good prior for where this tile should be
         // relative to this neighbor — recapture usually just refines a very
         // similar spot, so it's a reasonable tie-breaker on repetitive texture.
-        const expectedDX = c.tiles[index].transform[2] - neighbor.transform[2];
-        const expectedDY = c.tiles[index].transform[5] - neighbor.transform[5];
+        // matchTiles expects the offset in the *neighbour's own* frame (that's
+        // what its axis hypotheses are compared against), so the world-space
+        // delta has to be rotated back through the neighbour's linear part.
+        const [expectedDX, expectedDY] = applyInverseLinear(
+          neighbor.transform,
+          c.tiles[index].transform[2] - neighbor.transform[2],
+          c.tiles[index].transform[5] - neighbor.transform[5]
+        );
         const mm = matchTiles(featNew.kp, featNew.desc, neighborFeat.kp, neighborFeat.desc, {
           axisLock: true, expectedDX, expectedDY,
           newSmall: featNew.small, prevSmall: neighborFeat.small, tileW: w, tileH: h,
@@ -1348,7 +1626,11 @@ export default function App() {
       persistTile(index, c.tiles[index]);
       persistMeta();
       mat.delete();
-      if (newEdges.length > 0) relax(c.tiles, c.adjacency, 0, 60);
+      if (newEdges.length > 0) {
+        relax(c.tiles, c.adjacency, 0, 60);
+        refreshBBoxes(c.tiles);
+        persistMeta();
+      }
       await rebuildMosaic();
       setTilePanelVersion((v) => v + 1);
       setMatchInfo({
@@ -1429,14 +1711,19 @@ export default function App() {
       const newEdges = [];
       for (const neighbor of neighbors) {
         const neighborFeat = await getTileFeatures(neighbor);
-        // Old position is still a good prior for where this tile should be
-        // relative to this neighbor — recapture usually just refines a very
-        // similar spot, so it's a reasonable tie-breaker on repetitive texture.
-        const expectedDX = c.tiles[index].transform[2] - neighbor.transform[2];
-        const expectedDY = c.tiles[index].transform[5] - neighbor.transform[5];
+        // Same prior as recaptureTile, in the neighbour's own frame. `tileW`/
+        // `tileH` come from the chosen layer: there is no `w`/`h` in this scope
+        // (unlike the other capture paths, which destructure them from
+        // grabVideoFrame), so referencing them threw a ReferenceError and made
+        // the whole Z-stack feature fail every single time it was used.
+        const [expectedDX, expectedDY] = applyInverseLinear(
+          neighbor.transform,
+          c.tiles[index].transform[2] - neighbor.transform[2],
+          c.tiles[index].transform[5] - neighbor.transform[5]
+        );
         const mm = matchTiles(featNew.kp, featNew.desc, neighborFeat.kp, neighborFeat.desc, {
           axisLock: true, expectedDX, expectedDY,
-          newSmall: featNew.small, prevSmall: neighborFeat.small, tileW: w, tileH: h,
+          newSmall: featNew.small, prevSmall: neighborFeat.small, tileW: best.w, tileH: best.h,
         });
         if (mm.ok) {
           const t = matMul3(neighbor.transform, mm.H);
@@ -1474,8 +1761,11 @@ export default function App() {
       };
       if (blurryFlag) setBlurryCount((n) => n + 1);
       persistTile(index, c.tiles[index]);
+      if (newEdges.length > 0) {
+        relax(c.tiles, c.adjacency, 0, 60);
+        refreshBBoxes(c.tiles);
+      }
       persistMeta();
-      if (newEdges.length > 0) relax(c.tiles, c.adjacency, 0, 60);
       await rebuildMosaic();
       setTilePanelVersion((v) => v + 1);
       setMatchInfo({
@@ -1493,16 +1783,39 @@ export default function App() {
 
   const undoLast = async () => {
     const c = cv_.current;
-    if (c.tiles.length === 0) return;
-    const removedIndex = c.tiles.length - 1;
-    const removedTile = c.tiles.pop();
-    removeEdgesForTile(c.edges, c.adjacency, removedIndex);
-    freeTileFeatures(removedTile);
-    if (removedTile.blurry) setBlurryCount((n) => Math.max(0, n - 1));
-    db.deleteTilesFrom(removedIndex).catch(() => {});
-    db.saveMeta({ edges: c.edges, tileCount: c.tiles.length, updatedAt: Date.now() }).catch(() => {});
-    await rebuildMosaic();
-    setMatchInfo({ text: 'Đã hoàn tác ô cuối.', kind: 'idle' });
+    if (c.tiles.length === 0 || c.busy) return;
+    c.busy = true;
+    try {
+      const removedIndex = c.tiles.length - 1;
+      const removedTile = c.tiles.pop();
+      removeEdgesForTile(c.edges, c.adjacency, removedIndex);
+      c.adjacency.length = c.tiles.length;
+      freeTileFeatures(removedTile);
+      if (removedTile.blurry) setBlurryCount((n) => Math.max(0, n - 1));
+
+      // The active reference is set to each new tile's index as it's captured, so
+      // after popping the last tile it points one past the end. Left dangling, the
+      // very next auto tick dereferenced tiles[undefined] and threw on every
+      // subsequent tick — i.e. a single "undo" silently ended the scan session.
+      if (c.activeRefIndex === null || c.activeRefIndex >= c.tiles.length) {
+        c.activeRefIndex = c.tiles.length > 0 ? c.tiles.length - 1 : null;
+      }
+      // Anything extrapolated from motion around the removed tile is no longer
+      // trustworthy — require a real match before guessing again.
+      c.justResumed = true;
+      c.consecutiveGuesses = 0;
+
+      db.deleteTilesFrom(removedIndex).catch(() => {});
+      refreshBBoxes(c.tiles);
+      persistMeta();
+      await rebuildMosaic();
+      setTilePanelVersion((v) => v + 1);
+      setMatchInfo({ text: 'Đã hoàn tác ô cuối.', kind: 'idle' });
+    } catch (e) {
+      setMatchInfo({ text: 'Hoàn tác thất bại: ' + (e && e.message ? e.message : e), kind: 'warn' });
+    } finally {
+      c.busy = false;
+    }
   };
 
   const resetAll = () => {
@@ -1525,10 +1838,17 @@ export default function App() {
     c.lastRebuildTime = 0;
     c.sharpnessHistory = [];
     c.activeRefIndex = null;
+    c.justResumed = true;
+    c.consecutiveGuesses = 0;
+    c.displayScale = 1;
+    c.dbCleared = true; // we just cleared it below
+    c.suppressPaint = false;
     setBlurryCount(0);
     db.clearAll().catch(() => {});
     setTileCount(0);
-    setCanvasDims({ w: 0, h: 0 });
+    setCanvasDims({ w: 0, h: 0, scale: 1 });
+    setTargetMode(false);
+    setTargetWorld(null);
     if (mosaicCanvasRef.current) {
       const ctx = mosaicCanvasRef.current.getContext('2d');
       mosaicCanvasRef.current.width = 1;
@@ -1544,6 +1864,8 @@ export default function App() {
     c.busy = true;
     try {
       relax(c.tiles, c.adjacency, 0, 200); // run to near-full convergence
+      refreshBBoxes(c.tiles);
+      persistMeta();
       setMatchInfo({ text: 'Đang vẽ lại ảnh ghép sau khi tối ưu…', kind: 'idle' });
       await rebuildMosaic();
       setMatchInfo({ text: 'Đã tối ưu vị trí toàn cục và vẽ lại ảnh ghép.', kind: 'ok' });
@@ -1552,14 +1874,49 @@ export default function App() {
     }
   };
 
+  // Renders straight from the full-resolution mosaic Mat rather than reading back
+  // the display canvas — the on-screen canvas is deliberately downscaled once the
+  // mosaic outgrows what a browser canvas can hold, so exporting it would quietly
+  // hand back a reduced image. Only falls back to downscaling if the mosaic is
+  // larger than a canvas can represent at all, and says so when it does.
   const exportPNG = () => {
-    const canvas = mosaicCanvasRef.current;
-    if (!canvas || !canvas.width) return;
-    canvas.toBlob((blob) => {
+    const c = cv_.current;
+    if (!c.mosaicMat || !c.w || !c.h) return;
+    const scale = fitScale(c.w, c.h, EXPORT_MAX_DIM, EXPORT_MAX_AREA);
+    const tmp = document.createElement('canvas');
+    try {
+      if (scale < 1) {
+        const dw = Math.max(1, Math.round(c.w * scale));
+        const dh = Math.max(1, Math.round(c.h * scale));
+        const small = new cv.Mat();
+        cv.resize(c.mosaicMat, small, new cv.Size(dw, dh), 0, 0, cv.INTER_AREA);
+        cv.imshow(tmp, small);
+        small.delete();
+      } else {
+        cv.imshow(tmp, c.mosaicMat);
+      }
+    } catch (e) {
+      setMatchInfo({ text: 'Không xuất được ảnh ghép: ' + (e && e.message ? e.message : e) + ' — dùng "Xuất ảnh gốc + toạ độ cho Fiji (ZIP)" để giữ toàn bộ dữ liệu ở độ phân giải gốc.', kind: 'warn' });
+      return;
+    }
+    tmp.toBlob((blob) => {
+      if (!blob) {
+        setMatchInfo({ text: 'Không tạo được file PNG (ảnh ghép quá lớn cho trình duyệt) — hãy dùng bản xuất ZIP + Fiji.', kind: 'warn' });
+        return;
+      }
       const a = document.createElement('a');
       a.href = URL.createObjectURL(blob);
       a.download = `panorama-lame-${Date.now()}.png`;
       a.click();
+      setTimeout(() => URL.revokeObjectURL(a.href), 60000);
+      setMatchInfo(
+        scale < 1
+          ? {
+              text: `Đã xuất ảnh ghép, nhưng đã thu nhỏ về ${Math.round(scale * 100)}% (${c.w}×${c.h}px vượt giới hạn canvas của trình duyệt). Muốn đủ độ phân giải gốc thì dùng bản xuất ZIP + ghép lại bằng Fiji.`,
+              kind: 'warn',
+            }
+          : { text: 'Đã xuất ảnh ghép ở độ phân giải gốc.', kind: 'ok' }
+      );
     }, 'image/png');
   };
 
@@ -1569,6 +1926,11 @@ export default function App() {
     if (tiles.length === 0 || exportingZip) return;
     setExportingZip(true);
     setMatchInfo({ text: `Đang đóng gói 0/${tiles.length} ảnh gốc…`, kind: 'idle' });
+    // Belt and braces: derive every exported coordinate from the tile's current
+    // transform. The manifest is the only link between a counted object and where
+    // it sat on the slide, so it must never describe a pre-optimization layout
+    // that disagrees with the mosaic that was exported alongside it.
+    refreshBBoxes(tiles);
     try {
       const zip = new JSZip();
       const pad = String(tiles.length).length;
@@ -1612,6 +1974,7 @@ export default function App() {
       a.href = URL.createObjectURL(blob);
       a.download = `anh-goc-lame-${Date.now()}.zip`;
       a.click();
+      setTimeout(() => URL.revokeObjectURL(a.href), 60000);
       setMatchInfo({
         text: `Đã xuất ${tiles.length} ảnh gốc kèm manifest.csv và TileConfiguration.txt (dùng cho Fiji: Plugins → Stitching → Grid/Collection stitching → Positions from file → Defined by TileConfiguration).`,
         kind: 'ok',
@@ -1666,20 +2029,27 @@ export default function App() {
       // a simple sequential chain (moderate default weight) so the session is at
       // least resumable/optimizable; richer loop-closure edges will re-form
       // naturally as scanning continues past old tiles.
-      c.edges = [];
-      c.adjacency = [];
+      const importedEdges = [];
       for (let i = 1; i < tiles.length; i++) {
         const worldDx = tiles[i].transform[2] - tiles[i - 1].transform[2];
         const worldDy = tiles[i].transform[5] - tiles[i - 1].transform[5];
         const [ldx, ldy] = applyInverseLinear(tiles[i - 1].transform, worldDx, worldDy);
         const dtheta = angleOf(tiles[i].transform) - angleOf(tiles[i - 1].transform);
-        addEdge(c.edges, c.adjacency, i - 1, i, ldx, ldy, dtheta, 20);
+        importedEdges.push({ a: i - 1, b: i, dx: ldx, dy: ldy, dtheta, w: 20 });
       }
+      const graph = rebuildAdjacency(importedEdges, tiles.length);
+      c.edges = graph.edges;
+      c.adjacency = graph.adjacency;
       freeAllTileFeatures(c.tiles);
       c.tiles = tiles;
+      refreshBBoxes(c.tiles);
       c.sharpnessHistory = tiles.filter((t) => !t.blurry && t.sharpness).map((t) => t.sharpness).slice(-SHARPNESS_HISTORY_SIZE);
       c.activeRefIndex = null;
+      c.justResumed = true;
+      c.consecutiveGuesses = 0;
+      c.dbCleared = true; // this import now owns the IndexedDB contents
       setBlurryCount(tiles.filter((t) => t.blurry).length);
+      setResumePrompt(null);
 
       await rebuildMosaic();
 
@@ -1715,10 +2085,22 @@ export default function App() {
     <>
       {!cvReady && (
         <div className="loading-cv">
-          <div className="mono" style={{ fontSize: 12, color: 'var(--ink-dim)' }}>
-            Đang tải bộ xử lý ảnh (OpenCV.js)…
-          </div>
-          <div className="bar"><div className="fill"></div></div>
+          {cvLoadFailed ? (
+            <div className="mono" style={{ fontSize: 12, color: 'var(--amber)', maxWidth: 520, lineHeight: 1.6 }}>
+              Không tải được bộ xử lý ảnh (<code>/opencv.js</code>).
+              <br />
+              Thường do build/publish directory bị cấu hình sai (server trả file nguồn thay vì thư mục{' '}
+              <code>dist/</code>), hoặc file <code>public/opencv.js</code> bị thiếu. Kiểm tra tab Network
+              của trình duyệt xem <code>/opencv.js</code> trả về 200 và có kiểu MIME JavaScript, rồi tải lại trang.
+            </div>
+          ) : (
+            <>
+              <div className="mono" style={{ fontSize: 12, color: 'var(--ink-dim)' }}>
+                Đang tải bộ xử lý ảnh (OpenCV.js)…
+              </div>
+              <div className="bar"><div className="fill"></div></div>
+            </>
+          )}
         </div>
       )}
       {resumePrompt && (
@@ -1892,6 +2274,14 @@ export default function App() {
               Số ô đã ghép: <b className="mono">{tileCount}</b>
               <br />
               Kích thước ảnh ghép: <span className="mono">{canvasDims.w}×{canvasDims.h}px</span>
+              {canvasDims.scale < 1 && (
+                <>
+                  <br />
+                  <span style={{ color: 'var(--ink-dim)' }}>
+                    Khung xem đang thu nhỏ {Math.round(canvasDims.scale * 100)}% (ảnh gốc vẫn giữ đủ độ phân giải khi xuất).
+                  </span>
+                </>
+              )}
               {blurryCount > 0 && (
                 <>
                   <br />
@@ -1914,7 +2304,7 @@ export default function App() {
             {showTilePanel && (
               <>
                 <div style={{ height: 8 }} />
-                <div className="tile-list">
+                <div className="tile-list" key={tilePanelVersion}>
                   {(() => {
                     const rows = cv_.current.tiles
                       .map((t, i) => ({ t, i }))
@@ -2062,8 +2452,8 @@ export default function App() {
                 <div
                   className="target-marker"
                   style={{
-                    left: targetWorld.x + cv_.current.originX - 16,
-                    top: targetWorld.y + cv_.current.originY - 16,
+                    left: (targetWorld.x + cv_.current.originX) * canvasDims.scale - 16,
+                    top: (targetWorld.y + cv_.current.originY) * canvasDims.scale - 16,
                   }}
                 ></div>
               )}

@@ -119,7 +119,11 @@ export function detectVignetteRect(mat) {
 
 // Longer-side target for the downscaled grayscale copy kept for the
 // independent pixel cross-correlation check (see crossCorrelateAxis below).
-const CROSSCHECK_MAX_DIM = 300;
+// Exported because the caller's cheap pre-capture gate template-matches a live
+// frame against this same downscaled copy — if it scales the live frame to a
+// different size, it is correlating two images at different magnifications and
+// will essentially never find a match.
+export const CROSSCHECK_MAX_DIM = 300;
 
 export function computeFeatures(mat) {
   const gray = new cv.Mat();
@@ -145,6 +149,19 @@ export function computeFeatures(mat) {
   }
   gray.delete();
   return { kp, desc, small };
+}
+
+// Frees everything computeFeatures allocated. cv.Mat/KeyPointVector live in the
+// WASM heap and are never garbage collected, so every feature set that isn't
+// handed off to a tile must go through here — freeing kp/desc by hand and
+// forgetting `small` leaks ~90KB of WASM heap per call, which on the
+// match-failed / didn't-move-enough paths happens a couple of times a second
+// and eventually aborts the whole page mid-scan.
+export function freeFeatures(feat) {
+  if (!feat) return;
+  if (feat.kp) feat.kp.delete();
+  if (feat.desc) feat.desc.delete();
+  if (feat.small) feat.small.delete();
 }
 
 // Laplacian variance: a standard, cheap focus/blur metric. Higher = sharper.
@@ -454,13 +471,13 @@ export function matchTiles(
       const p2 = kpPrev.get(m.trainIdx).pt;
       return [p1.x, p1.y, p2.x, p2.y];
     });
-    const AXIS_THRESH_PX = 7;
+    const AXIS_THRESH_PX = 5;
     // Half the tile's own dimension is a generous window — genuine matches
     // need real overlap to work at all, so the true offset is essentially
     // never more than about half the tile size, while a repeated-stripe
     // alias is typically much further away than that.
-    const maxDevX = tileW != null ? tileW * 0.65 : null;
-    const maxDevY = tileH != null ? tileH * 0.65 : null;
+    const maxDevX = tileW != null ? tileW * 0.5 : null;
+    const maxDevY = tileH != null ? tileH * 0.5 : null;
     const rx = fitAxisTranslation(pts, 'x', AXIS_THRESH_PX, expectedDX, maxDevX);
     const ry = fitAxisTranslation(pts, 'y', AXIS_THRESH_PX, expectedDY, maxDevY);
     // Which axis to trust when BOTH hypotheses find a plausible fit. Naively
@@ -509,8 +526,8 @@ export function matchTiles(
     if (!skipCrossCheck && newSmall && prevSmall) {
       const origDim = best.axis === 'x' ? tileW : tileH;
       const cc = origDim ? crossCorrelateAxis(newSmall, prevSmall, best.axis, best.t, origDim) : null;
-      const AGREEMENT_PX = 25;
-      const MIN_SCORE = 0.18;
+      const AGREEMENT_PX = 15;
+      const MIN_SCORE = 0.3;
       if (cc && cc.score >= MIN_SCORE && Math.abs(cc.t - best.t) <= AGREEMENT_PX) {
         // Both agree — average for a touch more precision than either alone.
         finalT = (best.t + cc.t) / 2;

@@ -68,6 +68,17 @@ export function bboxOf(pts) {
   return { minX, minY, maxX, maxY };
 }
 
+// Recomputes every tile's cached world-space bounding box from its *current*
+// transform. Must be called after any relax() pass: tile.bbox is otherwise
+// frozen at the value it had when the tile was first placed, which quietly
+// breaks two things at once — overlap-based anchor/candidate search degrades
+// exactly as accumulated drift grows (i.e. when loop closure is needed most),
+// and the exported manifest/TileConfiguration coordinates end up describing
+// pre-optimization positions that disagree with the exported mosaic.
+export function refreshBBoxes(tiles) {
+  for (const t of tiles) t.bbox = bboxOf(cornersOf(t.transform, t.w, t.h));
+}
+
 export function bboxOverlapRatio(a, b) {
   const ix = Math.max(0, Math.min(a.maxX, b.maxX) - Math.max(a.minX, b.minX));
   const iy = Math.max(0, Math.min(a.maxY, b.maxY) - Math.max(a.minY, b.minY));
