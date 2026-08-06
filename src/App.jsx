@@ -241,9 +241,12 @@ export default function App() {
       setBusyLabel(null);
       return;
     }
-    s.mosaic = M.createMosaic(s.tiles[0].w, s.tiles[0].h);
+    // Every position is known here, so allocate the exact size instead of growing
+    // into it — no padding is created, so none has to be trimmed away later.
+    s.mosaic = M.createMosaicFor(s.tiles);
     for (const t of s.tiles) {
-      M.growFor(s.mosaic, t.x, t.y, t.w, t.h);
+      M.growFor(s.mosaic, t.x, t.y, t.w, t.h); // safety net; should never fire
+
       const bmp = await createImageBitmap(t.blob);
       const c = readbackCanvas(bmp.width, bmp.height);
       c.getContext('2d').drawImage(bmp, 0, 0);
@@ -941,11 +944,27 @@ export default function App() {
     }
   };
 
+  // Anything that produces output starts here. During a scan the mosaic carries a
+  // deliberate empty margin from chunked growth; every output step wants the
+  // picture, not the buffer it lives in.
+  const trimToContent = () => {
+    const s = S.current;
+    if (!s.mosaic || s.tiles.length === 0) return false;
+    const before = `${s.mosaic.w}×${s.mosaic.h}`;
+    if (!M.trimMosaic(s.mosaic, s.tiles, excluded)) return false;
+    dropCoarse();
+    paintAll();
+    refreshMinimap();
+    log('info', `cắt viền trống: ${before} → ${s.mosaic.w}×${s.mosaic.h}`);
+    return true;
+  };
+
   // ---- review & fuse before export ----
   const runFusion = async (method) => {
     const s = S.current;
     if (!s.mosaic || s.tiles.length === 0 || busyLabel) return;
     stopAuto();
+    trimToContent();
     try {
       const r = await fuseMosaic(s.mosaic, s.tiles, {
         method,
@@ -1003,7 +1022,7 @@ export default function App() {
       clearRefs(); // reference frames carry old positions
       setOptStats(r);
       setFused(null);
-      await rebuild();
+      await rebuild(); // re-allocates the mosaic exactly around the new positions
       setStatus({
         text: `Đã tối ưu ${s.tiles.length} ô từ ${r.links}/${r.pairs} cặp chồng lấn. ` +
           `Sai lệch trung bình giữa các cặp: ${r.beforeResidual.toFixed(1)}px → ${r.afterResidual.toFixed(1)}px. ` +
@@ -1042,6 +1061,7 @@ export default function App() {
   const exportPNG = () => {
     const s = S.current;
     if (!s.mosaic) return;
+    trimToContent();
     let out;
     try {
       out = M.renderForExport(s.mosaic);
@@ -1072,6 +1092,9 @@ export default function App() {
     const s = S.current;
     if (s.tiles.length === 0 || busyLabel) return;
     setBusyLabel('Đang đóng gói…');
+    // Trim first so the manifest coordinates are relative to the top-left of the
+    // exported mosaic, not to a buffer origin that no output file describes.
+    trimToContent();
     try {
       const zip = new JSZip();
       const pad = Math.max(4, String(s.tiles.length).length);
@@ -1433,6 +1456,24 @@ export default function App() {
               <br />
               Ảnh ghép: <span className="mono">{dims.w}×{dims.h}px</span>
               {dims.scale < 1 && <span className="dim"> (xem ở {Math.round(dims.scale * 100)}%)</span>}
+              {(() => {
+                // The buffer is larger than the picture while scanning, by design.
+                // Say so, so the number above isn't mistaken for the export size.
+                const b = tileCount > 0 ? M.contentBounds(S.current.tiles, excluded) : null;
+                if (!b) return null;
+                const cwPx = Math.ceil(b.maxX) - Math.floor(b.minX);
+                const chPx = Math.ceil(b.maxY) - Math.floor(b.minY);
+                if (cwPx === dims.w && chPx === dims.h) return null;
+                return (
+                  <>
+                    <br />
+                    <span className="dim">
+                      Nội dung thật: <span className="mono">{cwPx}×{chPx}px</span> — viền trống sẽ được
+                      cắt tự động khi xuất.
+                    </span>
+                  </>
+                );
+              })()}
               {blurry > 0 && <><br /><span className="amber">⚠ {blurry} ô có thể bị mờ</span></>}
             </div>
           </div>
@@ -1522,12 +1563,21 @@ export default function App() {
             </div>
             <div className="gap" />
             <button className="primary" onClick={exportPNG} disabled={tileCount === 0}>Xuất ảnh ghép (PNG)</button>
-            {dims.w > 0 && (() => {
+            {tileCount > 0 && (() => {
               // Told before clicking, not after: the only step in the whole
               // pipeline that can reduce resolution is a mosaic too large for a
               // browser canvas, and it is worth knowing that in advance.
-              const es = M.fitScale(dims.w, dims.h, M.EXPORT_MAX_DIM, M.EXPORT_MAX_AREA);
-              const mp = (dims.w * dims.h) / 1e6;
+              //
+              // Measured on the CONTENT bounds, not on dims — dims is the buffer,
+              // which carries the empty growth margin. Reporting the buffer here
+              // would predict a downscale that trimming then makes unnecessary.
+              const b = M.contentBounds(S.current.tiles, excluded);
+              if (!b) return null;
+              const cwPx = Math.ceil(b.maxX) - Math.floor(b.minX);
+              const chPx = Math.ceil(b.maxY) - Math.floor(b.minY);
+              const es = M.fitScale(cwPx, chPx, M.EXPORT_MAX_DIM, M.EXPORT_MAX_AREA);
+              const mp = (cwPx * chPx) / 1e6;
+              const dims = { w: cwPx, h: chPx };
               return es < 1 ? (
                 <div className="note mono amber">
                   Ảnh ghép {dims.w}×{dims.h} ({mp.toFixed(0)} MP) vượt giới hạn canvas của trình duyệt —

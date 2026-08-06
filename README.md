@@ -147,6 +147,27 @@ giới hạn canvas của trình duyệt (~16000px mỗi chiều, ~200 MP) — l
 App nói trước con số này **ngay cạnh nút xuất**, chứ không để bạn phát hiện sau. Khi đó
 dùng bản xuất ZIP: từng ảnh gốc vẫn là PNG nguyên vẹn kèm toạ độ.
 
+**Viền trống được cắt trước khi xuất.** Trong lúc quét, ảnh ghép được cấp phát dư
+1024px mỗi lần mở rộng, để vài ô tiếp theo vừa vào mà không phải cấp phát lại và copy
+toàn bộ ảnh. Đúng lúc quét, sai ở mọi lúc khác: viền trống đó **được tính vào giới hạn
+canvas**, nên `fitScale` bắt đầu thu nhỏ bản xuất — hy sinh độ phân giải thật cho chỗ
+trắng — và file PNG mang theo viền trong suốt.
+
+Nên mọi bước tạo ra output (dựng lại hậu kiểm, xuất PNG, xuất ZIP) đều cắt ảnh ghép về
+đúng bao đóng của các ô trước. Toạ độ trong `manifest.csv` do đó cũng tính từ góc trên
+bên trái của **ảnh đã xuất**, không phải từ một gốc buffer mà không file nào mô tả.
+
+Khối *Trạng thái* hiện cả hai con số khi chúng khác nhau, để `Ảnh ghép: 17000×12000px`
+không bị hiểu là kích thước sẽ xuất ra:
+
+```
+Ảnh ghép: 17000×12000px (xem ở 47%)
+Nội dung thật: 14000×9000px — viền trống sẽ được cắt tự động khi xuất.
+```
+
+Bước *Tối ưu vị trí toàn cục* cũng dựng lại ảnh ghép với kích thước khít chính xác
+(`createMosaicFor`), không qua bước mở rộng nào — nên không sinh padding để phải cắt.
+
 Khung xem trên màn hình cũng bị thu nhỏ khi ảnh ghép lớn (hiện `xem ở N%`) — nếu bạn
 đang đánh giá chất lượng bằng cách nhìn khung đó thì nó không phản ánh ảnh xuất ra.
 

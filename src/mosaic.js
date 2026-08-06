@@ -26,6 +26,78 @@ export function fitScale(w, h, maxDim, maxArea) {
   return Math.min(1, maxDim / Math.max(w, h), Math.sqrt(maxArea / (w * h)));
 }
 
+// Tight bounding box of the tiles, in tile coordinates. Pure so it can be tested.
+export function contentBounds(tiles, excluded) {
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  let n = 0;
+  for (let i = 0; i < tiles.length; i++) {
+    if (excluded && excluded.has(i)) continue;
+    const t = tiles[i];
+    if (t.x < minX) minX = t.x;
+    if (t.y < minY) minY = t.y;
+    if (t.x + t.w > maxX) maxX = t.x + t.w;
+    if (t.y + t.h > maxY) maxY = t.y + t.h;
+    n++;
+  }
+  return n === 0 ? null : { minX, minY, maxX, maxY };
+}
+
+// Allocates a mosaic sized exactly to a known set of tiles, with no padding at
+// all. Used when every position is known up front (a rebuild), where growth is
+// unnecessary and the padding growth leaves behind is pure waste.
+export function createMosaicFor(tiles) {
+  const b = contentBounds(tiles);
+  if (!b) return createMosaic(1, 1);
+  const x0 = Math.floor(b.minX);
+  const y0 = Math.floor(b.minY);
+  const w = Math.max(1, Math.ceil(b.maxX) - x0);
+  const h = Math.max(1, Math.ceil(b.maxY) - y0);
+  return {
+    mat: new cv.Mat(h, w, cv.CV_8UC4, new cv.Scalar(0, 0, 0, 0)),
+    w,
+    h,
+    originX: -x0,
+    originY: -y0,
+  };
+}
+
+// Shrinks the mosaic to its actual content.
+//
+// Growth deliberately over-allocates (GROW_CHUNK) so the next few tiles fit
+// without another reallocate-and-copy of the whole image, and the mosaic never
+// shrinks on its own. That is right during a scan and wrong at every other
+// moment: the empty margin counts toward the browser's canvas size limit, so
+// `fitScale` starts reducing the export — real resolution given up for blank
+// space — and the exported PNG carries the margin as transparent border.
+// Returns true if anything changed.
+export function trimMosaic(m, tiles, excluded) {
+  const b = contentBounds(tiles, excluded);
+  if (!b || !m || !m.mat) return false;
+  const x0 = Math.max(0, Math.floor(b.minX) + m.originX);
+  const y0 = Math.max(0, Math.floor(b.minY) + m.originY);
+  const x1 = Math.min(m.w, Math.ceil(b.maxX) + m.originX);
+  const y1 = Math.min(m.h, Math.ceil(b.maxY) + m.originY);
+  const w = x1 - x0;
+  const h = y1 - y0;
+  if (w <= 0 || h <= 0) return false;
+  if (x0 === 0 && y0 === 0 && w === m.w && h === m.h) return false; // already tight
+  const next = new cv.Mat(h, w, cv.CV_8UC4, new cv.Scalar(0, 0, 0, 0));
+  const roi = m.mat.roi(new cv.Rect(x0, y0, w, h));
+  roi.copyTo(next);
+  roi.delete();
+  m.mat.delete();
+  m.mat = next;
+  // Tile coordinates are unaffected; only the mapping into mosaic pixels moves.
+  m.originX -= x0;
+  m.originY -= y0;
+  m.w = w;
+  m.h = h;
+  return true;
+}
+
 export function createMosaic(tileW, tileH) {
   const w = tileW + INIT_PAD * 2;
   const h = tileH + INIT_PAD * 2;
