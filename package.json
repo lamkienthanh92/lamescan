@@ -8,7 +8,7 @@
     "build": "vite build",
     "preview": "vite preview",
     "lint": "oxlint src/ --deny-warnings=false",
-    "test": "oxlint src/ && node check-hook-order.mjs && node test-agree.mjs && node test-anchor.mjs && node test-fuse.mjs && node test-optimize.mjs && node test-minimap.mjs && node test-trim.mjs"
+    "test": "oxlint src/ && node check-hook-order.mjs && node test-agree.mjs && node test-anchor.mjs && node test-fuse.mjs && node test-optimize.mjs && node test-minimap.mjs && node test-trim.mjs && node test-tilt.mjs"
   },
   "dependencies": {
     "jszip": "^3.10.1",

@@ -238,16 +238,91 @@ export function shiftDisplay(m, canvas, growLeft, growTop, scale) {
 
 // Renders the mosaic to an offscreen canvas for PNG export, at full resolution
 // unless it exceeds what a canvas can hold. Returns { canvas, scale }.
-export function renderForExport(m) {
-  const scale = fitScale(m.w, m.h, EXPORT_MAX_DIM, EXPORT_MAX_AREA);
-  const canvas = document.createElement('canvas');
-  if (scale < 1) {
-    const small = new cv.Mat();
-    cv.resize(m.mat, small, new cv.Size(Math.max(1, Math.round(m.w * scale)), Math.max(1, Math.round(m.h * scale))), 0, 0, cv.INTER_AREA);
-    cv.imshow(canvas, small);
-    small.delete();
-  } else {
-    cv.imshow(canvas, m.mat);
+// Rotates the whole mosaic by `rad` so a scan that travelled diagonally across the
+// sensor comes out square. Applied once, to the finished image, rather than per
+// tile: one resampling pass for the entire mosaic is the least interpolation this
+// can possibly cost, and it is the only place in the pipeline that interpolates at
+// all. Returns a new Mat; the caller owns it.
+//
+// OpenCV's rotation matrix is [cos a, sin a; -sin a, cos a], so a step vector at
+// angle `rad` maps to y' = L·sin(rad − a): passing a = rad is exactly what puts it
+// back on the horizontal.
+export function rotateMosaic(mat, rad) {
+  const deg = (rad * 180) / Math.PI;
+  const c = new cv.Point(mat.cols / 2, mat.rows / 2);
+  const M = cv.getRotationMatrix2D(c, deg, 1);
+  // Grow the output to hold the rotated corners instead of clipping them.
+  const cos = Math.abs(Math.cos(rad));
+  const sin = Math.abs(Math.sin(rad));
+  const nw = Math.ceil(mat.cols * cos + mat.rows * sin);
+  const nh = Math.ceil(mat.cols * sin + mat.rows * cos);
+  M.doublePtr(0, 2)[0] += nw / 2 - c.x;
+  M.doublePtr(1, 2)[0] += nh / 2 - c.y;
+  const out = new cv.Mat();
+  cv.warpAffine(mat, out, M, new cv.Size(nw, nh), cv.INTER_CUBIC, cv.BORDER_CONSTANT, new cv.Scalar(0, 0, 0, 0));
+  M.delete();
+  return out;
+}
+
+// Tight bounding box of non-transparent pixels. Rotation leaves triangular
+// transparent corners, and those must not be allowed to inflate the exported image
+// the same way growth padding did.
+export function paintedBounds(mat) {
+  const chans = new cv.MatVector();
+  const alpha = new cv.Mat();
+  const bin = new cv.Mat();
+  try {
+    cv.split(mat, chans);
+    chans.get(3).copyTo(alpha);
+    cv.threshold(alpha, bin, 8, 255, cv.THRESH_BINARY);
+    const rect = cv.boundingRect(bin);
+    return rect.width > 0 && rect.height > 0 ? rect : null;
+  } finally {
+    for (let i = 0; i < chans.size(); i++) chans.get(i).delete();
+    chans.delete();
+    alpha.delete();
+    bin.delete();
   }
-  return { canvas, scale };
+}
+
+export function renderForExport(m, { straightenRad = 0 } = {}) {
+  let src = m.mat;
+  let temp = null;
+  let rotated = false;
+  if (Math.abs(straightenRad) > 1e-4) {
+    temp = rotateMosaic(m.mat, straightenRad);
+    src = temp;
+    rotated = true;
+  }
+  // Crop to actual pixels unconditionally, not just after a rotation. Trimming
+  // upstream should already have done this, but the export is the last chance to
+  // notice, and a transparent margin here costs real resolution: it counts toward
+  // the canvas limit that decides whether the image gets downscaled.
+  const box = paintedBounds(src);
+  if (box && (box.width !== src.cols || box.height !== src.rows)) {
+    const cropped = src.roi(box);
+    const tight = new cv.Mat();
+    cropped.copyTo(tight);
+    cropped.delete();
+    if (temp) temp.delete();
+    temp = tight;
+    src = tight;
+  }
+  const w = src.cols;
+  const h = src.rows;
+  const scale = fitScale(w, h, EXPORT_MAX_DIM, EXPORT_MAX_AREA);
+  const canvas = document.createElement('canvas');
+  try {
+    if (scale < 1) {
+      const small = new cv.Mat();
+      cv.resize(src, small, new cv.Size(Math.max(1, Math.round(w * scale)), Math.max(1, Math.round(h * scale))), 0, 0, cv.INTER_AREA);
+      cv.imshow(canvas, small);
+      small.delete();
+    } else {
+      cv.imshow(canvas, src);
+    }
+  } finally {
+    if (temp) temp.delete();
+  }
+  return { canvas, scale, rotated, w, h };
 }

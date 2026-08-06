@@ -1,5 +1,5 @@
 /* global cv */
-import { largestAgreeingGroup, PATCH_CENTERS, subpixelPeakOf } from './align.js';
+import { largestAgreeingGroup, PATCH_CENTERS, subpixelPeakOf, PATCH_MIN_PX } from './align.js';
 
 // Chaining each tile onto the one before it means every tile's position is the sum
 // of all the measurements before it. Random error in those measurements grows as a
@@ -43,7 +43,21 @@ export function frameOriginFromMatch({ rx, ry, originX, originY, frameScale, pat
 // `predX/predY` is the position predicted by frame-to-frame tracking, in tile
 // coordinates; `radiusPx` is how far from it to search. Returns
 // { ok, x, y, used, total, correction } with x/y in the same tile coordinates.
-export function alignToMosaic(mosaic, frameGray, frameScale, w, h, predX, predY, radiusPx, patchFrac, tolPx) {
+// `minAgree` and `maxCorrectionPx` exist because this function OVERRIDES the
+// frame-to-frame measurement. Two of five patches agreeing is a reasonable bar for
+// accepting a measurement; it is a poor bar for overruling one. Histology is
+// repetitive, so two small patches finding the same wrong offset is not a remote
+// possibility — and the cost of being wrong here is not a skipped frame, it is a
+// tile deposited somewhere else entirely, which then becomes the reference for
+// everything after it.
+//
+// A refinement that moves the tile a long way is also, by definition, not a
+// refinement. The search radius is not the right limit for that: the radius is how
+// far to LOOK, and looking far is fine — accepting an answer from far away is not.
+export function alignToMosaic(
+  mosaic, frameGray, frameScale, w, h, predX, predY, radiusPx, patchFrac, tolPx,
+  { minAgree = 3, maxCorrectionPx = null } = {}
+) {
   const rx0 = Math.round(predX) + mosaic.originX - radiusPx;
   const ry0 = Math.round(predY) + mosaic.originY - radiusPx;
   const rx = Math.max(0, rx0);
@@ -97,8 +111,8 @@ export function alignToMosaic(mosaic, frameGray, frameScale, w, h, predX, predY,
       return { ok: false, reason: 'unpainted' };
     }
 
-    const pw = Math.max(14, Math.round(frameGray.cols * patchFrac));
-    const ph = Math.max(14, Math.round(frameGray.rows * patchFrac));
+    const pw = Math.max(PATCH_MIN_PX, Math.round(frameGray.cols * patchFrac));
+    const ph = Math.max(PATCH_MIN_PX, Math.round(frameGray.rows * patchFrac));
     if (pw >= sw || ph >= sh) return { ok: false, reason: 'edge' };
 
     const measurements = [];
@@ -128,17 +142,15 @@ export function alignToMosaic(mosaic, frameGray, frameScale, w, h, predX, predY,
       }
     }
 
-    if (measurements.length < 2) return { ok: false, reason: 'no-signal', used: measurements.length };
+    if (measurements.length < minAgree) return { ok: false, reason: 'no-signal', used: measurements.length };
     const group = largestAgreeingGroup(measurements, tolPx);
-    if (group.length < 2) return { ok: false, reason: 'disagree', used: measurements.length };
+    if (group.length < minAgree) return { ok: false, reason: 'disagree', used: measurements.length };
 
     const x = group.reduce((a, m) => a + m.dx, 0) / group.length;
     const y = group.reduce((a, m) => a + m.dy, 0) / group.length;
     const correction = Math.hypot(x - predX, y - predY);
-    // A measurement that disagrees with the prediction by more than the search
-    // radius cannot be a refinement of it; treat it as a mismatch rather than
-    // teleporting the tile.
-    if (correction > radiusPx) return { ok: false, reason: 'implausible', correction };
+    const limit = maxCorrectionPx == null ? radiusPx : maxCorrectionPx;
+    if (correction > limit) return { ok: false, reason: 'implausible', correction, limit };
     return { ok: true, x, y, used: group.length, total: PATCH_CENTERS.length, correction };
   } finally {
     for (let i = trash.length - 1; i >= 0; i--) trash[i].delete();

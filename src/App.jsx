@@ -2,11 +2,11 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
 import JSZip from 'jszip';
 import './App.css';
-import { toMatchGray, estimateShift, sharpnessOf, borderIsDark, detectFieldRect, PATCH_CENTERS } from './align.js';
+import { toMatchGray, estimateShift, sharpnessOf, borderIsDark, detectFieldRect, pixelDetailRatio, PATCH_CENTERS, PATCH_MIN_PX } from './align.js';
 import * as M from './mosaic.js';
 import { alignToMosaic, relocalizeCoarse, buildCoarseMosaic, coarseScaleFor } from './anchor.js';
 import { fuseMosaic, FUSION_METHODS, medianSharpnessOf, tileQuality } from './fuse.js';
-import { optimizePositions } from './optimize.js';
+import { optimizePositions, scanAxisTilt } from './optimize.js';
 import { drawMinimap, pipSupport, openDocumentPiP } from './minimap.js';
 import * as db from './db.js';
 import { readbackCanvas } from './canvasutil.js';
@@ -20,9 +20,30 @@ const LOST_AFTER = 4;         // consecutive unlocated frames before saying so p
 const ANCHOR_RADIUS_FRAC = 0.12;
 const ANCHOR_TOL_PX = 6;
 const AGREE_TOL_PX = 6;       // how close two patches must land to count as agreeing
-const MIN_AGREE = 2;          // patches that must agree before a frame is accepted
+// Three of five, not two. Every patch measures the same physical translation, so
+// on a clean frame all five agree; needing three still tolerates two patches
+// landing on a fixture or on featureless background. Two was weak enough that a
+// pair of small patches finding the same wrong offset on repetitive tissue could
+// carry a frame, and a wrongly placed tile then becomes the reference for
+// everything after it. A skipped frame costs 200ms; a wrong one costs the scan.
+const MIN_AGREE = 3;
 const MIN_STEP_PX = 12;       // don't record a tile until the picture has actually moved
-const STEP_FRAC = 0.08;       // ...or this fraction of the frame, whichever is larger
+// How far the picture must move before a tile is recorded, as a fraction of the
+// frame. This was 0.08 — a tile every 8% of a frame, i.e. 92% overlap, so 82 tiles
+// covered barely three fields of view. Overlap does not reduce resolution, but it
+// does mean an enormous number of tiles for a tiny area of slide, and it is why a
+// long scan produced a small image.
+//
+// 0.4 keeps 60% overlap, which is still generous, and stays inside a patch's reach
+// so each tile can be measured against the previous TILE rather than chained
+// through intermediate frames. Larger steps cover more slide per tile but rely on
+// frame-to-frame chaining, which accumulates more error.
+const STEP_PRESETS = [
+  { frac: 0.30, label: 'Dày (70% chồng)', note: 'Nhiều ô nhất, an toàn nhất khi định vị. Ảnh ghép lớn chậm.' },
+  { frac: 0.45, label: 'Vừa (55% chồng)', note: 'Cân bằng — mặc định. Vẫn đo trực tiếp được với ô trước.' },
+  { frac: 0.65, label: 'Thưa (35% chồng)', note: 'Ít ô, phủ nhiều lame nhất. Dựa vào nối qua khung trước nên sai số nhiều hơn.' },
+];
+const STEP_DEFAULT = 0.45;
 // Patch size as a fraction of the capture region. Deliberately small: the point
 // of the patch is to contain specimen and nothing else, and anything large enough
 // to be individually convincing is large enough to reach the stationary fixtures
@@ -83,8 +104,12 @@ export default function App() {
   const [lost, setLost] = useState(false);
   const [lastRect, setLastRect] = useState(null); // last tile, marked on the mosaic view
   const [cover, setCover] = useState(null);       // { onceFrac } from the minimap
+  const [tilt, setTilt] = useState(null);        // camera-vs-stage axis angle
+  const [detail, setDetail] = useState(null);    // per-pixel detail ratio of the source
   const [pipOn, setPipOn] = useState(false);
   const [showCov, setShowCov] = useState(true);
+  const [stepFrac, setStepFrac] = useState(STEP_DEFAULT);
+  const stepRef = useRef(STEP_DEFAULT);
   const [sourceMode, setSourceMode] = useState('camera');
   const [cameras, setCameras] = useState([]);
   const [deviceId, setDeviceId] = useState('');
@@ -97,6 +122,7 @@ export default function App() {
   const excludedRef = useRef(new Set());
   const [fused, setFused] = useState(null); // which method the current mosaic shows
   const [optStats, setOptStats] = useState(null);
+  const [straighten, setStraighten] = useState(true);
   const anchorRef = useRef(true);
 
   const videoRef = useRef(null);
@@ -124,6 +150,7 @@ export default function App() {
   useEffect(() => { anchorRef.current = anchor; }, [anchor]);
   useEffect(() => { excludedRef.current = excluded; }, [excluded]);
   useEffect(() => { showCovRef.current = showCov; }, [showCov]);
+  useEffect(() => { stepRef.current = stepFrac; }, [stepFrac]);
 
   const S = useRef({
     mosaic: null,
@@ -528,6 +555,7 @@ export default function App() {
     const tile = { x, y, w, h, blob, sharpness, blurry: isBlurry, capturedAt: Date.now() };
     s.tiles.push(tile);
     setLastRect({ x, y, w, h });
+    setTilt(scanAxisTilt(s.tiles));
     db.saveTile({ index, ...tile }).catch((e) =>
       setStatus({ text: 'Cảnh báo: không lưu được vào bộ nhớ tạm (' + e.message + ')', kind: 'warn' })
     );
@@ -574,6 +602,12 @@ export default function App() {
 
       const sharp = sharpnessOf(gray);
       const isBlurry = classifyBlur(sharp);
+      // Measured on the full-resolution frame, not the downscaled working copy:
+      // the question is specifically about per-pixel detail.
+      if (s.tiles.length === 0 || s.tiles.length % 10 === 0) {
+        const d = pixelDetailRatio(mat);
+        if (d !== null) setDetail(d);
+      }
 
       if (s.tiles.length === 0) {
         if (!s.dbOwned) {
@@ -684,11 +718,19 @@ export default function App() {
       let anchored = null;
       if (anchorRef.current && s.tiles.length >= 2) {
         const radius = Math.max(20, Math.round(Math.min(w, h) * ANCHOR_RADIUS_FRAC));
-        const a = alignToMosaic(s.mosaic, gray, scale, w, h, x, y, radius, patchRef.current, ANCHOR_TOL_PX);
+        // Anchoring corrects accumulated error, which is small per step. Allowing it
+        // to move a tile by the full search radius let a false match relocate the
+        // tile instead of nudging it.
+        const a = alignToMosaic(s.mosaic, gray, scale, w, h, x, y, radius, patchRef.current, ANCHOR_TOL_PX, {
+          minAgree: MIN_AGREE,
+          maxCorrectionPx: Math.max(12, Math.round(Math.min(w, h) * 0.04)),
+        });
         if (a.ok) {
           x = a.x;
           y = a.y;
           anchored = a;
+        } else if (a.reason === 'implausible') {
+          log('warn', `bỏ neo vào ảnh ghép: lệch dự đoán ${a.correction.toFixed(0)}px > ${a.limit}px — giữ kết quả đo trực tiếp`);
         }
       }
 
@@ -701,7 +743,7 @@ export default function App() {
       setLost(false);
 
       const stepPx = Math.hypot(x - s.refTile.x, y - s.refTile.y);
-      const minStep = Math.max(MIN_STEP_PX, Math.min(w, h) * STEP_FRAC);
+      const minStep = Math.max(MIN_STEP_PX, Math.min(w, h) * stepRef.current);
       if (stepPx < minStep) {
         log('skip', `mới dịch ${Math.round(stepPx)}px (cần ≥ ${Math.round(minStep)}px), ${est.used}/${est.total} khung dò đồng ý`);
         return;
@@ -751,8 +793,15 @@ export default function App() {
       const c = relocalizeCoarse(s.mosaic, s.coarse.mat, s.coarse.scale, gray, scale);
       if (!c.ok) return null;
       const radius = Math.max(24, c.uncertaintyPx);
-      const fine = alignToMosaic(s.mosaic, gray, scale, w, h, c.x, c.y, radius, patchRef.current, ANCHOR_TOL_PX);
-      if (!fine.ok) return null;
+      // Relocalisation moves the tile anywhere in the scan, so it has to clear a
+      // higher bar than an ordinary measurement: four of five patches, not three.
+      const fine = alignToMosaic(s.mosaic, gray, scale, w, h, c.x, c.y, radius, patchRef.current, ANCHOR_TOL_PX, {
+        minAgree: 4,
+      });
+      if (!fine.ok) {
+        log('skip', `ứng viên tìm lại vị trí bị loại (${fine.reason})`);
+        return null;
+      }
       return { x: fine.x, y: fine.y };
     } catch (e) {
       log('warn', 'tìm lại vị trí lỗi: ' + (e && e.message ? e.message : e));
@@ -865,6 +914,8 @@ export default function App() {
     setLost(false);
     setLastRect(null);
     setCover(null);
+    setTilt(null);
+    setDetail(null);
     setExcluded(new Set());
     setFused(null);
     setOptStats(null);
@@ -1073,7 +1124,7 @@ export default function App() {
     trimToContent();
     let out;
     try {
-      out = M.renderForExport(s.mosaic);
+      out = M.renderForExport(s.mosaic, { straightenRad: straighten && tilt ? tilt.rad : 0 });
     } catch (e) {
       setStatus({ text: 'Không xuất được PNG: ' + e.message + ' — dùng bản xuất ZIP.', kind: 'warn' });
       return;
@@ -1089,9 +1140,9 @@ export default function App() {
       a.click();
       setTimeout(() => URL.revokeObjectURL(a.href), 60000);
       setStatus({
-        text: out.scale < 1
+        text: (out.rotated ? `Đã xoay thẳng trục ${tilt.deg.toFixed(1)}°. ` : '') + (out.scale < 1
           ? `Đã xuất PNG nhưng thu nhỏ ${Math.round(out.scale * 100)}% (vượt giới hạn canvas). Muốn đủ độ phân giải thì dùng bản ZIP.`
-          : 'Đã xuất PNG ở độ phân giải gốc.',
+          : `Đã xuất PNG ${out.w}×${out.h} ở độ phân giải gốc.`),
         kind: out.scale < 1 ? 'warn' : 'ok',
       });
     }, 'image/png');
@@ -1129,6 +1180,23 @@ export default function App() {
         if (!skip) cfg.push(`${name}; ; (${x}.0, ${y}.0)`);
       });
       zip.file('manifest.csv', rows.join('\n') + '\n');
+      // Tile coordinates in the manifest are in the UNROTATED frame — the one the
+      // tiles were actually measured in. Straightening is a transform applied to
+      // the exported PNG after the fact, so the angle is recorded here rather than
+      // baked into numbers that would no longer match the tile images.
+      zip.file(
+        'scan_info.txt',
+        [
+          `tiles: ${s.tiles.length}`,
+          `excluded: ${excluded.size}`,
+          `mosaic_px: ${s.mosaic.w}x${s.mosaic.h}`,
+          tilt ? `scan_axis_tilt_deg: ${tilt.deg.toFixed(3)}` : 'scan_axis_tilt_deg: unknown',
+          tilt ? `scan_axis_tilt_spread_deg: ${tilt.madDeg.toFixed(3)}` : '',
+          'note: manifest.csv coordinates are in the unrotated frame',
+          'note: straightening, if used, applies to the exported PNG only',
+          `exported_at: ${new Date().toISOString()}`,
+        ].filter(Boolean).join('\n') + '\n'
+      );
       zip.file('TileConfiguration.txt', cfg.join('\n') + '\n');
       const blob = await zip.generateAsync({ type: 'blob', compression: 'STORE' });
       const a = document.createElement('a');
@@ -1274,14 +1342,28 @@ export default function App() {
                   </button>
                 </div>
                 <div className="note">
-                  <b>Camera trực tiếp</b> đọc thẳng từ cảm biến ở độ phân giải tối đa — đây là cách duy nhất
-                  để có ảnh gốc. <b>Ghi màn hình</b> chỉ chụp lại <i>cửa sổ</i> của phần mềm camera: nếu cảm
-                  biến 2592×1944 đang được xem trong khung 900×700 thì 87% pixel đã mất trước khi app nhìn
-                  thấy gì, rồi còn bị nén lại. Mọi bước sau đều lossless, nên không có gì cứu lại được phần
-                  đã mất ở đây.
+                  <b>Camera trực tiếp</b> đọc thẳng từ cảm biến, nhưng phần lớn camera kính 3 mắt <b>không
+                  xuất hiện như thiết bị UVC</b> cho trình duyệt — phần mềm của hãng giữ độc quyền. Nếu vậy
+                  thì ghi màn hình là đường duy nhất, và vẫn kéo được chất lượng lên rất nhiều.
                 </div>
-                <div className="note">
-                  Camera trực tiếp cần phần mềm camera <b>đang không giữ thiết bị</b> — đóng nó trước.
+                <div className="alert">
+                  <b>Ghi màn hình: đặt zoom phần mềm camera về 100% (1:1).</b>
+                  <br /><br />
+                  Đây là đòn bẩy lớn nhất và nó phản trực giác. Nếu phần mềm đang thu ảnh 2592×1944 cho vừa
+                  cửa sổ 700px, thì mỗi pixel bạn chụp được là kết quả nội suy của 3.7 pixel cảm biến — chi
+                  tiết đã mất và không bước nào lấy lại được. Ở zoom 100%, cùng cửa sổ đó chỉ hiện <i>một
+                  phần</i> quang trường, nhưng <b>mỗi pixel là một pixel cảm biến thật</b>.
+                  <br /><br />
+                  Quang trường nhỏ hơn không phải vấn đề — <b>app này ghép ảnh</b>. Bạn chỉ cần kéo tiêu bản
+                  nhiều hơn. Một trường nhỏ mà sắc nét thì luôn tốt hơn một trường rộng đã bị thu nhỏ:
+                  trường hợp đầu ghép lại thành ảnh lớn và nét, trường hợp sau thì mềm ở mọi mức phóng đại.
+                  <br /><br />
+                  Ba việc kèm theo: chọn <b>cửa sổ camera</b> trong hộp chọn của trình duyệt (không chọn
+                  "toàn màn hình"); phóng cửa sổ đó <b>to hết mức</b> trên màn hình lớn nhất bạn có; và tắt
+                  mọi bộ lọc làm mịn/sharpen trong phần mềm camera.
+                  <br /><br />
+                  Chỉ số <b>Chi tiết mức pixel</b> ở trên là cách kiểm chứng: đổi zoom rồi xem con số đó
+                  tăng hay không. Trên 55% là nguồn đang tốt.
                 </div>
               </>
             ) : (
@@ -1302,6 +1384,55 @@ export default function App() {
                         <br />
                         Nguồn khá nhỏ. Nếu đang ghi màn hình, hãy phóng to cửa sổ camera và đặt zoom 1:1,
                         hoặc chuyển sang Camera trực tiếp.
+                      </>
+                    )}
+                  </div>
+                )}
+                {srcInfo && cropBox && (() => {
+                  // The whole resolution question in three numbers. A tile's pixel
+                  // count sets the ceiling for everything: no later step adds
+                  // detail, and a mosaic is roughly tileMP * tiles * step^2.
+                  const tileMP = (cropBox.w * cropBox.h) / 1e6;
+                  const srcMP = (srcInfo.w * srcInfo.h) / 1e6;
+                  const cropFrac = srcMP > 0 ? (cropBox.w * cropBox.h) / (srcInfo.w * srcInfo.h) : 0;
+                  const per100 = tileMP * 100 * stepFrac * stepFrac;
+                  const thin = tileMP < 0.5;
+                  return (
+                    <div className={'note mono' + (thin ? ' alert' : '')}>
+                      Mỗi ô: <b>{cropBox.w}×{cropBox.h}</b> = {tileMP.toFixed(2)} MP
+                      <span className="dim"> ({Math.round(cropFrac * 100)}% diện tích nguồn)</span>
+                      <br />
+                      Với bước hiện tại, 100 ô ≈ <b>{per100.toFixed(0)} MP</b> ảnh ghép.
+                      {thin && (
+                        <>
+                          <br /><br />
+                          Vùng quét quá nhỏ — đây là thứ chặn độ phân giải, không phải bước xuất. Không có
+                          bước nào sau lúc chụp thêm được chi tiết.
+                          {srcInfo.mode === 'screen' && (
+                            <>
+                              {' '}Bạn đang ghi màn hình ở {srcInfo.w}×{srcInfo.h}, tức toàn bộ màn hình —
+                              cửa sổ camera chỉ chiếm một phần trong đó. Chuyển sang <b>Camera trực tiếp</b>{' '}
+                              để đọc thẳng cảm biến: một camera 2592×1944 cho ô ~2000×1600 = 3.2 MP, gấp{' '}
+                              {(3.2 / Math.max(tileMP, 0.01)).toFixed(0)}× hiện tại.
+                            </>
+                          )}
+                        </>
+                      )}
+                    </div>
+                  );
+                })()}
+                {detail !== null && (
+                  <div className={'note mono' + (detail < 0.35 ? ' alert' : '')}>
+                    Chi tiết mức pixel: <b>{Math.round(detail * 100)}%</b>
+                    {detail >= 0.55 ? (
+                      <span style={{ color: 'var(--teal)' }}> — ảnh sắc đến từng pixel, nguồn đang tốt.</span>
+                    ) : detail >= 0.35 ? (
+                      <span className="dim"> — tạm được, còn dư địa nếu tăng zoom camera lên 100%.</span>
+                    ) : (
+                      <>
+                        {' '}— <b>ảnh đã bị nội suy/làm mềm</b>. Số pixel đang nhiều hơn lượng chi tiết thật:
+                        phần mềm camera đang thu ảnh cảm biến cho vừa cửa sổ, và app chỉ nhận được bản đã
+                        resample đó. Xem hướng dẫn ở dưới.
                       </>
                     )}
                   </div>
@@ -1358,19 +1489,40 @@ export default function App() {
             </div>
             <div className="note">
               5 khung dò nhỏ, đặt rải trong vùng quét. Mỗi khung đo dịch chuyển độc lập; app chỉ nhận
-              kết quả mà <b>ít nhất {MIN_AGREE} khung đồng ý</b> với nhau (lệch dưới {AGREE_TOL_PX}px).
+              kết quả mà <b>ít nhất {MIN_AGREE}/5 khung đồng ý</b> với nhau (lệch dưới {AGREE_TOL_PX}px).
+              Bước tìm lại vị trí sau khi mất dấu đòi 4/5, vì nó dịch ô đi xa nên cần chứng cứ mạnh hơn.
               Nhờ vậy một khung dò vô tình nằm trên vật cố định — bụi, viền halo, overlay — sẽ báo
               "không dịch chuyển", lệch khỏi nhóm, và bị loại; nó không kéo được kết quả đi.
             </div>
             <div className="note">
               Nhỏ thì an toàn hơn với vật cố định <i>và</i> tầm với xa hơn, nhưng cần vùng có chi tiết.
-              Chỉ tăng lên khi nhật ký báo "không khung dò nào định vị được".
+              Có <b>sàn tuyệt đối {PATCH_MIN_PX}px</b>: ở 8% của một vùng quét 444px thì khung dò chỉ
+              36×36px — quá ít nội dung để tương quan, và biểu hiện đúng là dòng "1/5 khung dò định vị
+              được" lặp lại mãi trong lúc ảnh ghép đứng im. Tỉ lệ quyết định tầm với; sàn này quyết định
+              có gì để khớp hay không.
               {patchPx > 0 && <> Hiện tại mỗi khung dò ≈ <span className="mono">{patchPx}×{patchPx}px</span> ở độ phân giải xử lý.</>}
             </div>
           </div>
 
           <div className="block">
-            <h2>3 · Chống trôi</h2>
+            <h2>3 · Mật độ ô</h2>
+            <div className="row">
+              {STEP_PRESETS.map((p) => (
+                <button key={p.frac} className={stepFrac === p.frac ? 'primary' : ''} onClick={() => setStepFrac(p.frac)}>
+                  {p.label}
+                </button>
+              ))}
+            </div>
+            <div className="note">{STEP_PRESETS.find((p) => p.frac === stepFrac).note}</div>
+            <div className="note">
+              Một ô được ghi khi ảnh đã dịch được phần này của khung. Trước đây nó cố định ở 8% — tức
+              <b> 92% chồng lấn</b>, nên 82 ô chỉ phủ vừa hơn ba khung nhìn. Chồng lấn nhiều không làm giảm
+              độ phân giải, nhưng nó khiến một phiên quét dài vẫn cho ra ảnh nhỏ.
+            </div>
+          </div>
+
+          <div className="block">
+            <h2>4 · Chống trôi</h2>
             <label className="check">
               <input type="checkbox" checked={anchor} onChange={(e) => setAnchor(e.target.checked)} />
               <span>Neo từng ô vào ảnh ghép</span>
@@ -1396,7 +1548,7 @@ export default function App() {
           </div>
 
           <div className="block" style={{ borderColor: running ? 'var(--teal)' : 'var(--line)' }}>
-            <h2>4 · Chạy</h2>
+            <h2>5 · Chạy</h2>
             {!running ? (
               <button className="primary" disabled={!cvReady || !capturing} onClick={startAuto}>
                 Bắt đầu <span className="kbd">Space</span>
@@ -1509,7 +1661,7 @@ export default function App() {
           </div>
 
           <div className="block">
-            <h2>5 · Tối ưu vị trí toàn cục</h2>
+            <h2>6 · Tối ưu vị trí toàn cục</h2>
             <button className="primary" onClick={runOptimize} disabled={tileCount < 3 || !!busyLabel}>
               Tối ưu vị trí tất cả các ô
             </button>
@@ -1525,6 +1677,40 @@ export default function App() {
               Đây chính là thuật toán Fiji dùng. Bài toán nhỏ (vài trăm ô, vài trăm ràng buộc) nên chạy
               ngay trong trình duyệt, không cần server.
             </div>
+            {tilt && (
+              <div className={'note' + (Math.abs(tilt.deg) > 0.5 && tilt.madDeg < 1.5 ? ' alert' : '')}>
+                Trục quét lệch <b className="mono">{tilt.deg.toFixed(1)}°</b> so với trục ảnh
+                <span className="dim"> (tán {tilt.madDeg.toFixed(1)}°, {tilt.n} bước)</span>.
+                {Math.abs(tilt.deg) > 0.5 && tilt.madDeg < 1.5 ? (
+                  <>
+                    <br /><br />
+                    Tán nhỏ nghĩa là góc này <b>giống nhau ở mọi bước</b> — nó là đặc tính của bộ thiết bị
+                    chứ không phải sai số tích luỹ: cảm biến camera không thẳng trục với bàn cơ. Kéo thuần
+                    trục X thì ảnh vẫn dịch chéo {tilt.deg.toFixed(1)}°, ở bước 700px là{' '}
+                    {Math.abs(700 * Math.sin(tilt.rad)).toFixed(0)}px lệch ngang mỗi bước.
+                    <br /><br />
+                    <b>Không có gì sai ở đây.</b> Các ô được đặt đúng chỗ nội dung của chúng, ảnh liền mạch,
+                    chỉ đường viền là méo. Tối ưu toàn cục không "sửa" được vì không có gì để sửa — cách xử
+                    lý là xoay ảnh thành phẩm một lần, bằng tuỳ chọn dưới đây.
+                  </>
+                ) : (
+                  <>
+                    <br />
+                    Tán lớn nghĩa là hướng đi thay đổi giữa các bước, nên đây <i>không</i> phải lệch trục cố
+                    định — nếu ảnh méo thì là trôi tích luỹ, hãy xem số cặp chéo ở dưới.
+                  </>
+                )}
+              </div>
+            )}
+            <label className="check" style={{ marginTop: 8 }}>
+              <input type="checkbox" checked={straighten} onChange={(e) => setStraighten(e.target.checked)} />
+              <span>Xoay thẳng trục khi xuất PNG{tilt ? ` (${tilt.deg.toFixed(1)}°)` : ''}</span>
+            </label>
+            <div className="note">
+              Xoay <b>một lần cho cả ảnh</b> ở bước xuất, không xoay từng ô — mức nội suy ít nhất có thể,
+              và là chỗ duy nhất trong toàn bộ đường đi có nội suy. Góc xoay được ghi vào
+              <code> scan_info.txt</code> trong bản ZIP.
+            </div>
             {optStats && (
               <div className="note mono" style={{ color: 'var(--teal)' }}>
                 {optStats.links}/{optStats.pairs} cặp đo được, trong đó{' '}
@@ -1539,7 +1725,7 @@ export default function App() {
           </div>
 
           <div className="block" style={{ borderColor: fused ? 'var(--teal)' : 'var(--amber)' }}>
-            <h2>6 · Hậu kiểm pixel trước khi xuất</h2>
+            <h2>7 · Hậu kiểm pixel trước khi xuất</h2>
             <div className="note" style={{ marginTop: 0 }}>
               Trong lúc quét, ô chụp sau ghi đè ô chụp trước — nhanh, đủ để định vị. Nhưng ở một vị trí
               thường có vài ô chồng lấn, và chúng <b>không tốt như nhau</b> tại vị trí đó: pixel gần

@@ -42,4 +42,31 @@ t('empty input is safe', () => {
   assert.deepEqual(largestAgreeingGroup([], 4), []);
 });
 
-console.log(`\n${pass} checks passed.`);
+
+
+// --- how many must agree, and why the number is not 2 ---
+
+t('two patches on the same wrong offset can carry a frame when minAgree is 2', () => {
+  // Repetitive tissue: real motion is (+300, 0), but two small patches locked onto
+  // a repeated structure one row over and agree with each other on (+300, -95).
+  const results = [P(300, 0), P(300, -95), P(301, -94)];
+  const g = largestAgreeingGroup(results, 6);
+  assert.equal(g.length, 2, 'the wrong pair forms the largest group');
+  assert.ok(g[0].dy < -50, 'and it is the wrong answer that wins');
+  // With minAgree 3 this frame is refused instead of misplacing a tile.
+  assert.ok(g.length < 3);
+});
+
+t('a clean frame has all five patches agreeing, so 3 is not a demanding bar', () => {
+  const g = largestAgreeingGroup([P(300, 1), P(299, 0), P(300, 0), P(301, 1), P(300, -1)], 6);
+  assert.equal(g.length, 5);
+});
+
+t('three still tolerates two bad patches', () => {
+  // two patches stuck on fixtures, three good
+  const g = largestAgreeingGroup([P(0, 0), P(412, 3), P(0, 0), P(411, 2), P(413, 4)], 6);
+  assert.equal(g.length, 3);
+  assert.ok(g.every((r) => r.dx > 400));
+});
+console.log(`
+${pass} checks passed.`);

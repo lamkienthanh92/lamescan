@@ -119,6 +119,84 @@ copy tại toạ độ nguyên (không warp, không nội suy), xuất trực ti
 là không bước nào sau đó cứu lại được chi tiết đã không được chụp — chất lượng được
 quyết định **ngay tại lúc chụp**.
 
+### Ba thứ quyết định độ phân giải, và không thứ nào ở bước xuất
+
+Một phiên quét thật cho ra con số này: nguồn màn hình 1920×1020, **vùng quét
+444×369**, 82 ô, ảnh ghép 1477×1574 = **2.3 MP**. Ba lỗi cộng lại, tất cả đều nằm ở
+phía chụp:
+
+**1. Vùng quét bị co lại quá mức.** `detectFieldRect` lùi vào **20%** mỗi phía để giữ
+halo ra khỏi khung dò. Nhưng khung dò giờ chỉ là một phần nhỏ của vùng quét và nằm gần
+tâm — nó đã cách xa biên rồi. Phần lùi vào chỉ cần đủ để loại pixel halo khỏi *ảnh
+được lưu*. Trên vùng sáng 550px, giá trị cũ cho ra vùng quét 330px; giá trị mới (6%)
+cho ~480px, tức **2.1× số pixel** cho cùng diện tích lame.
+
+**2. Ô được ghi mỗi 8% khung** — tức **92% chồng lấn**. Nên 82 ô chỉ phủ vừa hơn ba
+khung nhìn. Chồng lấn nhiều không làm giảm độ phân giải, nhưng nó khiến một phiên quét
+dài vẫn cho ra ảnh nhỏ. Nay chọn được: 70% / 55% / 35% chồng lấn, mặc định 55%.
+
+**3. Khung dò không có sàn tuyệt đối.** 8% của 444px là **36×36px** — quá ít nội dung
+để tương quan. Biểu hiện đúng là `1/5 khung dò không khớp nhau` lặp lại liên tục trong
+lúc ảnh ghép đứng im, rồi mất dấu. Nay có sàn **56px**: tỉ lệ quyết định tầm với, sàn
+quyết định có gì để khớp hay không.
+
+App hiện thẳng ngân sách độ phân giải ngay dưới phần nguồn:
+
+```
+Mỗi ô: 444×369 = 0.16 MP (4% diện tích nguồn)
+Với bước hiện tại, 100 ô ≈ 3 MP ảnh ghép.
+
+Vùng quét quá nhỏ — đây là thứ chặn độ phân giải, không phải bước xuất.
+Bạn đang ghi màn hình ở 1920×1020, tức toàn bộ màn hình. Chuyển sang Camera
+trực tiếp: camera 2592×1944 cho ô ~2000×1600 = 3.2 MP, gấp 20× hiện tại.
+```
+
+### Khi chỉ có đường ghi màn hình
+
+Phần lớn camera kính 3 mắt **không xuất hiện như thiết bị UVC** cho trình duyệt —
+phần mềm của hãng giữ độc quyền thiết bị. Nên với nhiều người, ghi màn hình không
+phải lựa chọn tiện mà là đường duy nhất. Vẫn kéo được chất lượng lên rất nhiều, và
+đòn bẩy lớn nhất thì phản trực giác:
+
+> **Đặt zoom trong phần mềm camera về 100% (1:1), đừng để nó thu ảnh cho vừa cửa sổ.**
+
+Nếu phần mềm đang fit ảnh 2592×1944 vào cửa sổ 700px, mỗi pixel bạn chụp được là nội
+suy của 3.7 pixel cảm biến — chi tiết đã mất, không bước nào lấy lại. Ở zoom 100%,
+cùng cửa sổ đó chỉ hiện *một phần* quang trường, nhưng **mỗi pixel là một pixel cảm
+biến thật**.
+
+Quang trường nhỏ hơn **không phải vấn đề, vì đây là app ghép ảnh**. Bạn chỉ cần kéo
+tiêu bản nhiều hơn. Một trường nhỏ mà sắc thì ghép lại thành ảnh lớn và nét; một
+trường rộng đã bị thu nhỏ thì mềm ở mọi mức phóng đại, và ghép bao nhiêu ô cũng vẫn
+mềm. Đổi diện tích lấy độ phân giải là đúng hướng khi có bước ghép ảnh bù lại diện
+tích.
+
+Kèm theo: chọn **cửa sổ camera** trong hộp chọn của trình duyệt (không chọn "toàn màn
+hình" — nó cho toàn bộ desktop trong khi cửa sổ camera chỉ chiếm một phần); phóng cửa
+sổ to hết mức trên màn hình lớn nhất có; tắt mọi bộ lọc làm mịn/sharpen trong phần mềm
+camera.
+
+### Chỉ số "Chi tiết mức pixel"
+
+Số pixel không nói được gì về chất lượng, nên app đo trực tiếp: **ảnh này có chi tiết
+ở mức pixel không, hay pixel của nó chỉ to và mềm?**
+
+Cách đo: giảm ảnh một nửa rồi đưa về kích thước cũ. Nếu ảnh mang chi tiết thật ở mức
+pixel — kể cả nhiễu cảm biến, thứ mà ảnh 1:1 thật luôn có — thì vòng đi-về đó phá huỷ
+rất nhiều năng lượng tần số cao và chỉ số lên cao. Nếu ảnh vốn đã là bản nội suy mượt
+của một ảnh nhỏ hơn, vòng đi-về gần như không đổi gì và chỉ số tụt về gần 0.
+
+| Chỉ số | Nghĩa |
+|---|---|
+| **> 55%** | Ảnh sắc đến từng pixel, nguồn đang tốt |
+| 35–55% | Tạm được, còn dư địa nếu tăng zoom lên 100% |
+| **< 35%** | Ảnh đã bị nội suy — số pixel nhiều hơn lượng chi tiết thật |
+
+Đây là chỉ số **so sánh**: đổi zoom hoặc đổi cách chọn nguồn rồi xem nó tăng hay
+giảm. Nó phụ thuộc nội dung (vùng nền trơn cho điểm thấp hơn vùng có mô), nên đừng
+đọc như một con số tuyệt đối — hãy đọc như một cái cân giữa hai thiết lập trên cùng
+một quang trường.
+
 ### Camera trực tiếp so với ghi màn hình
 
 **Ghi màn hình** là lựa chọn tiện và là lựa chọn mất mát. Nó ghi lại *cửa sổ* của phần
@@ -203,6 +281,25 @@ là nhiều chỗ trong ảnh tương quan tốt gần bằng nhau. Nên app dù
 nhỏ** đặt rải trong vùng quét, mỗi khung đo độc lập, và chỉ nhận kết quả mà **ít
 nhất 2 khung đồng ý** với nhau.
 
+### Bao nhiêu khung phải đồng ý
+
+**3 trên 5** cho phép đo thường, **4 trên 5** cho bước tìm lại vị trí sau khi mất dấu.
+
+Ban đầu tôi đặt 2, và đó là sai. Mọi khung dò đo cùng một dịch chuyển vật lý, nên một
+khung ảnh sạch thì cả 5 đều đồng ý — đòi 3 vẫn dư sức bỏ qua 2 khung dò rơi vào vật cố
+định hoặc vùng nền trơn. Nhưng 2 thì đủ yếu để **một cặp khung dò cùng bám vào một cấu
+trúc lặp lại** ở hàng bên cạnh và cùng báo sai một offset — trên mô học thì đó không
+phải khả năng xa vời. Và một ô đặt sai sẽ trở thành mốc tham chiếu cho mọi ô sau nó.
+
+Một khung bị bỏ tốn 200ms. Một khung bị đặt sai tốn cả phiên quét. `test-agree.mjs` có
+test dựng đúng tình huống cặp khung dò cùng sai đó.
+
+Bước tìm lại vị trí đòi cao hơn vì nó **dịch ô đi xa**, chứ không phải nhích một chút.
+Cùng lý do đó, bước neo vào ảnh ghép nay chỉ được **sửa tối đa 4% cạnh ô**: bán kính dò
+là *khoảng nhìn*, không phải giới hạn cho *kết quả được nhận* — nhìn xa thì không sao,
+nhận một câu trả lời từ xa thì có. Một "tinh chỉnh" dịch ô đi một khoảng lớn thì tự nó
+đã không còn là tinh chỉnh. Khi bị loại, nhật ký ghi rõ và app giữ kết quả đo trực tiếp.
+
 Cách này giải quyết luôn vấn đề vật cố định: một khung dò vô tình nằm trên bụi,
 viền halo hay overlay sẽ báo *"không dịch chuyển"* trong khi các khung khác báo
 dịch chuyển thật — nó lệch khỏi nhóm và bị loại. Một khung xấu **không** kéo được
@@ -282,6 +379,41 @@ cần cỡ N² lượt mới hội tụ. Đo thật trên chuỗi 300 ô: vẫn 
 phiên quét chủ yếu là chuỗi cộng vài liên kết chéo, nên giải trực tiếp phần chuỗi và
 để phép lặp chỉ phân bổ sai số khép vòng biến trường hợp khó nhất thành dễ nhất —
 chuỗi 300 ô giờ hội tụ chính xác tuyệt đối.
+
+### Lệch trục camera — không phải trôi
+
+Nếu bạn kéo **thuần một trục** mà ảnh ghép vẫn nghiêng, thì gần như chắc chắn đây
+không phải sai số tích luỹ.
+
+Camera gắn trên ống thị kính, và trục cảm biến của nó **hầu như không bao giờ vuông**
+với trục cơ của bàn. Lệch 2–3° là chuyện thường. Kéo theo stage-X khi đó làm ảnh dịch
+`(L·cos θ, L·sin θ)`: ở θ = 3° và bước 700px là **37px lệch ngang mỗi bước**, sau 20
+bước là 730px.
+
+**Không có gì sai khi điều đó xảy ra.** Các ô được đặt đúng chỗ nội dung của chúng,
+ảnh liền mạch, không xé. Chỉ đường viền là méo. Tối ưu toàn cục không "sửa" được vì
+không có gì để sửa — đường quét thật sự đã đi chéo qua cảm biến.
+
+Phân biệt hai trường hợp này quan trọng vì chúng cần cách xử lý **trái ngược**: trôi
+cần thêm chồng lấn và giải toàn cục; lệch trục cần xoay ảnh thành phẩm một lần.
+
+App đo góc này từ chính các bước đã ghi, gập vào ±45° (một lượt X và một lượt Y trên
+cùng camera lệch nhau đúng 90°, nên cả hai đều là mốc hợp lệ), rồi lấy trung vị. Con
+số đi kèm là **độ tán** (median absolute deviation), và đó là thứ phân biệt:
+
+- **Tán nhỏ** (< 1.5°) → góc giống nhau ở mọi bước → đặc tính thiết bị, là lệch trục.
+- **Tán lớn** → hướng đi thay đổi giữa các bước → không phải lệch trục cố định; nếu
+  ảnh méo thì là trôi, xem số cặp chéo.
+
+Tuỳ chọn **Xoay thẳng trục khi xuất PNG** xoay **một lần cho cả ảnh** ở bước xuất,
+không xoay từng ô — đây là mức nội suy ít nhất có thể, và là chỗ *duy nhất* trong toàn
+bộ đường đi có nội suy. Góc bù được ghi vào `scan_info.txt` trong bản ZIP; toạ độ
+trong `manifest.csv` giữ nguyên hệ **chưa xoay**, vì đó là hệ mà các ô thật sự được đo
+trong đó, và việc xoay là một phép biến đổi áp lên PNG sau đó chứ không phải một thay
+đổi về dữ liệu.
+
+Góc quay để lại bốn góc trong suốt hình tam giác; chúng bị cắt theo bao đóng của pixel
+thật (`paintedBounds`) để không phình ảnh xuất ra giống như viền padding từng làm.
 
 ### Vì sao vẫn có thể trôi sau khi tối ưu
 

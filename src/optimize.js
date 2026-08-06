@@ -167,6 +167,46 @@ export function globalSolve(positions, links, { sweeps = null, robustRounds = 3,
   return { positions: p, residual, dropped };
 }
 
+// Angle between the direction the stage actually moves the picture and the image
+// axes, measured from the recorded steps.
+//
+// This is the explanation for a mosaic that leans even though the operator only
+// ever moved along one axis. The camera is mounted on the eyepiece tube and its
+// sensor axes are almost never square with the stage's mechanical axes — two or
+// three degrees is ordinary. Dragging along stage-X then moves the picture by
+// (L·cos θ, L·sin θ): at θ = 3° and a 700px step that is 37px sideways per step,
+// which after twenty steps is 730px of lean.
+//
+// Nothing is wrong when that happens. The tiles are placed exactly where their
+// content is, the content is continuous, and no amount of solving will "fix" it
+// because there is nothing to fix — the scan really did travel diagonally across
+// the sensor. Only the outline is skewed. Distinguishing this from genuine drift
+// matters, because the two need opposite responses: drift needs more overlap and
+// a global solve, tilt needs the finished image rotated once.
+//
+// Steps are folded into ±45° because either axis is an equally valid reference:
+// an X run and a Y run on the same misaligned camera report angles 90° apart.
+export function scanAxisTilt(tiles, minStep = 20) {
+  const q = Math.PI / 2;
+  const angles = [];
+  for (let i = 1; i < tiles.length; i++) {
+    const dx = tiles[i].x - tiles[i - 1].x;
+    const dy = tiles[i].y - tiles[i - 1].y;
+    if (Math.hypot(dx, dy) < minStep) continue;
+    let a = Math.atan2(dy, dx);
+    a -= q * Math.round(a / q);
+    angles.push(a);
+  }
+  if (angles.length < 3) return null;
+  const sorted = [...angles].sort((a, b) => a - b);
+  const rad = sorted[Math.floor(sorted.length / 2)];
+  // Median absolute deviation: a real camera tilt is the SAME on every step, so a
+  // small spread means the angle is a property of the setup rather than noise.
+  const dev = angles.map((a) => Math.abs(a - rad)).sort((a, b) => a - b);
+  const madDeg = (dev[Math.floor(dev.length / 2)] * 180) / Math.PI;
+  return { rad, deg: (rad * 180) / Math.PI, n: angles.length, madDeg };
+}
+
 // ---------- pairwise measurement (needs OpenCV) ----------
 
 const OPT_SCALE_MAX_DIM = 480; // working size per tile for pair measurement

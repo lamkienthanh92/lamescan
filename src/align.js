@@ -141,9 +141,16 @@ function matchOnePatch(refGray, curGray, cx, cy, pw, ph) {
 // roughly the distance from that position to the far edge — so smaller patches
 // reach further as well as being safer. `tolPx` is how close two patches must
 // land to count as agreeing.
+// A patch has to be big enough to be distinctive in absolute pixels, not just as a
+// fraction. At 8% of a 444px region a patch is 36x36px — too little content to
+// correlate reliably, which showed up as "1/5 patches located" over and over while
+// tracking sat still. The fraction controls reach; this floor controls whether
+// there is anything to match on.
+export const PATCH_MIN_PX = 56;
+
 export function estimateShift(refGray, curGray, patchFrac, { minScore = 0.4, tolPx = 4, minAgree = 2 } = {}) {
-  const pw = Math.max(14, Math.round(refGray.cols * patchFrac));
-  const ph = Math.max(14, Math.round(refGray.rows * patchFrac));
+  const pw = Math.max(PATCH_MIN_PX, Math.round(refGray.cols * patchFrac));
+  const ph = Math.max(PATCH_MIN_PX, Math.round(refGray.rows * patchFrac));
   const total = PATCH_CENTERS.length;
   const info = { patchPx: Math.round(pw / (refGray.cols / 100)) / 100, pw, ph, total };
 
@@ -197,6 +204,52 @@ export function sharpnessOf(gray) {
   }
 }
 
+// Does this image carry real detail at the pixel level, or are its pixels just big
+// and soft?
+//
+// This is the question that matters when the only route to the image is screen
+// capture, because the number of pixels tells you nothing on its own. A camera
+// program fitting a 2592x1944 sensor into a 700px window has thrown away 3.7x in
+// each direction; the capture is then 700px of *resampled* image, and no later step
+// recovers what the resampling removed. Meanwhile the same window at 100% zoom shows
+// a smaller piece of the field but every pixel is a sensor pixel.
+//
+// The test: halve the image and put it back. If it carried genuine per-pixel detail
+// — including the sensor noise a real 1:1 image always has — that round trip destroys
+// a lot of high-frequency energy and the ratio is high. If the image was already a
+// smooth interpolation of something smaller, the round trip changes almost nothing
+// and the ratio collapses toward zero.
+//
+// Heuristic, and content-dependent: featureless background scores lower than tissue.
+// Useful for comparing two settings on the same field, which is exactly the use.
+export function pixelDetailRatio(mat) {
+  const size = Math.min(512, mat.cols, mat.rows);
+  if (size < 64) return null;
+  const rect = new cv.Rect(
+    Math.floor((mat.cols - size) / 2),
+    Math.floor((mat.rows - size) / 2),
+    size, size
+  );
+  const roi = mat.roi(rect);
+  const gray = new cv.Mat();
+  const half = new cv.Mat();
+  const back = new cv.Mat();
+  try {
+    cv.cvtColor(roi, gray, cv.COLOR_RGBA2GRAY);
+    const full = sharpnessOf(gray);
+    if (!(full > 1e-6)) return null;
+    cv.resize(gray, half, new cv.Size(Math.round(size / 2), Math.round(size / 2)), 0, 0, cv.INTER_AREA);
+    cv.resize(half, back, new cv.Size(size, size), 0, 0, cv.INTER_CUBIC);
+    const softened = sharpnessOf(back);
+    return Math.max(0, Math.min(1, 1 - softened / full));
+  } finally {
+    roi.delete();
+    gray.delete();
+    half.delete();
+    back.delete();
+  }
+}
+
 // Checks whether the chosen capture region is still reaching into the dark
 // vignette ring, by comparing a thin border band against the middle. This is
 // the failure the small-patch design exists to avoid, and it is silent — the
@@ -223,7 +276,14 @@ export function borderIsDark(gray) {
 // halo's edge is a soft gradient many pixels wide, and a rectangle that merely
 // touches the nominal boundary still contains enough of the stationary ring to
 // pin the correlation at zero.
-export function detectFieldRect(mat, insetFrac = 0.2) {
+// insetFrac was 0.2, which was a mistake with real consequences: it shrank the
+// CAPTURE region — the pixels that end up in the mosaic — by 40% in each direction
+// to protect the detection patches from the halo. But the patches are now a small
+// fraction of the region and sit near its centre, so they are already far from the
+// edge. The inset only needs to keep actual halo pixels out of the saved image.
+// On a 550px bright field the old value gave a 330px capture region; this gives
+// ~480px, which is 2.1x the pixel count for the same slide area.
+export function detectFieldRect(mat, insetFrac = 0.06) {
   const gray = new cv.Mat();
   cv.cvtColor(mat, gray, cv.COLOR_RGBA2GRAY);
   const w = gray.cols;
