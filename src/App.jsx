@@ -2,7 +2,7 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
 import JSZip from 'jszip';
 import './App.css';
-import { IDENT, matMul3, translateM, cornersOf, bboxOf, findAnchorTile, angleOf, applyInverseLinear } from './matrix.js';
+import { IDENT, matMul3, translateM, cornersOf, bboxOf, findAnchorTile, findCandidateTiles, angleOf, applyInverseLinear } from './matrix.js';
 import { computeFeatures, matchTiles, computeSharpness, detectVignetteRect } from './cvMatch.js';
 import { addEdge, removeEdgesForTile, relax, maxRenderedDrift } from './graph.js';
 import * as db from './db.js';
@@ -18,6 +18,7 @@ const EXTRAPOLATE_MIN_PX = 3; // minimum recent motion before it's worth extrapo
 const RELAX_ITERS_PER_TICK = 20; // small warm-started relaxation pass, run every tick — needs more than a handful now that rotation is solved too (coupled rotation+translation converges slower than translation alone), still cheap since it's plain arithmetic over edges
 const GUESS_EDGE_WEIGHT = 1; // low confidence for extrapolated (unmatched) placements
 const MAX_CONSECUTIVE_GUESSES = 2; // stop auto-accepting guesses after this many in a row without a real match confirming them
+const CANDIDATE_POOL_SIZE = 4; // how many nearby-by-prediction tiles a capture is tried against, not just the last one
 const REBUILD_DRIFT_PX = 20; // repaint the mosaic once any already-painted tile drifts this much — a few px of residual jitter from iterative relax isn't worth a full expensive repaint; only real loop-closure corrections should trigger one
 const REBUILD_MIN_TILES = 25; // ...but don't repaint more often than every N new tiles
 const REBUILD_MAX_MS = 8000; // ...or longer than this since the last repaint, if dirty
@@ -118,6 +119,7 @@ export default function App() {
   const previewContainerRef = useRef(null);
   const mosaicCanvasRef = useRef(null);
   const workCanvasRef = useRef(document.createElement('canvas'));
+  const quickCanvasRef = useRef(document.createElement('canvas')); // scratch canvas for the cheap pre-capture overlap check
   const streamRef = useRef(null);
   const autoTimerRef = useRef(null);
   const cropRef = useRef(null); // {x,y,w,h} in native video px, read by grabVideoFrame
@@ -759,6 +761,80 @@ export default function App() {
     return { mat, w: sw, h: sh, blobPromise };
   };
 
+  // ---- cheap pre-capture check: is now actually worth capturing? ----
+  // The nav-box/ghost overlay shows you the reference tile's leading edge so
+  // you can eyeball overlap — this reuses the exact same signal (leading-edge
+  // strip vs. reference tile) but puts it to work deciding *when* the real
+  // pipeline below should even run, instead of blindly running the full
+  // ORB + candidate-pool match every single timer tick regardless of whether
+  // you've moved. Deliberately cheap: a small downscaled grab + one
+  // matchTemplate call, no ORB, no candidate pool, no PNG encode. Only ever
+  // used to SKIP a tick early (fail open on any uncertainty) — it never
+  // blocks or delays a capture that the real pipeline would've accepted.
+  const MIN_MOVE_FRAC = 0.12; // skip capturing while less than this fraction of the tile has been traversed since the reference
+  const quickOverlapCheck = () => {
+    const c = cv_.current;
+    const refIdx = c.activeRefIndex !== null ? c.activeRefIndex : c.tiles.length - 1;
+    const refTile = refIdx >= 0 ? c.tiles[refIdx] : null;
+    if (!refTile || refIdx < 1 || !refTile._small) return null; // not enough history yet — always capture
+    const prev2 = c.tiles[refIdx - 1];
+    const dx = refTile.transform[2] - prev2.transform[2];
+    const dy = refTile.transform[5] - prev2.transform[5];
+    if (Math.abs(dx) < 1 && Math.abs(dy) < 1) return null;
+    const dir = Math.abs(dy) >= Math.abs(dx) ? { axis: 'y', sign: dy >= 0 ? 1 : -1 } : { axis: 'x', sign: dx >= 0 ? 1 : -1 };
+
+    const v = videoRef.current;
+    const crop = cropRef.current;
+    const sx = crop ? crop.x : 0, sy = crop ? crop.y : 0;
+    const sw = crop ? crop.w : v.videoWidth, sh = crop ? crop.h : v.videoHeight;
+    if (!sw || !sh) return null;
+
+    const scale = 220 / Math.max(sw, sh);
+    const qw = Math.max(8, Math.round(sw * scale));
+    const qh = Math.max(8, Math.round(sh * scale));
+    const qc = quickCanvasRef.current;
+    qc.width = qw;
+    qc.height = qh;
+    qc.getContext('2d').drawImage(v, sx, sy, sw, sh, 0, 0, qw, qh);
+
+    const liveMat = cv.imread(qc);
+    const liveGray = new cv.Mat();
+    cv.cvtColor(liveMat, liveGray, cv.COLOR_RGBA2GRAY);
+    liveMat.delete();
+
+    const dim = dir.axis === 'y' ? qh : qw;
+    const templateLen = Math.max(6, Math.round(dim * 0.2));
+    const refSmall = refTile._small;
+    if (refSmall.rows < templateLen + 1 || refSmall.cols < templateLen + 1 || qh < templateLen + 1 || qw < templateLen + 1) {
+      liveGray.delete();
+      return null;
+    }
+
+    let template;
+    if (dir.axis === 'y') {
+      template = dir.sign > 0 ? liveGray.roi(new cv.Rect(0, 0, qw, templateLen)) : liveGray.roi(new cv.Rect(0, qh - templateLen, qw, templateLen));
+    } else {
+      template = dir.sign > 0 ? liveGray.roi(new cv.Rect(0, 0, templateLen, qh)) : liveGray.roi(new cv.Rect(qw - templateLen, 0, templateLen, qh));
+    }
+    const result = new cv.Mat();
+    let movedFrac = null;
+    try {
+      cv.matchTemplate(refSmall, template, result, cv.TM_CCOEFF_NORMED);
+      const mm = cv.minMaxLoc(result);
+      if (mm.maxVal >= 0.25) {
+        const off = dir.axis === 'y' ? mm.maxLoc.y : mm.maxLoc.x;
+        const refDim = dir.axis === 'y' ? refSmall.rows : refSmall.cols;
+        const tSmall = dir.sign > 0 ? off : off - (refDim - templateLen);
+        movedFrac = Math.min(1, Math.abs(tSmall) / refDim);
+      }
+    } finally {
+      result.delete();
+      template.delete();
+      liveGray.delete();
+    }
+    return movedFrac;
+  };
+
   // ---- continuous, fully autonomous stitch loop ----
   // Never asks for confirmation: on a confident feature match it integrates
   // directly; when matching fails (low-texture region) it falls back to
@@ -768,6 +844,14 @@ export default function App() {
     if (!uiRef.current.capturing || c.busy) return;
     c.busy = true;
     try {
+      // Cheap gate: don't even grab a full-res frame if we clearly haven't
+      // moved far enough yet — returns null (proceed normally) on any
+      // uncertainty, so this only ever skips clear-cut "barely moved" ticks.
+      const movedFrac = quickOverlapCheck();
+      if (movedFrac !== null && movedFrac < MIN_MOVE_FRAC) {
+        return;
+      }
+
       const { mat, w, h, blobPromise } = grabVideoFrame();
 
       if (c.tiles.length === 0) {
@@ -798,23 +882,65 @@ export default function App() {
         return;
       }
 
-      let prevIndex = c.activeRefIndex !== null ? c.activeRefIndex : c.tiles.length - 1;
-      let prevTile = c.tiles[prevIndex];
-      const prevFeat = await getTileFeatures(prevTile);
-      const featNew = computeFeatures(mat);
-      // Best guess of this step's axis-translation magnitude, from the last
-      // real step — used only to break ties among comparably-supported
-      // candidates on repetitive texture (see matchTiles/fitAxisTranslation).
-      let expectedDX = null, expectedDY = null;
-      if (prevIndex >= 1) {
-        const prev2 = c.tiles[prevIndex - 1];
-        expectedDX = prevTile.transform[2] - prev2.transform[2];
-        expectedDY = prevTile.transform[5] - prev2.transform[5];
+      // ---- reference search: try a small pool of tiles ranked by predicted
+      // position, not just the last one captured ----
+      // The chronologically-previous tile isn't always the geometrically
+      // closest one right now — right after a scan direction change, the
+      // true nearest tile can be from an earlier row/column, not the one
+      // captured a second ago. Searching a small ranked pool instead of a
+      // single fixed reference is what actually fixes losing track at a
+      // direction change, rather than just reacting to it afterward.
+      const primaryIndex = c.activeRefIndex !== null ? c.activeRefIndex : c.tiles.length - 1;
+      const primaryTile = c.tiles[primaryIndex];
+
+      // Predicted placement, extrapolated the same way the guess-fallback
+      // below already does — used only to rank candidates and compute each
+      // candidate's own local expected offset, not to place anything directly.
+      let predWorldDX = 0, predWorldDY = 0;
+      if (primaryIndex >= 1) {
+        const prev2 = c.tiles[primaryIndex - 1];
+        predWorldDX = primaryTile.transform[2] - prev2.transform[2];
+        predWorldDY = primaryTile.transform[5] - prev2.transform[5];
       }
-      let m = matchTiles(featNew.kp, featNew.desc, prevFeat.kp, prevFeat.desc, {
-        axisLock: true, expectedDX, expectedDY,
-        newSmall: featNew.small, prevSmall: prevFeat.small, tileW: w, tileH: h,
-      });
+      const predictedTransform = primaryTile.transform.slice();
+      predictedTransform[2] += predWorldDX;
+      predictedTransform[5] += predWorldDY;
+      const predictedBBox = tileBBox(predictedTransform, w, h);
+
+      const featNew = computeFeatures(mat);
+      const candidates = findCandidateTiles(c.tiles, predictedBBox, [], CANDIDATE_POOL_SIZE, 0.05);
+      // Always guarantee the chronological tile gets tried even if it didn't
+      // rank in the bbox-overlap pool (e.g. barely dragged yet, so bboxes
+      // only just touch) — it's still the single most likely match.
+      if (!candidates.some((cand) => cand.index === primaryIndex)) {
+        candidates.push({ index: primaryIndex, tile: primaryTile, ratio: 0 });
+      }
+
+      let m = null;
+      let prevIndex = null;
+      let prevTile = null;
+      for (const cand of candidates) {
+        const candFeat = await getTileFeatures(cand.tile);
+        const [localExpDX, localExpDY] = applyInverseLinear(
+          cand.tile.transform,
+          predictedTransform[2] - cand.tile.transform[2],
+          predictedTransform[5] - cand.tile.transform[5]
+        );
+        const trial = matchTiles(featNew.kp, featNew.desc, candFeat.kp, candFeat.desc, {
+          axisLock: true, expectedDX: localExpDX, expectedDY: localExpDY,
+          newSmall: featNew.small, prevSmall: candFeat.small, tileW: w, tileH: h,
+        });
+        if (trial.ok && (!m || trial.inliers > m.inliers)) {
+          m = trial;
+          prevIndex = cand.index;
+          prevTile = cand.tile;
+        }
+      }
+      if (!m) m = { ok: false, inliers: 0, total: 0 };
+      if (prevIndex === null) {
+        prevIndex = primaryIndex;
+        prevTile = primaryTile;
+      }
 
       // Runs the shared warm-started relaxation pass, then checks whether any
       // already-painted tile drifted enough (or enough time/tiles have passed)
@@ -960,9 +1086,28 @@ export default function App() {
           const anchorFeat = await getTileFeatures(anchor);
           const am = matchTiles(featNew.kp, featNew.desc, anchorFeat.kp, anchorFeat.desc);
           if (am.ok) {
-            // Same as the chain edge above: am.H is already local to the anchor's frame.
-            addEdge(c.edges, c.adjacency, anchorIndex, newIndex, am.H[2], am.H[5], angleOf(am.H), am.inliers);
-            usedAnchor = true;
+            // Unlike the axisLock chain match above, this general (free
+            // rotation/scale) estimator has no built-in defense against
+            // repetitive-texture aliasing — RANSAC can still pick a cluster
+            // of points matched onto a neighboring identical-looking
+            // structure, especially on very regular tissue, and there's
+            // nothing in estimateGeneralTransform to catch that. But both
+            // tiles are already placed in the mosaic, so we know
+            // approximately what am.H's translation *should* be — sanity
+            // check the actual result against that, and reject anything
+            // wildly off instead of wiring a misaligned loop-closure into
+            // the pose graph (which visibly shows up as "same physical area,
+            // content doesn't actually line up" once revisited later).
+            const [expLdx, expLdy] = applyInverseLinear(
+              anchor.transform, transform[2] - anchor.transform[2], transform[5] - anchor.transform[5]
+            );
+            const offErr = Math.hypot(am.H[2] - expLdx, am.H[5] - expLdy);
+            const maxOffErr = Math.max(w, h) * 0.5;
+            if (offErr <= maxOffErr) {
+              // Same as the chain edge above: am.H is already local to the anchor's frame.
+              addEdge(c.edges, c.adjacency, anchorIndex, newIndex, am.H[2], am.H[5], angleOf(am.H), am.inliers);
+              usedAnchor = true;
+            }
           }
         }
       }
@@ -1414,6 +1559,12 @@ export default function App() {
       const manifestRows = [
         'index,filename,x_px,y_px,width_px,height_px,estimated,blurry,sharpness,t_a,t_b,t_tx,t_c,t_d,t_ty,captured_at_iso',
       ];
+      // Fiji ("Grid/Collection Stitching" → Positions from file → Defined by
+      // TileConfiguration) format: this app's already-computed (rough, live)
+      // tile positions become the *starting point* Fiji refines from, instead
+      // of it registering blind — meaningfully more robust on repetitive
+      // texture, since it only has to search near a known-plausible position.
+      const tileConfigRows = ['# Define the number of dimensions we are working on', 'dim = 2', '# Define the image coordinates'];
 
       tiles.forEach((tile, i) => {
         const idx = String(i + 1).padStart(Math.max(4, pad), '0');
@@ -1427,9 +1578,11 @@ export default function App() {
           `${i + 1},${filename},${xPx},${yPx},${tile.w},${tile.h},${tile.estimated ? 1 : 0},${tile.blurry ? 1 : 0},` +
           `${tile.sharpness || 0},${t[0]},${t[1]},${t[2]},${t[3]},${t[4]},${t[5]},${iso}`
         );
+        tileConfigRows.push(`${filename}; ; (${xPx}.0, ${yPx}.0)`);
       });
 
       zip.file('manifest.csv', manifestRows.join('\n'));
+      zip.file('TileConfiguration.txt', tileConfigRows.join('\n') + '\n');
 
       const blob = await zip.generateAsync(
         { type: 'blob', compression: 'STORE' },
@@ -1443,7 +1596,10 @@ export default function App() {
       a.href = URL.createObjectURL(blob);
       a.download = `anh-goc-lame-${Date.now()}.zip`;
       a.click();
-      setMatchInfo({ text: `Đã xuất ${tiles.length} ảnh gốc kèm manifest.csv.`, kind: 'ok' });
+      setMatchInfo({
+        text: `Đã xuất ${tiles.length} ảnh gốc kèm manifest.csv và TileConfiguration.txt (dùng cho Fiji: Plugins → Stitching → Grid/Collection stitching → Positions from file → Defined by TileConfiguration).`,
+        kind: 'ok',
+      });
     } catch (e) {
       setMatchInfo({ text: 'Xuất ảnh gốc thất bại: ' + e.message, kind: 'warn' });
     } finally {
@@ -1828,8 +1984,14 @@ export default function App() {
             </button>
             <div style={{ height: 8 }} />
             <button onClick={exportAllTilesZip} disabled={tileCount === 0 || exportingZip}>
-              {exportingZip ? 'Đang đóng gói…' : 'Xuất toàn bộ ảnh gốc + manifest (ZIP)'}
+              {exportingZip ? 'Đang đóng gói…' : 'Xuất ảnh gốc + toạ độ cho Fiji (ZIP)'}
             </button>
+            <div className="note" style={{ marginTop: 6 }}>
+              Kèm <code>manifest.csv</code> và <code>TileConfiguration.txt</code> (định dạng Fiji) —
+              nạp vào Fiji: Plugins → Stitching → Grid/Collection stitching → Type: "Positions from
+              file" → Order: "Defined by TileConfiguration", chọn file này. Fiji sẽ dùng toạ độ đã
+              có làm điểm khởi đầu rồi tự tinh chỉnh + blend lại cho ảnh cuối chất lượng cao hơn.
+            </div>
             <div style={{ height: 8 }} />
             <input
               ref={fileInputRef}

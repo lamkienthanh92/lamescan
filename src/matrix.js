@@ -96,3 +96,24 @@ export function findAnchorTile(tiles, candidateBBox, excludeCount, minOverlap = 
   return best;
 }
 
+// Like findAnchorTile, but returns up to `maxCandidates` tiles ranked by
+// overlap with `candidateBBox` instead of just the single best — used to
+// match a new capture against a small pool of "wherever it's predicted to
+// be" tiles rather than being locked into exactly one reference. This is
+// what lets matching recover its bearings right at a scan-direction change:
+// the chronologically-previous tile isn't always the geometrically-closest
+// one at that moment (e.g. the start of a new zigzag row sits right next to
+// the *end* of a much earlier row, not next to the tile captured a second
+// ago), and searching only that one tile has no way to notice.
+export function findCandidateTiles(tiles, candidateBBox, excludeIndices, maxCandidates = 4, minOverlap = 0.05) {
+  const excluded = excludeIndices instanceof Set ? excludeIndices : new Set(excludeIndices || []);
+  const scored = [];
+  for (let i = 0; i < tiles.length; i++) {
+    if (excluded.has(i)) continue;
+    const ratio = bboxOverlapRatio(candidateBBox, tiles[i].bbox);
+    if (ratio > minOverlap) scored.push({ index: i, tile: tiles[i], ratio });
+  }
+  scored.sort((a, b) => b.ratio - a.ratio);
+  return scored.slice(0, maxCandidates);
+}
+

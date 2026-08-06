@@ -169,48 +169,59 @@ export function computeSharpness(mat) {
 
 // Independent, non-ORB confirmation of an axis translation estimate:
 // template-matches a strip of raw pixel intensities from the leading edge of
-// the new tile against a wider strip of the previous tile covering the range
-// that edge should fall within, given the ORB-based estimate `t`'s direction.
+// the new tile against a window of the previous tile *centered on where the
+// ORB estimate `t` predicts it should be* (plus a margin) — not a generic
+// fixed region. Centering the search on the prediction (rather than e.g.
+// always searching "the far 60% of the tile") is what makes this correct
+// regardless of how much you actually dragged: a small drag has a small true
+// t, and searching around that small t is what finds it; searching a fixed
+// distant region would simply miss it.
 // Because this is a completely different signal (pixel correlation, not
 // keypoint descriptors), it isn't fooled by the exact repetitive-texture
 // ambiguity that can trip up ORB in the same way — so requiring the two to
-// agree is a genuine second, independent opinion, not just the same idea run
-// twice. Works on the small downscaled copy from computeFeatures; `origDim`
-// (the real tile height for axis='y', width for axis='x') is used to scale
-// the result back into the same pixel units as the ORB estimate.
+// agree is a genuine second, independent opinion on the same claim, not just
+// the same idea run twice. Works on the small downscaled copy from
+// computeFeatures; `origDim` (the real tile height for axis='y', width for
+// axis='x') is used to convert to/from that same small-image scale.
 function crossCorrelateAxis(newSmall, prevSmall, axis, t, origDim) {
   const w = newSmall.cols, h = newSmall.rows;
   const dim = axis === 'y' ? h : w;
-  const TEMPLATE_FRAC = 0.22;
-  const SEARCH_FRAC = 0.6;
-  const templateLen = Math.max(6, Math.round(dim * TEMPLATE_FRAC));
-  const searchLen = Math.max(templateLen + 4, Math.round(dim * SEARCH_FRAC));
-  if (templateLen >= searchLen || searchLen > dim) return null;
+  const scale = dim / origDim;
+  const tSmall = t * scale;
 
-  let templateRoi, searchRoi, searchStart;
+  const TEMPLATE_FRAC = 0.22;
+  const MARGIN_FRAC = 0.25;
+  const templateLen = Math.max(6, Math.round(dim * TEMPLATE_FRAC));
+  const marginPx = Math.max(templateLen, Math.round(dim * MARGIN_FRAC));
+
+  let template, searchStart, searchLen, predictedStart;
   if (axis === 'y') {
     if (t > 0) {
-      templateRoi = new cv.Rect(0, 0, w, templateLen);
-      searchStart = h - searchLen;
-      searchRoi = new cv.Rect(0, searchStart, w, searchLen);
+      template = newSmall.roi(new cv.Rect(0, 0, w, templateLen));
+      predictedStart = tSmall;
     } else {
-      templateRoi = new cv.Rect(0, h - templateLen, w, templateLen);
-      searchStart = 0;
-      searchRoi = new cv.Rect(0, 0, w, searchLen);
+      template = newSmall.roi(new cv.Rect(0, h - templateLen, w, templateLen));
+      predictedStart = h - templateLen + tSmall;
     }
+    searchStart = Math.max(0, Math.min(h - templateLen, Math.round(predictedStart - marginPx)));
+    searchLen = Math.min(h - searchStart, templateLen + marginPx * 2);
   } else {
     if (t > 0) {
-      templateRoi = new cv.Rect(0, 0, templateLen, h);
-      searchStart = w - searchLen;
-      searchRoi = new cv.Rect(searchStart, 0, searchLen, h);
+      template = newSmall.roi(new cv.Rect(0, 0, templateLen, h));
+      predictedStart = tSmall;
     } else {
-      templateRoi = new cv.Rect(w - templateLen, 0, templateLen, h);
-      searchStart = 0;
-      searchRoi = new cv.Rect(0, 0, searchLen, h);
+      template = newSmall.roi(new cv.Rect(w - templateLen, 0, templateLen, h));
+      predictedStart = w - templateLen + tSmall;
     }
+    searchStart = Math.max(0, Math.min(w - templateLen, Math.round(predictedStart - marginPx)));
+    searchLen = Math.min(w - searchStart, templateLen + marginPx * 2);
+  }
+  if (searchLen <= templateLen) {
+    template.delete();
+    return null;
   }
 
-  const template = newSmall.roi(templateRoi);
+  const searchRoi = axis === 'y' ? new cv.Rect(0, searchStart, w, searchLen) : new cv.Rect(searchStart, 0, searchLen, h);
   const search = prevSmall.roi(searchRoi);
   const result = new cv.Mat();
   cv.matchTemplate(search, template, result, cv.TM_CCOEFF_NORMED);
@@ -220,8 +231,12 @@ function crossCorrelateAxis(newSmall, prevSmall, axis, t, origDim) {
   search.delete();
 
   const off = axis === 'y' ? mm.maxLoc.y : mm.maxLoc.x;
-  const tSmall = t > 0 ? searchStart + off : searchStart + off - (dim - templateLen);
-  return { t: tSmall * (origDim / dim), score: mm.maxVal };
+  const matchedStart = searchStart + off;
+  const tSmallFound =
+    axis === 'y'
+      ? (t > 0 ? matchedStart : matchedStart - (h - templateLen))
+      : (t > 0 ? matchedStart : matchedStart - (w - templateLen));
+  return { t: tSmallFound / scale, score: mm.maxVal };
 }
 
 // Exhaustive (not random-sampled — the point count is capped low enough that
@@ -480,14 +495,31 @@ export function matchTiles(
       return { ok: false, inliers: best ? best.inliers : 0, total: pts.length };
     }
 
-    // NOTE: an earlier version cross-checked `best.t` here against an
-    // independent pixel cross-correlation (crossCorrelateAxis) and rejected
-    // on disagreement. Pulled back out — untestable without a real browser,
-    // and it turned out to reject almost everything in practice, stalling
-    // the scan at the first tile. The function is left defined below in case
-    // it's worth debugging and re-enabling later, but nothing calls it now.
+    // Second, independent opinion — the "outer frame": pixel cross-
+    // correlation on whole edge strips, not keypoints, searched around where
+    // the ORB estimate above predicts (see crossCorrelateAxis). Only run
+    // when the caller supplied the downscaled tile copies; skipped (not
+    // rejected) otherwise so callers without them still work.
+    let finalT = best.t;
+    if (newSmall && prevSmall) {
+      const origDim = best.axis === 'x' ? tileW : tileH;
+      const cc = origDim ? crossCorrelateAxis(newSmall, prevSmall, best.axis, best.t, origDim) : null;
+      const AGREEMENT_PX = 15;
+      const MIN_SCORE = 0.3;
+      if (cc && cc.score >= MIN_SCORE && Math.abs(cc.t - best.t) <= AGREEMENT_PX) {
+        // Both agree — average for a touch more precision than either alone.
+        finalT = (best.t + cc.t) / 2;
+      } else if (cc) {
+        // Both ran, but disagree — this is the actual "outer frame catches a
+        // bad inner-frame match" case. Reject rather than silently keeping
+        // the ORB-only answer.
+        return { ok: false, inliers: best.inliers, total: pts.length, disagreement: true };
+      }
+      // cc === null (e.g. degenerate tile size): fall through and trust ORB alone.
+    }
+
     const H =
-      best.axis === 'x' ? [1, 0, best.t, 0, 1, 0, 0, 0, 1] : [1, 0, 0, 0, 1, best.t, 0, 0, 1];
+      best.axis === 'x' ? [1, 0, finalT, 0, 1, 0, 0, 0, 1] : [1, 0, 0, 0, 1, finalT, 0, 0, 1];
     return { ok: true, inliers: best.inliers, total: pts.length, H };
   }
 
