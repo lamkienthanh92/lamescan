@@ -1078,18 +1078,23 @@ export default function App() {
       // cross-links at all: a chain of consecutive links cannot tell that the
       // chain as a whole has bent, so with none of them the solve can converge
       // beautifully and still leave the scan just as skewed as before.
+      const split = r.components > 1;
       const noCross = r.crossLinks < Math.max(2, r.links * 0.1);
       setStatus({
-        text: noCross
+        text: split
+          ? `Đồ thị liên kết bị chia thành ${r.components} nhóm rời nhau (nhóm lớn nhất ${r.largestComponent}/${s.tiles.length} ô). ` +
+            'Các nhóm không có liên kết nào giữa chúng, nên vị trí tương đối của chúng là không xác định — ' +
+            'đó chính là hiện tượng một khối ô nằm sai chỗ hẳn. Cần quét nối liền giữa các vùng.'
+          : noCross
           ? `Đã tối ưu nhưng chỉ có ${r.crossLinks} cặp "chéo" (giữa các ô không chụp liền nhau) trên ${r.links} cặp. ` +
             'Đó là loại cặp duy nhất sửa được trôi tích luỹ — không có chúng thì chuỗi ô không có cách nào biết là nó đã bị bẻ cong. ' +
             'Cần quét sao cho các cột/hàng chồng lấn lên nhau, rồi chạy lại.'
           : `Đã tối ưu ${s.tiles.length} ô từ ${r.links}/${r.pairs} cặp (${r.crossLinks} cặp chéo). ` +
             `Sai lệch trung bình: ${r.beforeResidual.toFixed(1)}px → ${r.afterResidual.toFixed(1)}px. ` +
             `Ô dịch nhiều nhất ${r.maxMove.toFixed(0)}px.`,
-        kind: noCross ? 'warn' : 'ok',
+        kind: split || noCross ? 'warn' : 'ok',
       });
-      log('info', `tối ưu: ${r.links}/${r.pairs} cặp (${r.crossLinks} chéo), sai lệch ${r.beforeResidual.toFixed(1)}→${r.afterResidual.toFixed(1)}px, bỏ ${r.dropped} cặp lỗi`);
+      log('info', `tối ưu: ${r.links}/${r.pairs} cặp (${r.crossLinks} chéo), sai lệch TB ${r.beforeResidual.toFixed(1)}→${r.afterResidual.toFixed(1)}px, tệ nhất ${r.maxError.toFixed(1)}px, loại ${r.dropped} cặp, ${r.components} nhóm`);
     } catch (e) {
       setStatus({ text: 'Tối ưu thất bại: ' + (e && e.message ? e.message : e), kind: 'warn' });
     } finally {
@@ -1674,8 +1679,23 @@ export default function App() {
               và đường quét vòng lại buộc phải khớp với chính nó.
             </div>
             <div className="note">
-              Đây chính là thuật toán Fiji dùng. Bài toán nhỏ (vài trăm ô, vài trăm ràng buộc) nên chạy
-              ngay trong trình duyệt, không cần server.
+              Ba cơ chế dưới đây được cài lại theo <b>thuật toán đã công bố của Fiji</b> (Preibisch et al.,
+              Grid/Collection stitching) sau khi đọc mã nguồn của nó — cài lại từ mô tả, không sao chép code,
+              vì Fiji là GPLv2 và sao chép sẽ buộc app này thành GPL:
+              <br /><br />
+              <b>1. Xét 5 đỉnh tương quan, không chỉ đỉnh cao nhất.</b> Mỗi đỉnh được kiểm chứng bằng một
+              phép đo <i>độc lập</i>: tương quan thật của toàn vùng chồng lấn nếu đặt ô ở offset đó. Trên mô
+              lặp lại, đỉnh cao nhất thường xuyên không phải vị trí đúng — một cấu trúc ở hàng bên cạnh khớp
+              nhích hơn — và lấy đỉnh cao nhất chính là cách chế ra một ràng buộc sai trông đầy tự tin.
+              <br /><br />
+              <b>2. Bỏ đúng một liên kết tệ nhất rồi giải lại, lặp.</b> Trước đây tôi giảm trọng số mọi liên
+              kết đáng ngờ cùng lúc; Fiji loại hẳn cái tệ nhất và giải lại. Lý do: một ràng buộc sai làm lệch
+              cả giá trị trung bình lẫn giá trị lớn nhất, nên giảm trọng số theo tỉ lệ vẫn để lại một phần
+              lực kéo của nó.
+              <br /><br />
+              <b>3. Đếm nhóm liên kết rời nhau.</b> Hai nhóm ô không có liên kết nào giữa chúng thì vị trí
+              tương đối là <i>không xác định</i> — và đó chính là hiện tượng một khối ô nằm sai chỗ hẳn.
+              Không nhìn ra được trên ảnh, nhưng giải thích hoàn toàn được bằng con số.
             </div>
             {tilt && (
               <div className={'note' + (Math.abs(tilt.deg) > 0.5 && tilt.madDeg < 1.5 ? ' alert' : '')}>
@@ -1717,9 +1737,14 @@ export default function App() {
                 <b style={{ color: optStats.crossLinks < 2 ? 'var(--amber)' : 'var(--teal)' }}>
                   {optStats.crossLinks} cặp chéo
                 </b>{' '}
-                · sai lệch trung bình {optStats.beforeResidual.toFixed(1)}px →{' '}
-                {optStats.afterResidual.toFixed(1)}px · bỏ {optStats.dropped} cặp lỗi · dịch tối đa{' '}
+                · sai lệch TB {optStats.beforeResidual.toFixed(1)}px → {optStats.afterResidual.toFixed(1)}px,
+                tệ nhất {optStats.maxError.toFixed(1)}px · loại {optStats.dropped} cặp · dịch tối đa{' '}
                 {optStats.maxMove.toFixed(0)}px
+                <br />
+                <b style={{ color: optStats.components > 1 ? 'var(--red)' : 'var(--teal)' }}>
+                  {optStats.components} nhóm liên kết
+                </b>{' '}
+                (lớn nhất {optStats.largestComponent} ô)
               </div>
             )}
           </div>

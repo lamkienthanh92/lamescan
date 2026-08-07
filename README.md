@@ -47,6 +47,41 @@ lại cạnh một cột đã quét — lúc đó vòng quét tự khép lại.
 Thứ sửa được trôi **đã** tích luỹ là bước tối ưu toàn cục ở dưới, và nó cần các cột
 chồng lấn lên nhau mới có ràng buộc để giải.
 
+### Nguồn thuật toán và giấy phép
+
+Ba cơ chế dưới đây được **cài lại theo thuật toán đã công bố của Fiji** (Preibisch et
+al., *Globally optimal stitching of tiled 3D microscopic image acquisitions*,
+Bioinformatics 2009 — plugin Grid/Collection stitching), sau khi đọc mã nguồn tại
+`github.com/fiji/Stitching`.
+
+**Cài lại từ mô tả, không sao chép code.** Fiji là **GPLv2**: sao chép code của nó vào
+đây sẽ buộc toàn bộ app này thành GPL. Bản thân thuật toán — phase correlation, xét
+nhiều đỉnh, cây khung, tối ưu toàn cục, loại liên kết lặp — đã công bố và không bị
+bằng độc quyền, nên cài lại độc lập là hợp pháp và không kéo theo giấy phép. Nếu bạn
+định phân phối app này thì đây là điểm cần giữ đúng.
+
+Ba cơ chế:
+
+**1. Xét 5 đỉnh tương quan, không chỉ đỉnh cao nhất** (`checkPeaks = 5` trong Fiji).
+Mỗi đỉnh được kiểm chứng bằng một phép đo **độc lập**: tương quan thật của *toàn* vùng
+chồng lấn nếu đặt ô ở offset đó — khác với bề mặt tương quan đã sinh ra đỉnh, vốn chỉ
+dùng một cửa sổ template. Trên mô lặp lại, đỉnh cao nhất thường xuyên không phải vị
+trí đúng, và lấy `argmax` là cách chế ra một ràng buộc sai trông đầy tự tin. Đây là cơ
+chế then chốt mà bản trước của tôi thiếu.
+
+**2. Bỏ đúng một liên kết tệ nhất rồi giải lại, lặp.** Điều kiện của Fiji:
+`trung bình × 2.5 < tệ nhất` và `tệ nhất > 0.95px`, hoặc `trung bình > 3.5px`. Trước
+đây tôi dùng IRLS — giảm trọng số mọi liên kết đáng ngờ cùng lúc. Cách của Fiji dứt
+khoát hơn và có lý: một ràng buộc sai làm lệch **cả** trung bình lẫn giá trị lớn nhất,
+nên giảm trọng số theo tỉ lệ vẫn để lại một phần lực kéo của nó; loại hẳn rồi giải lại
+mới biết nó có phải thủ phạm không.
+
+**3. Đếm nhóm liên kết rời nhau** (`identifyConnectedGraphs` trong Fiji). Hai nhóm ô
+không có liên kết nào giữa chúng thì vị trí tương đối của chúng **không xác định** —
+kết quả là nhóm nào cũng có thể nằm ở đâu đó tuỳ theo vị trí ghi được lúc quét. Đây
+chính xác là hiện tượng "một khối ô nằm sai chỗ hẳn": không nhìn ra được trên ảnh,
+nhưng giải thích trọn vẹn bằng một con số. App báo số nhóm và kích thước nhóm lớn nhất.
+
 Cách làm: trích một vùng của ảnh ghép quanh vị trí dự đoán, làm xám và thu về đúng
 độ phân giải xử lý, rồi tìm 5 khung dò của khung hiện tại trong đó. Phần ảnh ghép
 chưa được vẽ (alpha = 0) được làm phẳng về giá trị trung bình của phần đã vẽ — để

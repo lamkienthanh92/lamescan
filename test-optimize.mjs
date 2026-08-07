@@ -148,3 +148,71 @@ t('tiles no link reaches keep the position they had', () => {
 });
 console.log(`
 ${pass} checks passed.`);
+
+// --- Fiji's rules, reimplemented from the published algorithm ---
+import { connectedComponents, findPeaks, solveWithPruning } from './src/optimize.js';
+
+t('a split link graph is detected and reported', () => {
+  // Two columns scanned with no measured link between them: their relative position
+  // is undefined, which is what a block of tiles dumped in the wrong place means.
+  const links = [
+    { i: 0, j: 1, dx: 100, dy: 0, w: 1 }, { i: 1, j: 2, dx: 100, dy: 0, w: 1 },
+    { i: 3, j: 4, dx: 100, dy: 0, w: 1 }, { i: 4, j: 5, dx: 100, dy: 0, w: 1 },
+  ];
+  const c = connectedComponents(6, links);
+  assert.equal(c.count, 2);
+  assert.equal(c.largest, 3);
+});
+
+t('a fully linked scan is one component', () => {
+  const links = [{ i: 0, j: 1, dx: 1, dy: 0, w: 1 }, { i: 1, j: 2, dx: 1, dy: 0, w: 1 }];
+  assert.equal(connectedComponents(3, links).count, 1);
+});
+
+t('findPeaks returns several separated maxima, tallest first', () => {
+  const w = 20, h = 20;
+  const d = new Float32Array(w * h);
+  d[5 * w + 5] = 0.9;   // true match
+  d[5 * w + 14] = 0.95; // a taller peak from a repeated structure
+  d[15 * w + 5] = 0.4;
+  const p = findPeaks(d, w, h, 5, 4);
+  assert.ok(p.length >= 3);
+  assert.equal(p[0].x, 14, 'tallest first — and it is the wrong one, which is the point');
+  assert.ok(p.some((q) => q.x === 5 && q.y === 5), 'the true match must still be among the candidates');
+});
+
+t('findPeaks does not return the same peak twice', () => {
+  const w = 12, h = 12;
+  const d = new Float32Array(w * h);
+  for (let y = 4; y <= 6; y++) for (let x = 4; x <= 6; x++) d[y * w + x] = 0.8;
+  d[5 * w + 5] = 0.9;
+  const p = findPeaks(d, w, h, 5, 4);
+  const close = p.filter((q) => Math.hypot(q.x - 5, q.y - 5) < 4);
+  assert.equal(close.length, 1, 'one plateau must yield one peak');
+});
+
+t('one bad link is removed rather than merely down-weighted', () => {
+  const tiles = truth();
+  const pairs = findOverlappingPairs(tiles, 0.12);
+  const links = pairs.map(({ i, j }) => ({
+    i, j, w: 1, dx: tiles[j].x - tiles[i].x, dy: tiles[j].y - tiles[i].y,
+  }));
+  const victim = Math.floor(links.length / 2);
+  links[victim].dx += 120;
+  const out = solveWithPruning(tiles.map((tt) => ({ x: tt.x, y: tt.y })), links);
+  assert.ok(out.removed.length >= 1, 'the bad link should be dropped outright');
+  assert.ok(out.maxError < 3, `remaining fit should be clean, max error ${out.maxError.toFixed(2)}px`);
+  const err = Math.max(...out.positions.map((q, i) => Math.hypot(q.x - tiles[i].x, q.y - tiles[i].y)));
+  assert.ok(err < 1, `geometry should be recovered, off by ${err.toFixed(2)}px`);
+});
+
+t('a clean scan loses no links', () => {
+  const tiles = truth();
+  const links = findOverlappingPairs(tiles, 0.12).map(({ i, j }) => ({
+    i, j, w: 1, dx: tiles[j].x - tiles[i].x, dy: tiles[j].y - tiles[i].y,
+  }));
+  const out = solveWithPruning(tiles.map((tt) => ({ x: tt.x, y: tt.y })), links);
+  assert.equal(out.removed.length, 0);
+});
+console.log(`
+${pass} checks passed.`);

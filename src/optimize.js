@@ -207,6 +207,75 @@ export function scanAxisTilt(tiles, minStep = 20) {
   return { rad, deg: (rad * 180) / Math.PI, n: angles.length, madDeg };
 }
 
+// Connected components of the link graph.
+//
+// Fiji's optimiser does this explicitly (identifyConnectedGraphs) and keeps only the
+// largest component, logging the size of each. It matters because a split graph is
+// invisible in the result but fully explains it: two groups of tiles with no
+// measured link between them have no defined position relative to each other, so
+// whatever the recorded positions happened to be is what you get, and one group can
+// sit anywhere. That is what a mosaic with a block of tiles dumped in the wrong
+// place looks like.
+export function connectedComponents(n, links) {
+  const parent = Array.from({ length: n }, (_, i) => i);
+  const find = (a) => {
+    while (parent[a] !== a) {
+      parent[a] = parent[parent[a]];
+      a = parent[a];
+    }
+    return a;
+  };
+  for (const l of links) {
+    const ra = find(l.i);
+    const rb = find(l.j);
+    if (ra !== rb) parent[ra] = rb;
+  }
+  const groups = new Map();
+  for (let i = 0; i < n; i++) {
+    const r = find(i);
+    if (!groups.has(r)) groups.set(r, []);
+    groups.get(r).push(i);
+  }
+  const comps = [...groups.values()].sort((a, b) => b.length - a.length);
+  return { count: comps.length, largest: comps[0] ? comps[0].length : 0, components: comps };
+}
+
+// Top `count` local maxima of a correlation surface, at least `minSep` apart.
+//
+// This is the mechanism Fiji has and my first version did not. Fiji's stitcher
+// investigates the five highest peaks of the phase correlation and then decides
+// between them by measuring the actual cross-correlation of the overlap at each
+// offset, rather than trusting the tallest peak. On repetitive tissue the tallest
+// peak is regularly the wrong one — a structure one row over matches slightly
+// better than the true position — and taking the single argmax is exactly how a
+// confident wrong constraint gets manufactured.
+export function findPeaks(data, w, h, count = 5, minSep = 4) {
+  const peaks = [];
+  const taken = [];
+  const far = (x, y) => taken.every((p) => Math.hypot(p.x - x, p.y - y) >= minSep);
+  // Candidate list of local maxima, then greedily take the highest that are apart.
+  const cands = [];
+  for (let y = 1; y < h - 1; y++) {
+    for (let x = 1; x < w - 1; x++) {
+      const v = data[y * w + x];
+      if (
+        v >= data[y * w + x - 1] && v >= data[y * w + x + 1] &&
+        v >= data[(y - 1) * w + x] && v >= data[(y + 1) * w + x]
+      ) {
+        cands.push({ x, y, v });
+      }
+    }
+  }
+  cands.sort((a, b) => b.v - a.v);
+  for (const c of cands) {
+    if (peaks.length >= count) break;
+    if (!far(c.x, c.y)) continue;
+    peaks.push(c);
+    taken.push(c);
+  }
+  return peaks;
+}
+
 // ---------- pairwise measurement (needs OpenCV) ----------
 
 const OPT_SCALE_MAX_DIM = 480; // working size per tile for pair measurement
@@ -224,6 +293,7 @@ const SEARCH_MARGIN_FRAC = 0.22;   // of the smaller tile dimension, at working 
 const SEARCH_MARGIN_MIN = 40;
 const SEARCH_MARGIN_MAX = 220;
 const MIN_PAIR_SCORE = 0.35;
+const PEAK_CANDIDATES = 5; // Fiji's stitcher investigates 5; same reasoning applies here
 
 async function grayAt(blob, maxDim) {
   const bmp = await createImageBitmap(blob);
@@ -292,8 +362,24 @@ function measurePair(a, b, ga, gb, scale, indexGap = 1) {
   const res = new cv.Mat();
   try {
     cv.matchTemplate(win, tpl, res, cv.TM_CCOEFF_NORMED);
-    const mm = cv.minMaxLoc(res);
-    if (mm.maxVal < MIN_PAIR_SCORE) return null;
+
+    // Consider several peaks and let an independent measurement choose between
+    // them, instead of trusting the tallest. The tallest peak of a correlation
+    // surface over repetitive tissue is regularly not the true position.
+    const peaks = findPeaks(res.data32F, res.cols, res.rows, PEAK_CANDIDATES, 4);
+    if (peaks.length === 0) return null;
+    let bestPeak = null;
+    for (const pk of peaks) {
+      if (pk.v < MIN_PAIR_SCORE * 0.6) continue; // clearly hopeless
+      // Verification: how well do the two tiles actually agree if placed at this
+      // offset? Measured on the whole shared region, not on the template window,
+      // so it is not the same computation that produced the peak.
+      const vscore = verifyOffset(a, b, ga, gb, scale, ax, ay, sx0 + pk.x, sy0 + pk.y);
+      if (vscore === null) continue;
+      if (!bestPeak || vscore > bestPeak.vscore) bestPeak = { pk, vscore };
+    }
+    if (!bestPeak || bestPeak.vscore < MIN_PAIR_SCORE) return null;
+    const mm = { maxVal: bestPeak.vscore, maxLoc: { x: bestPeak.pk.x, y: bestPeak.pk.y } };
     // A peak pinned to the edge of the search window means the real match is
     // probably outside it, so the number is a bound rather than a measurement.
     // Accepting it would feed the solver a confident-looking wrong constraint,
@@ -319,6 +405,100 @@ function measurePair(a, b, ga, gb, scale, indexGap = 1) {
     win.delete();
     tpl.delete();
   }
+}
+
+// Normalised cross-correlation of the two tiles' shared region when the template
+// found at (foundX, foundY) is taken to be the true match. Equal-sized windows make
+// matchTemplate return a single value, which is exactly the correlation coefficient.
+//
+// Independent of the surface that produced the peak: that surface came from one
+// template window, this uses everything the two tiles share under the proposed
+// offset. A peak that wins on the template but loses here was matching a repeat.
+function verifyOffset(a, b, ga, gb, scale, ax, ay, bx, by) {
+  // Offset between the two tiles' origins, in working pixels.
+  const ox = ax - bx;
+  const oy = ay - by;
+  // Shared region in A's pixel space under that offset.
+  const x0 = Math.max(0, -ox);
+  const y0 = Math.max(0, -oy);
+  const x1 = Math.min(ga.cols, gb.cols - ox);
+  const y1 = Math.min(ga.rows, gb.rows - oy);
+  const w = Math.floor(x1 - x0);
+  const h = Math.floor(y1 - y0);
+  if (w < 24 || h < 24) return null;
+  const ra = ga.roi(new cv.Rect(Math.floor(x0), Math.floor(y0), w, h));
+  const rb = gb.roi(new cv.Rect(Math.floor(x0 + ox), Math.floor(y0 + oy), w, h));
+  const out = new cv.Mat();
+  const contA = new cv.Mat();
+  const contB = new cv.Mat();
+  try {
+    ra.copyTo(contA);
+    rb.copyTo(contB);
+    cv.matchTemplate(contA, contB, out, cv.TM_CCOEFF_NORMED);
+    return out.data32F[0];
+  } catch {
+    return null;
+  } finally {
+    ra.delete();
+    rb.delete();
+    out.delete();
+    contA.delete();
+    contB.delete();
+  }
+}
+
+// Solve, then drop the single worst link and solve again, repeating while the fit
+// looks like it is being held hostage by one bad measurement.
+//
+// This is Fiji's rule rather than mine. I had iterative re-weighting (IRLS), which
+// softens every suspect link at once; Fiji removes exactly one — the match with the
+// largest displacement — and redoes the whole optimisation, looping. The trigger is
+// a comparison of the worst error against the average: `avg * 2.5 < max` with `max`
+// above about a pixel, or an average error above 3.5px outright. The reasoning is
+// that a single wrong constraint distorts the average as well as the maximum, so
+// discounting proportionally leaves some of its pull in place, whereas removing it
+// and re-solving tells you whether it was the culprit.
+const REL_THRESHOLD = 2.5;   // max error this many times the average = one bad link
+const ABS_THRESHOLD = 3.5;   // px; an average this bad means something is wrong anyway
+const MIN_MAX_ERROR = 0.95;  // px; below this nothing is worth chasing
+
+export function solveWithPruning(positions, links, { maxRemoved = null } = {}) {
+  let active = links.map((l, k) => ({ ...l, k }));
+  const removed = [];
+  const cap = maxRemoved == null ? Math.max(3, Math.floor(links.length * 0.2)) : maxRemoved;
+  let out = globalSolve(positions, active, { robustRounds: 0 });
+  for (let pass = 0; pass < cap; pass++) {
+    const errs = active.map((l) =>
+      Math.hypot(
+        out.positions[l.j].x - out.positions[l.i].x - l.dx,
+        out.positions[l.j].y - out.positions[l.i].y - l.dy
+      )
+    );
+    if (errs.length === 0) break;
+    const avg = errs.reduce((s, e) => s + e, 0) / errs.length;
+    let worst = 0;
+    for (let i = 1; i < errs.length; i++) if (errs[i] > errs[worst]) worst = i;
+    const max = errs[worst];
+    const holdingHostage = avg * REL_THRESHOLD < max && max > MIN_MAX_ERROR;
+    if (!holdingHostage && avg <= ABS_THRESHOLD) break;
+    if (active.length <= 1) break;
+    removed.push({ ...active[worst], error: max });
+    active = active.filter((_, i) => i !== worst);
+    out = globalSolve(positions, active, { robustRounds: 0 });
+  }
+  const errs = active.map((l) =>
+    Math.hypot(
+      out.positions[l.j].x - out.positions[l.i].x - l.dx,
+      out.positions[l.j].y - out.positions[l.i].y - l.dy
+    )
+  );
+  return {
+    positions: out.positions,
+    links: active,
+    removed,
+    avgError: errs.length ? errs.reduce((s, e) => s + e, 0) / errs.length : 0,
+    maxError: errs.length ? Math.max(...errs) : 0,
+  };
 }
 
 // Full pass: measure every overlapping pair, then solve. `tiles` needs x, y, w, h
@@ -374,14 +554,15 @@ export async function optimizePositions(tiles, { minFrac = 0.12, onProgress } = 
   const beforeResidual =
     links.reduce((a, l) => a + Math.hypot(before[l.j].x - before[l.i].x - l.dx, before[l.j].y - before[l.i].y - l.dy), 0) /
     links.length;
-  const solved = globalSolve(before, links);
+  const solved = solveWithPruning(before, links);
+  const comps = connectedComponents(tiles.length, solved.links);
   const moved = solved.positions.map((q, i) => Math.hypot(q.x - before[i].x, q.y - before[i].y));
   // Links between tiles that were NOT captured one after the other are the only
   // ones that can correct accumulated drift: a chain of consecutive links has no
   // way to know the chain as a whole has bent. If this count is near zero the
   // scan has no cross-links to solve against, and no amount of solving will
   // straighten it — the columns need to overlap each other.
-  const crossLinks = links.filter((l) => l.j - l.i > 1).length;
+  const crossLinks = solved.links.filter((l) => l.j - l.i > 1).length;
   return {
     ok: true,
     positions: solved.positions,
@@ -389,8 +570,11 @@ export async function optimizePositions(tiles, { minFrac = 0.12, onProgress } = 
     links: links.length,
     crossLinks,
     beforeResidual,
-    afterResidual: solved.residual,
-    dropped: solved.dropped,
+    afterResidual: solved.avgError,
+    maxError: solved.maxError,
+    dropped: solved.removed.length,
+    components: comps.count,
+    largestComponent: comps.largest,
     maxMove: Math.max(...moved),
     meanMove: moved.reduce((a, b) => a + b, 0) / moved.length,
   };
