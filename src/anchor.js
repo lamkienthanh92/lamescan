@@ -55,106 +55,93 @@ export function frameOriginFromMatch({ rx, ry, originX, originY, frameScale, pat
 // refinement. The search radius is not the right limit for that: the radius is how
 // far to LOOK, and looking far is fine — accepting an answer from far away is not.
 export function alignToMosaic(
-  mosaic, frameGray, frameScale, w, h, predX, predY, radiusPx, patchFrac, tolPx,
+  mosaic, frameGray, frameScale, _w, _h, predX, predY, radiusPx, patchFrac, tolPx,
   { minAgree = 3, maxCorrectionPx = null } = {}
 ) {
-  const rx0 = Math.round(predX) + mosaic.originX - radiusPx;
-  const ry0 = Math.round(predY) + mosaic.originY - radiusPx;
-  const rx = Math.max(0, rx0);
-  const ry = Math.max(0, ry0);
-  const rw = Math.min(mosaic.w, rx0 + w + radiusPx * 2) - rx;
-  const rh = Math.min(mosaic.h, ry0 + h + radiusPx * 2) - ry;
-  if (rw < w * 0.5 || rh < h * 0.5) return { ok: false, reason: 'edge' };
+  // Each patch is searched for only in its own window of the mosaic — its
+  // predicted position ± radiusPx — instead of preparing (alpha split, gray
+  // conversion, resize) and searching one region the size of the whole frame plus
+  // margins. Same reach, same answers; in WebAssembly that whole-region version
+  // cost ~110ms per tile, which on its own was enough to stall the tick long enough
+  // for a moderately fast drag to outrun tracking.
+  const pw = Math.max(PATCH_MIN_PX, Math.round(frameGray.cols * patchFrac));
+  const ph = Math.max(PATCH_MIN_PX, Math.round(frameGray.rows * patchFrac));
+  const pwF = Math.ceil(pw / frameScale);
+  const phF = Math.ceil(ph / frameScale);
+  const r = Math.max(4, Math.round(radiusPx));
 
-  const trash = [];
-  const track = (m) => { trash.push(m); return m; };
-  try {
-    const roi = track(mosaic.mat.roi(new cv.Rect(rx, ry, rw, rh)));
-    const chans = track(new cv.MatVector());
-    cv.split(roi, chans);
-    const alpha = track(chans.get(3));
+  const measurements = [];
+  let windows = 0;
+  for (const [cx, cy] of PATCH_CENTERS) {
+    const tx = Math.round(cx * frameGray.cols - pw / 2);
+    const ty = Math.round(cy * frameGray.rows - ph / 2);
+    if (tx < 0 || ty < 0 || tx + pw > frameGray.cols || ty + ph > frameGray.rows) continue;
+    // Window in full-resolution mosaic pixels around where this patch should be.
+    const px = Math.round(predX + tx / frameScale) + mosaic.originX;
+    const py = Math.round(predY + ty / frameScale) + mosaic.originY;
+    const wx = Math.max(0, px - r);
+    const wy = Math.max(0, py - r);
+    const ww = Math.min(mosaic.w, px + pwF + r) - wx;
+    const wh = Math.min(mosaic.h, py + phF + r) - wy;
+    if (ww < pwF + 4 || wh < phF + 4) continue;
 
-    // Unpainted mosaic is fully transparent. Left as black it would be a huge
-    // high-contrast region for the correlation to latch onto, so it is flattened
-    // to the mean of the painted pixels instead — featureless, and therefore
-    // unable to produce a peak.
-    const painted = track(new cv.Mat());
-    cv.threshold(alpha, painted, 128, 255, cv.THRESH_BINARY);
-    const gray = track(new cv.Mat());
-    cv.cvtColor(roi, gray, cv.COLOR_RGBA2GRAY);
-    const meanPainted = cv.mean(gray, painted)[0];
-    const unpainted = track(new cv.Mat());
-    cv.bitwise_not(painted, unpainted);
-    gray.setTo(new cv.Scalar(meanPainted), unpainted);
-
-    // Bring the mosaic region to the same scale the frame's patches are at.
-    const sw = Math.max(8, Math.round(rw * frameScale));
-    const sh = Math.max(8, Math.round(rh * frameScale));
-    const small = track(new cv.Mat());
-    cv.resize(gray, small, new cv.Size(sw, sh), 0, 0, cv.INTER_AREA);
-    const smallPainted = track(new cv.Mat());
-    cv.resize(painted, smallPainted, new cv.Size(sw, sh), 0, 0, cv.INTER_NEAREST);
-
-    // Enough of the frame's own footprint must already exist in the mosaic for
-    // this to mean anything — at the leading edge of a scan most of it is empty.
-    const fw = Math.round(w * frameScale);
-    const fh = Math.round(h * frameScale);
-    const fx = Math.round((Math.round(predX) + mosaic.originX - rx) * frameScale);
-    const fy = Math.round((Math.round(predY) + mosaic.originY - ry) * frameScale);
-    const ix = Math.max(0, fx);
-    const iy = Math.max(0, fy);
-    const iw = Math.min(sw, fx + fw) - ix;
-    const ih = Math.min(sh, fy + fh) - iy;
-    if (iw <= 0 || ih <= 0) return { ok: false, reason: 'edge' };
-    const foot = track(smallPainted.roi(new cv.Rect(ix, iy, iw, ih)));
-    if (cv.countNonZero(foot) < fw * fh * MIN_PAINTED_FRAC) {
-      return { ok: false, reason: 'unpainted' };
+    const trash = [];
+    const track = (m) => { trash.push(m); return m; };
+    try {
+      const roi = track(mosaic.mat.roi(new cv.Rect(wx, wy, ww, wh)));
+      const chans = track(new cv.MatVector());
+      cv.split(roi, chans);
+      const alpha = track(chans.get(3));
+      const painted = track(new cv.Mat());
+      cv.threshold(alpha, painted, 128, 255, cv.THRESH_BINARY);
+      // Most of the window must already be scan, or there is nothing to find the
+      // patch in — at the leading edge part of the frame's footprint is empty.
+      if (cv.countNonZero(painted) < ww * wh * MIN_PAINTED_FRAC) continue;
+      windows++;
+      // Unpainted mosaic is fully transparent. Left as black it would be a huge
+      // high-contrast region for the correlation to latch onto, so it is flattened
+      // to the mean of the painted pixels instead — featureless, and therefore
+      // unable to produce a peak.
+      const gray = track(new cv.Mat());
+      cv.cvtColor(roi, gray, cv.COLOR_RGBA2GRAY);
+      const meanPainted = cv.mean(gray, painted)[0];
+      const unpainted = track(new cv.Mat());
+      cv.bitwise_not(painted, unpainted);
+      gray.setTo(new cv.Scalar(meanPainted), unpainted);
+      // Bring the window to the frame's working scale. Explicit fx/fy keeps the
+      // scale exactly frameScale rather than whatever rounding the size implies.
+      const small = track(new cv.Mat());
+      cv.resize(gray, small, new cv.Size(0, 0), frameScale, frameScale, cv.INTER_AREA);
+      if (small.cols < pw + 2 || small.rows < ph + 2) continue;
+      const tpl = track(frameGray.roi(new cv.Rect(tx, ty, pw, ph)));
+      const res = track(new cv.Mat());
+      cv.matchTemplate(small, tpl, res, cv.TM_CCOEFF_NORMED);
+      const mm = cv.minMaxLoc(res);
+      if (mm.maxVal < 0.3) continue;
+      const [sx, sy] = subpixelPeakOf(res, mm.maxLoc);
+      // The patch sits at (tx, ty) inside the frame and was found at (sx, sy)
+      // inside the scaled window whose top-left is mosaic pixel (wx, wy).
+      const p = frameOriginFromMatch({
+        rx: wx, ry: wy, originX: mosaic.originX, originY: mosaic.originY, frameScale,
+        patchX: tx, patchY: ty, foundX: sx, foundY: sy,
+      });
+      measurements.push({ dx: p.x, dy: p.y, score: mm.maxVal });
+    } finally {
+      for (let i = trash.length - 1; i >= 0; i--) trash[i].delete();
     }
-
-    const pw = Math.max(PATCH_MIN_PX, Math.round(frameGray.cols * patchFrac));
-    const ph = Math.max(PATCH_MIN_PX, Math.round(frameGray.rows * patchFrac));
-    if (pw >= sw || ph >= sh) return { ok: false, reason: 'edge' };
-
-    const measurements = [];
-    for (const [cx, cy] of PATCH_CENTERS) {
-      const tx = Math.round(cx * frameGray.cols - pw / 2);
-      const ty = Math.round(cy * frameGray.rows - ph / 2);
-      if (tx < 0 || ty < 0 || tx + pw > frameGray.cols || ty + ph > frameGray.rows) continue;
-      const tpl = frameGray.roi(new cv.Rect(tx, ty, pw, ph));
-      const res = new cv.Mat();
-      try {
-        cv.matchTemplate(small, tpl, res, cv.TM_CCOEFF_NORMED);
-        const mm = cv.minMaxLoc(res);
-        if (mm.maxVal < 0.3) continue;
-        const [sx, sy] = subpixelPeakOf(res, mm.maxLoc);
-        // The patch sits at (tx, ty) inside the frame and was found at (sx, sy)
-        // inside the scaled mosaic region, so the frame's origin is at
-        // (sx - tx, sy - ty) there. Convert back to full mosaic pixels, then to
-        // tile coordinates.
-        const p = frameOriginFromMatch({
-          rx, ry, originX: mosaic.originX, originY: mosaic.originY, frameScale,
-          patchX: tx, patchY: ty, foundX: sx, foundY: sy,
-        });
-        measurements.push({ dx: p.x, dy: p.y, score: mm.maxVal });
-      } finally {
-        res.delete();
-        tpl.delete();
-      }
-    }
-
-    if (measurements.length < minAgree) return { ok: false, reason: 'no-signal', used: measurements.length };
-    const group = largestAgreeingGroup(measurements, tolPx);
-    if (group.length < minAgree) return { ok: false, reason: 'disagree', used: measurements.length };
-
-    const x = group.reduce((a, m) => a + m.dx, 0) / group.length;
-    const y = group.reduce((a, m) => a + m.dy, 0) / group.length;
-    const correction = Math.hypot(x - predX, y - predY);
-    const limit = maxCorrectionPx == null ? radiusPx : maxCorrectionPx;
-    if (correction > limit) return { ok: false, reason: 'implausible', correction, limit };
-    return { ok: true, x, y, used: group.length, total: PATCH_CENTERS.length, correction };
-  } finally {
-    for (let i = trash.length - 1; i >= 0; i--) trash[i].delete();
   }
+
+  if (windows < minAgree) return { ok: false, reason: 'unpainted', used: measurements.length };
+  if (measurements.length < minAgree) return { ok: false, reason: 'no-signal', used: measurements.length };
+  const group = largestAgreeingGroup(measurements, tolPx);
+  if (group.length < minAgree) return { ok: false, reason: 'disagree', used: measurements.length };
+
+  const x = group.reduce((a, m) => a + m.dx, 0) / group.length;
+  const y = group.reduce((a, m) => a + m.dy, 0) / group.length;
+  const correction = Math.hypot(x - predX, y - predY);
+  const limit = maxCorrectionPx == null ? radiusPx : maxCorrectionPx;
+  if (correction > limit) return { ok: false, reason: 'implausible', correction, limit };
+  return { ok: true, x, y, used: group.length, total: PATCH_CENTERS.length, correction };
 }
 
 // ---------- relocalisation after losing track ----------
@@ -253,4 +240,86 @@ export function relocalizeCoarse(mosaic, coarseMat, coarse, frameGray, frameScal
     small.delete();
     res.delete();
   }
+}
+
+// ---------- full-resolution refinement at tile placement ----------
+//
+// Tracking and alignToMosaic both measure at WORKING resolution (frames shrunk to
+// ~640px). With a 2000px camera frame, one working pixel is ~3 sensor pixels, so
+// the sub-pixel fit's small systematic error (peak-locking) is ~3x larger in the
+// mosaic than it needs to be — and a systematic error is exactly what accumulates
+// linearly along a scan into a leaning strip.
+//
+// This runs once per TILE (not per tick), so it can afford full resolution: a grid
+// of patches from the full-res frame is located in the full-res mosaic, each
+// inside a small window around the position already measured. Patches whose
+// window isn't fully painted are skipped, so it uses whatever overlap exists —
+// the previous tile at the leading edge, an earlier column on a serpentine return.
+// The result must be agreed on by several patches and may only nudge the tile.
+
+const REFINE_GRID = [0.22, 0.5, 0.78];
+
+export function refineOnMosaic(mosaic, fullGray, x, y, {
+  patchPx = 112, radiusPx = 6, minAgree = 3, tolPx = 1.5, minScore = 0.5, maxCorrectionPx = 6,
+} = {}) {
+  const w = fullGray.cols;
+  const h = fullGray.rows;
+  const pw = Math.min(patchPx, Math.floor(w / 4));
+  const ph = Math.min(patchPx, Math.floor(h / 4));
+  if (pw < 24 || ph < 24) return { ok: false, reason: 'small' };
+  const r = Math.max(2, Math.round(radiusPx));
+  const found = [];
+  let tried = 0;
+  for (const fy of REFINE_GRID) {
+    for (const fx of REFINE_GRID) {
+      const px = Math.round(fx * w - pw / 2);
+      const py = Math.round(fy * h - ph / 2);
+      // Predicted mosaic position of this patch, then a window around it.
+      const mx = x + px + mosaic.originX;
+      const my = y + py + mosaic.originY;
+      const wx = Math.floor(mx) - r;
+      const wy = Math.floor(my) - r;
+      const ww = pw + 2 * r + 1;
+      const wh = ph + 2 * r + 1;
+      if (wx < 0 || wy < 0 || wx + ww > mosaic.w || wy + wh > mosaic.h) continue;
+      const roi = mosaic.mat.roi(new cv.Rect(wx, wy, ww, wh));
+      const chans = new cv.MatVector();
+      const gray = new cv.Mat();
+      const res = new cv.Mat();
+      const tpl = fullGray.roi(new cv.Rect(px, py, pw, ph));
+      try {
+        cv.split(roi, chans);
+        const alpha = chans.get(3);
+        const minA = cv.minMaxLoc(alpha).minVal;
+        alpha.delete();
+        if (minA < 255) continue; // window not fully painted
+        tried++;
+        cv.cvtColor(roi, gray, cv.COLOR_RGBA2GRAY);
+        cv.matchTemplate(gray, tpl, res, cv.TM_CCOEFF_NORMED);
+        const mm = cv.minMaxLoc(res);
+        if (mm.maxVal < minScore) continue;
+        if (mm.maxLoc.x <= 0 || mm.maxLoc.y <= 0 || mm.maxLoc.x >= res.cols - 1 || mm.maxLoc.y >= res.rows - 1) continue;
+        const [sx, sy] = subpixelPeakOf(res, mm.maxLoc);
+        found.push({
+          dx: wx + sx - px - mosaic.originX, // implied frame origin, tile coords
+          dy: wy + sy - py - mosaic.originY,
+          score: mm.maxVal,
+        });
+      } finally {
+        tpl.delete();
+        res.delete();
+        gray.delete();
+        chans.delete();
+        roi.delete();
+      }
+    }
+  }
+  if (found.length < minAgree) return { ok: false, reason: tried < minAgree ? 'unpainted' : 'no-signal', used: found.length, tried };
+  const group = largestAgreeingGroup(found, tolPx);
+  if (group.length < minAgree) return { ok: false, reason: 'disagree', used: group.length, tried };
+  const rx = group.reduce((a, m) => a + m.dx, 0) / group.length;
+  const ry = group.reduce((a, m) => a + m.dy, 0) / group.length;
+  const correction = Math.hypot(rx - x, ry - y);
+  if (correction > maxCorrectionPx) return { ok: false, reason: 'implausible', correction };
+  return { ok: true, x: rx, y: ry, used: group.length, tried, correction };
 }

@@ -2,16 +2,22 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
 import JSZip from 'jszip';
 import './App.css';
-import { toMatchGray, estimateShift, sharpnessOf, borderIsDark, detectFieldRect, pixelDetailRatio, PATCH_CENTERS, PATCH_MIN_PX } from './align.js';
+import { toMatchGray, estimateShiftFast, toCoarse, sharpnessOf, borderIsDark, detectFieldRect, pixelDetailRatio, PATCH_CENTERS, PATCH_MIN_PX } from './align.js';
 import * as M from './mosaic.js';
-import { alignToMosaic, relocalizeCoarse, buildCoarseMosaic, coarseScaleFor } from './anchor.js';
+import { alignToMosaic, relocalizeCoarse, buildCoarseMosaic, coarseScaleFor, refineOnMosaic } from './anchor.js';
 import { fuseMosaic, FUSION_METHODS, medianSharpnessOf, tileQuality } from './fuse.js';
 import { optimizePositions, scanAxisTilt } from './optimize.js';
 import { drawMinimap, pipSupport, openDocumentPiP } from './minimap.js';
 import * as db from './db.js';
 import { readbackCanvas } from './canvasutil.js';
 
-const TICK_MS = 200;          // how often a frame is sampled
+// How often a frame is sampled. This was 200ms, but a tick used to cost 150–250ms
+// of WebAssembly work (a full-frame search per patch, the mosaic anchor and a PNG
+// encode on EVERY frame), so busy ticks were skipped and the real rate was 2–3 Hz.
+// Per-tick work is now a few tens of ms — the expensive steps run only when a frame
+// becomes a tile — so sampling twice as often is affordable, and it halves how far
+// the slide moves between samples, which is what decides whether tracking holds.
+const TICK_MS = 100;
 const MIN_SCORE = 0.32;       // a single patch scoring below this isn't a measurement
 const LOST_AFTER = 4;         // consecutive unlocated frames before saying so plainly
 // Search radius for the mosaic measurement, as a fraction of the frame. It only
@@ -25,7 +31,7 @@ const AGREE_TOL_PX = 6;       // how close two patches must land to count as agr
 // landing on a fixture or on featureless background. Two was weak enough that a
 // pair of small patches finding the same wrong offset on repetitive tissue could
 // carry a frame, and a wrongly placed tile then becomes the reference for
-// everything after it. A skipped frame costs 200ms; a wrong one costs the scan.
+// everything after it. A skipped frame costs one tick; a wrong one costs the scan.
 const MIN_AGREE = 3;
 const MIN_STEP_PX = 12;       // don't record a tile until the picture has actually moved
 // How far the picture must move before a tile is recorded, as a fraction of the
@@ -51,6 +57,15 @@ const STEP_DEFAULT = 0.45;
 const PATCH_MIN = 0.04;
 const PATCH_MAX = 0.18;
 const PATCH_DEFAULT = 0.08;
+// "Only record when still": the picture must be moving slower than this for a
+// frame to become a tile — a fraction of the frame's short side per second, with a
+// floor. At ~5% of a 1200px frame per second (60 px/s), motion blur over a typical
+// 10–20ms exposure is about a pixel and rolling-shutter skew is negligible.
+const STILL_FRAC_S = 0.05;
+const STILL_MIN_PX_S = 15;
+// Repetitive "not far enough yet" lines are throttled so the log stays readable and
+// React isn't re-rendering the whole panel ten times a second for them.
+const SKIP_LOG_MS = 700;
 const BLUR_HISTORY = 30;
 const BLUR_MIN_SAMPLES = 5;
 const BLUR_RATIO = 0.4;
@@ -76,6 +91,7 @@ function videoRect(container, video) {
 function Thumb({ blob }) {
   const [url, setUrl] = useState(null);
   useEffect(() => {
+    if (!blob) return undefined; // still encoding
     const u = URL.createObjectURL(blob);
     setUrl(u);
     return () => URL.revokeObjectURL(u);
@@ -117,6 +133,10 @@ export default function App() {
   const [locked, setLocked] = useState(null);     // which camera controls got fixed
   const showCovRef = useRef(true);
   const [anchor, setAnchor] = useState(true);
+  const [stillOnly, setStillOnly] = useState(false);
+  const [, setBlobTick] = useState(0); // re-render tile thumbnails as encodes land
+  const stillRef = useRef(false);
+  const lastSkipLog = useRef(0);
   const [fusion, setFusion] = useState('best');
   const [excluded, setExcluded] = useState(() => new Set());
   const excludedRef = useRef(new Set());
@@ -148,6 +168,7 @@ export default function App() {
   const patchRef = useRef(PATCH_DEFAULT);
   useEffect(() => { patchRef.current = patchFrac; }, [patchFrac]);
   useEffect(() => { anchorRef.current = anchor; }, [anchor]);
+  useEffect(() => { stillRef.current = stillOnly; }, [stillOnly]);
   useEffect(() => { excludedRef.current = excluded; }, [excluded]);
   useEffect(() => { showCovRef.current = showCov; }, [showCov]);
   useEffect(() => { stepRef.current = stepFrac; }, [stepFrac]);
@@ -173,8 +194,8 @@ export default function App() {
     //
     // refPrev is at most one tick old, so falling back to it means a lost lock
     // costs one frame instead of the rest of the scan.
-    refTile: null,     // { gray, scale, x, y }
-    refPrev: null,     // { gray, scale, x, y }
+    refTile: null,     // { gray, coarse, scale, x, y, t }
+    refPrev: null,     // { gray, coarse, scale, x, y, t }
     coarse: null,      // { mat, scale } shrunk mosaic, for relocalising when lost
     busy: false,
     fails: 0,
@@ -255,6 +276,8 @@ export default function App() {
   const rebuild = useCallback(async () => {
     const s = S.current;
     setBusyLabel('Đang vẽ lại ảnh ghép…');
+    // Before touching the mosaic: tile images may still be encoding.
+    await settleBlobs();
     M.freeMosaic(s.mosaic);
     s.mosaic = null;
     dropCoarse();
@@ -485,6 +508,11 @@ export default function App() {
     }
   };
 
+  // Draws the current video frame (cropped) into the work canvas and reads it into
+  // a Mat. The PNG encode that used to happen here on EVERY tick — then thrown away
+  // for most of them — is now `encode()`, called only for a frame that becomes a
+  // tile. It must be called before anything redraws the work canvas; the tick holds
+  // `busy` for its whole duration, so nothing does.
   const grabFrame = () => {
     const v = videoRef.current;
     const c = cropRef.current;
@@ -493,12 +521,13 @@ export default function App() {
     const sw = c ? c.w : v.videoWidth;
     const sh = c ? c.h : v.videoHeight;
     const wc = workRef.current;
-    wc.width = sw;
-    wc.height = sh;
+    // Assigning width/height reallocates the backing store even when unchanged.
+    if (wc.width !== sw) wc.width = sw;
+    if (wc.height !== sh) wc.height = sh;
     wc.getContext('2d').drawImage(v, sx, sy, sw, sh, 0, 0, sw, sh);
     const mat = cv.imread(wc);
-    const blobPromise = new Promise((res) => wc.toBlob(res, 'image/png'));
-    return { mat, w: sw, h: sh, blobPromise };
+    const encode = () => new Promise((res) => wc.toBlob(res, 'image/png'));
+    return { mat, w: sw, h: sh, encode };
   };
 
   const classifyBlur = (value) => {
@@ -515,8 +544,23 @@ export default function App() {
     return isBlurry;
   };
 
+  // A reference frame: the working-resolution gray plus its coarse copy (for the
+  // coarse-to-fine search), its position, and when it was grabbed.
+  const makeRef = (gray, scale, x, y, t) => ({ gray, coarse: toCoarse(gray), scale, x, y, t });
+  const cloneRef = (r, x, y) => ({ gray: r.gray.clone(), coarse: r.coarse.clone(), scale: r.scale, x, y, t: r.t });
   const freeRef = (r) => {
-    if (r && r.gray) r.gray.delete();
+    if (!r) return;
+    if (r.gray) r.gray.delete();
+    if (r.coarse) r.coarse.delete();
+    r.gray = null;
+    r.coarse = null;
+  };
+
+  const logSkip = (text) => {
+    const now = performance.now();
+    if (now - lastSkipLog.current < SKIP_LOG_MS) return;
+    lastSkipLog.current = now;
+    log('skip', text);
   };
 
   // The shrunk mosaic used for relocalisation is only valid until the mosaic
@@ -536,6 +580,10 @@ export default function App() {
     dropCoarse();
   };
 
+  // Tile images are encoded in the background (see addTile). Anything that reads
+  // them — rebuild, fusion, ZIP export — calls this first.
+  const settleBlobs = () => Promise.all(S.current.tiles.map((t) => t.blobPromise || null));
+
   const addTile = async (mat, w, h, blobPromise, x, y, sharpness, isBlurry) => {
     const s = S.current;
     const grew = M.growFor(s.mosaic, x, y, w, h);
@@ -550,15 +598,28 @@ export default function App() {
     }
     if (!M.paintRegion(s.mosaic, canvasRef.current, rect, s.scale)) paintAll();
 
-    const blob = await blobPromise;
+    // The PNG encode takes ~150ms and used to be awaited right here, inside the
+    // tick — long enough for a normal drag to carry the slide out of tracking
+    // reach before the next frame was looked at. The tile is recorded now and its
+    // image attached when the encode finishes; anything that reads tile images
+    // first waits for pending encodes (settleBlobs).
     const index = s.tiles.length;
-    const tile = { x, y, w, h, blob, sharpness, blurry: isBlurry, capturedAt: Date.now() };
+    const tile = { x, y, w, h, blob: null, sharpness, blurry: isBlurry, capturedAt: Date.now() };
+    tile.blobPromise = blobPromise.then((blob) => {
+      tile.blob = blob;
+      delete tile.blobPromise;
+      // Undone while encoding: don't write a tile that no longer exists.
+      if (S.current.tiles[index] !== tile) return;
+      // eslint-disable-next-line no-unused-vars
+      const { blobPromise: _p, ...rec } = tile;
+      db.saveTile({ index, ...rec }).catch((e) =>
+        setStatus({ text: 'Cảnh báo: không lưu được vào bộ nhớ tạm (' + e.message + ')', kind: 'warn' })
+      );
+      setBlobTick((n) => n + 1);
+    });
     s.tiles.push(tile);
     setLastRect({ x, y, w, h });
     setTilt(scanAxisTilt(s.tiles));
-    db.saveTile({ index, ...tile }).catch((e) =>
-      setStatus({ text: 'Cảnh báo: không lưu được vào bộ nhớ tạm (' + e.message + ')', kind: 'warn' })
-    );
     if (isBlurry) setBlurry((n) => n + 1);
     setTileCount(s.tiles.length);
     setFused(null); // mosaic no longer matches any reviewed fusion
@@ -568,25 +629,27 @@ export default function App() {
   };
 
   // ---- the whole loop ----
-  // Grab a frame, correlate a small central patch of the last accepted frame
-  // against it, and if the picture moved far enough, paste the frame at the
-  // accumulated offset. No confirmation step, no fallback estimate, no second
-  // opinion: either the correlation locates the patch or the frame is skipped
-  // and the next one is tried 200ms later.
+  // Every tick: grab a frame and locate it against the last tile (or, failing
+  // that, the previous frame) — cheaply, coarse-to-fine. Only when the picture has
+  // moved far enough for a new tile does the expensive work run: PNG encode,
+  // anchoring to the mosaic, full-resolution refinement, paste. A frame that
+  // can't be located is skipped and the next one is tried a tick later.
   const tick = useCallback(async () => {
     const s = S.current;
     if (!ui.current.capturing || s.busy) return;
     s.busy = true;
     let mat = null;
-    let gray = null;
-    let grayOwned = true; // cleared once setRef() takes ownership of it
+    let cur = null;        // { gray, coarse, scale, x, y, t } for this frame
+    let curOwned = true;   // cleared once a reference takes ownership of it
+    let fullGray = null;
     try {
       const frame = grabFrame();
       mat = frame.mat;
-      const { w, h, blobPromise } = frame;
+      const { w, h } = frame;
+      const now = performance.now();
       const g = toMatchGray(mat);
-      gray = g.gray;
-      const scale = g.scale;
+      cur = makeRef(g.gray, g.scale, 0, 0, now);
+      const { gray, scale } = cur;
 
       // One-off check that the capture region isn't reaching into the vignette.
       // A stationary high-contrast ring inside the correlated area pins the
@@ -610,6 +673,8 @@ export default function App() {
       }
 
       if (s.tiles.length === 0) {
+        // Encode before any await: the work canvas must still hold this frame.
+        const blobPromise = frame.encode();
         if (!s.dbOwned) {
           await db.clearAll().catch(() => {});
           s.dbOwned = true;
@@ -618,9 +683,9 @@ export default function App() {
         s.mosaic = M.createMosaic(w, h);
         await addTile(mat, w, h, blobPromise, 0, 0, sharp, isBlurry);
         clearRefs();
-        s.refTile = { gray: gray.clone(), scale, x: 0, y: 0 };
-        s.refPrev = { gray, scale, x: 0, y: 0 };
-        grayOwned = false;
+        s.refTile = cloneRef(cur, 0, 0);
+        s.refPrev = cur;
+        curOwned = false;
         s.fails = 0;
         setLost(false);
         log('ok', `ô nền #1 tại (0, 0), ${w}×${h}px`);
@@ -632,14 +697,15 @@ export default function App() {
       // disk, or the last tile was undone. Nothing in the pixels tells us where
       // the current view sits, so the documented workflow is to line the specimen
       // back up with the last tile first — and this frame is taken at its word as
-      // being that position. Previously this path dereferenced a null reference
-      // and threw on the first tick after resuming or undoing.
+      // being that position.
       if (!s.refTile) {
         const last = s.tiles[s.tiles.length - 1];
         freeRef(s.refPrev);
-        s.refTile = { gray: gray.clone(), scale, x: last.x, y: last.y };
-        s.refPrev = { gray, scale, x: last.x, y: last.y };
-        grayOwned = false;
+        cur.x = last.x;
+        cur.y = last.y;
+        s.refTile = cloneRef(cur, last.x, last.y);
+        s.refPrev = cur;
+        curOwned = false;
         s.fails = 0;
         setLost(false);
         log('info', `nối lại từ ô #${s.tiles.length} — coi khung hiện tại là trùng vị trí ô đó`);
@@ -654,14 +720,15 @@ export default function App() {
       const patchOf = (e) =>
         (e.all || []).map((r) => `${Math.round(r.dx / s.refTile.scale)},${Math.round(r.dy / s.refTile.scale)}`).join(' ');
 
-      // Against the last placed tile first: no accumulated error.
-      let est = estimateShift(s.refTile.gray, gray, patchRef.current, opts);
+      // Against the last placed tile first: no accumulated error. Coarse-to-fine,
+      // so this costs a few ms instead of ~130ms (see estimateShiftFast).
+      let est = estimateShiftFast(s.refTile, cur, patchRef.current, opts);
       let base = s.refTile;
       let chained = false;
       if (!est.ok && s.refPrev && s.refPrev !== s.refTile) {
         // Out of reach of the tile, but the previous frame is one tick old, so
         // whatever just happened is almost certainly within reach of that.
-        const alt = estimateShift(s.refPrev.gray, gray, patchRef.current, opts);
+        const alt = estimateShiftFast(s.refPrev, cur, patchRef.current, opts);
         if (alt.ok) {
           est = alt;
           base = s.refPrev;
@@ -683,9 +750,11 @@ export default function App() {
           if (found) {
             freeRef(s.refPrev);
             freeRef(s.refTile);
-            s.refTile = { gray: gray.clone(), scale, x: found.x, y: found.y };
-            s.refPrev = { gray, scale, x: found.x, y: found.y };
-            grayOwned = false;
+            cur.x = found.x;
+            cur.y = found.y;
+            s.refTile = cloneRef(cur, found.x, found.y);
+            s.refPrev = cur;
+            curOwned = false;
             s.fails = 0;
             setLost(false);
             log('ok', `đã tự tìm lại vị trí: (${Math.round(found.x)}, ${Math.round(found.y)}) — không cần khớp tay`);
@@ -710,12 +779,49 @@ export default function App() {
       let x = base.x + dx;
       let y = base.y + dy;
 
-      // Frame-to-frame tracking has produced a prediction. Now measure the frame's
-      // position against the mosaic itself, which carries no accumulated error, and
-      // use that instead when it succeeds. This is what stops the whole strip from
-      // leaning: without it, every tile inherits the sum of all previous
-      // measurement errors, so a small consistent bias becomes a visible skew.
+      // How fast the picture is moving, from the previous located frame. Used by
+      // the "only record when still" option: a frame grabbed mid-drag carries
+      // motion blur and, on rolling-shutter cameras, a skew — both show up as
+      // seams that don't line up, which reads as drift but isn't.
+      const prev = s.refPrev;
+      const dtS = prev && prev.t ? Math.max(0.001, (now - prev.t) / 1000) : null;
+      const speed = dtS ? Math.hypot(x - prev.x, y - prev.y) / dtS : 0;
+
+      // The frame is located, so it becomes the previous-frame reference whether
+      // or not it earns a tile. This is what keeps the fallback fresh.
+      if (s.refPrev !== s.refTile) freeRef(s.refPrev);
+      cur.x = x;
+      cur.y = y;
+      s.refPrev = cur;
+      curOwned = false;
+      s.fails = 0;
+      setLost(false);
+
+      const stepPx = Math.hypot(x - s.refTile.x, y - s.refTile.y);
+      const minStep = Math.max(MIN_STEP_PX, Math.min(w, h) * stepRef.current);
+      if (stepPx < minStep) {
+        logSkip(`mới dịch ${Math.round(stepPx)}px (cần ≥ ${Math.round(minStep)}px), ${est.used}/${est.total} khung dò đồng ý`);
+        return;
+      }
+      if (stillRef.current) {
+        const stillMax = Math.max(STILL_MIN_PX_S, Math.min(w, h) * STILL_FRAC_S);
+        if (speed > stillMax) {
+          logSkip(`đủ xa để ghi ô nhưng tay còn đang kéo (${Math.round(speed)} px/s > ${Math.round(stillMax)}) — dừng tay một chút`);
+          setStatus({ text: 'Đủ xa rồi — dừng tay một chút để ghi ô cho nét.', kind: 'warn' });
+          return;
+        }
+      }
+
+      // From here on the frame becomes a tile, so the expensive steps — which
+      // used to run on every tick — are worth doing. Encode first: the work
+      // canvas must still hold this exact frame.
+      const blobPromise = frame.encode();
+
+      // Measure the position against the mosaic itself, which carries no
+      // accumulated error, and use that instead when it succeeds. This is what
+      // closes the loop on a serpentine return alongside an earlier column.
       let anchored = null;
+      let refined = null;
       if (anchorRef.current && s.tiles.length >= 2) {
         const radius = Math.max(20, Math.round(Math.min(w, h) * ANCHOR_RADIUS_FRAC));
         // Anchoring corrects accumulated error, which is small per step. Allowing it
@@ -733,29 +839,34 @@ export default function App() {
           log('warn', `bỏ neo vào ảnh ghép: lệch dự đoán ${a.correction.toFixed(0)}px > ${a.limit}px — giữ kết quả đo trực tiếp`);
         }
       }
-
-      // The frame is located, so it becomes the previous-frame reference whether
-      // or not it earns a tile. This is what keeps the fallback fresh.
-      if (s.refPrev !== s.refTile) freeRef(s.refPrev);
-      s.refPrev = { gray, scale, x, y };
-      grayOwned = false;
-      s.fails = 0;
-      setLost(false);
-
-      const stepPx = Math.hypot(x - s.refTile.x, y - s.refTile.y);
-      const minStep = Math.max(MIN_STEP_PX, Math.min(w, h) * stepRef.current);
-      if (stepPx < minStep) {
-        log('skip', `mới dịch ${Math.round(stepPx)}px (cần ≥ ${Math.round(minStep)}px), ${est.used}/${est.total} khung dò đồng ý`);
-        return;
+      // Then refine at FULL resolution. Everything above measured on the ~640px
+      // working copy, where one pixel is several camera pixels; doing the last step
+      // on camera pixels shrinks the per-tile error that otherwise accumulates.
+      if (anchorRef.current) {
+        fullGray = new cv.Mat();
+        cv.cvtColor(mat, fullGray, cv.COLOR_RGBA2GRAY);
+        const r = refineOnMosaic(s.mosaic, fullGray, x, y, {
+          radiusPx: Math.ceil(2 / scale) + 2,
+          maxCorrectionPx: Math.ceil(3 / scale) + 2,
+        });
+        if (r.ok) {
+          x = r.x;
+          y = r.y;
+          refined = r;
+        }
       }
+      cur.x = x;
+      cur.y = y;
 
       const index = await addTile(mat, w, h, blobPromise, x, y, sharp, isBlurry);
       freeRef(s.refTile);
-      s.refTile = { gray: s.refPrev.gray.clone(), scale, x, y };
+      s.refTile = cloneRef(cur, x, y);
       log('ok', `ô #${index + 1} tại (${Math.round(x)}, ${Math.round(y)}) · dịch ${fmt(dx)},${fmt(dy)}` +
         ` · ${est.used}/${est.total} khung dò đồng ý (điểm ${est.score.toFixed(2)}, tán ${est.spread.toFixed(1)}px)` +
         (chained ? ' · nối qua khung trước' : '') +
-        (anchored ? ` · neo vào ảnh ghép (chỉnh ${anchored.correction.toFixed(1)}px)` : ''));
+        (anchored ? ` · neo vào ảnh ghép (chỉnh ${anchored.correction.toFixed(1)}px)` : '') +
+        (refined ? ` · tinh chỉnh độ phân giải gốc ${refined.correction.toFixed(1)}px (${refined.used} mảng)` : '') +
+        (speed > 0 ? ` · tốc độ ${Math.round(speed)} px/s` : ''));
       setStatus({
         text: `Đã ghép ${index + 1} ô. Bước vừa rồi: ${fmt(dx)}, ${fmt(dy)} px — ${est.used}/${est.total} khung dò đồng ý.` +
           (isBlurry ? ' Ô này có thể bị mờ.' : ''),
@@ -769,11 +880,11 @@ export default function App() {
       // eslint-disable-next-line no-console
       console.error('[panorama] tick failed', err);
     } finally {
-      // cv.Mat lives in the WASM heap and is never garbage collected, so both
-      // the frame and the grayscale copy must be released on every path —
-      // including the exception path, where it's easiest to forget.
+      // cv.Mat lives in the WASM heap and is never garbage collected, so every
+      // Mat must be released on every path — including the exception path.
       if (mat) mat.delete();
-      if (gray && grayOwned) gray.delete();
+      if (fullGray) fullGray.delete();
+      if (cur && curOwned) freeRef(cur);
       s.busy = false;
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1015,6 +1126,7 @@ export default function App() {
     const s = S.current;
     if (!s.mosaic || s.tiles.length === 0 || busyLabel) return;
     stopAuto();
+    await settleBlobs();
     trimToContent();
     try {
       const r = await fuseMosaic(s.mosaic, s.tiles, {
@@ -1157,6 +1269,7 @@ export default function App() {
     const s = S.current;
     if (s.tiles.length === 0 || busyLabel) return;
     setBusyLabel('Đang đóng gói…');
+    await settleBlobs();
     // Trim first so the manifest coordinates are relative to the top-left of the
     // exported mosaic, not to a buffer origin that no output file describes.
     trimToContent();
@@ -1519,6 +1632,16 @@ export default function App() {
               ))}
             </div>
             <div className="note">{STEP_PRESETS.find((p) => p.frac === stepFrac).note}</div>
+            <label className="check">
+              <input type="checkbox" checked={stillOnly} onChange={(e) => setStillOnly(e.target.checked)} />
+              <span>Chỉ ghi ô khi tay dừng</span>
+            </label>
+            <div className="note">
+              Bật khi cần ảnh để đếm/đánh giá: app vẫn bám vị trí liên tục, nhưng chỉ ghi ô khi ảnh gần như đứng
+              yên — kéo tới chỗ mới, <b>dừng tay một nhịp</b>, rồi kéo tiếp. Khung chụp lúc đang kéo bị nhoè và
+              (với camera màn trập cuộn) bị xô lệch; khi ghép vào, các đường nối sẽ lệch vài pixel và trông
+              như bị trôi dù vị trí đo được vẫn đúng.
+            </div>
             <div className="note">
               Một ô được ghi khi ảnh đã dịch được phần này của khung. Trước đây nó cố định ở 8% — tức
               <b> 92% chồng lấn</b>, nên 82 ô chỉ phủ vừa hơn ba khung nhìn. Chồng lấn nhiều không làm giảm

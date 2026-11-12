@@ -4,6 +4,16 @@ Kéo tiêu bản dưới kính hiển vi, app tự đo xem ảnh đã dịch bao
 trục x và y**, rồi dán khung ảnh vào đúng vị trí đó. Một cơ chế duy nhất, không có
 bước xác nhận nhiều tầng.
 
+## Thay đổi trong bản này
+
+- **Nhanh hơn ~4,5 lần mỗi nhịp ghi ô, nhịp 100ms thay vì 200ms**: dò thô-rồi-tinh, neo vào
+  ảnh ghép theo cửa sổ và chỉ khi ghi ô, nén PNG ở nền. Kéo nhanh gấp ~3 lần mà không mất
+  dấu (xem *Tốc độ*).
+- **Tinh chỉnh ở độ phân giải gốc** mỗi khi ghi ô (xem mục cùng tên).
+- **Tuỳ chọn "Chỉ ghi ô khi tay dừng"** chống nhoè và xô lệch do màn trập cuộn.
+- Bảng **phân biệt trôi thật với lệch trục camera / nhoè** (xem *Phân biệt "trôi"…*).
+- Test mới `test-track.mjs` chạy opencv.js thật; bench đầu-cuối `bench/e2e.mjs`.
+
 ## Cách hoạt động
 
 Tiêu bản trượt dưới ống kính cố định thì ảnh chỉ **tịnh tiến**. Nên toàn bộ bài
@@ -11,17 +21,43 @@ toán định vị chỉ là: *"so với khung trước, ảnh đã dịch bao n
 y?"* — và câu đó được trả lời trực tiếp bằng tương quan chéo chuẩn hoá
 (`TM_CCOEFF_NORMED`), không cần keypoint, RANSAC, hay pose graph.
 
-Mỗi 200ms:
+Mỗi 100ms:
 
 1. Lấy 1 khung từ vùng quét.
-2. Lấy **5 khung dò nhỏ** từ khung tham chiếu, tìm từng khung trong khung mới.
+2. Lấy **5 khung dò nhỏ** từ khung tham chiếu và tìm từng khung trong khung mới —
+   **thô rồi tinh**: tìm khắp khung trên một bản thu nhỏ (~200px), rồi đo chính xác ở
+   độ phân giải xử lý trong một cửa sổ hẹp quanh kết quả thô.
 3. Nội suy parabol qua đỉnh tương quan để có độ chính xác dưới 1 pixel.
 4. Giữ nhóm khung dò lớn nhất mà tất cả đo ra cùng một dịch chuyển (lệch < 6px).
-   Cần ít nhất 2 khung.
-5. Nếu ảnh đã dịch đủ xa so với ô cuối, dán khung mới vào vị trí đó.
+   Cần ít nhất 3 khung.
+5. Nếu ảnh đã dịch đủ xa so với ô cuối thì — **chỉ lúc này** — neo vào ảnh ghép, tinh
+   chỉnh ở độ phân giải gốc của camera, rồi dán khung mới vào vị trí đó.
 
-Khung nào không đo được thì **bỏ qua**, thử lại khung sau 200ms. Không ngoại suy
-bù, không đoán vị trí.
+Khung nào không đo được thì **bỏ qua**, thử lại ở nhịp sau. Không ngoại suy bù,
+không đoán vị trí.
+
+## Tốc độ: vì sao trước đây phải kéo chậm
+
+OpenCV trong trình duyệt là WebAssembly một luồng, chạy chung luồng với giao diện. Đo
+trong Chromium thật (bằng `bench/e2e.mjs`, xem dưới), bản trước mỗi nhịp tốn nhiều
+hơn chính nhịp 200ms của nó:
+
+| Việc | Bản trước | Bản này |
+|---|---|---|
+| Dò 5 khung dò (tìm khắp khung 640px) | ~130ms, gấp đôi khi phải nối qua khung trước | ~10ms (thô rồi tinh) |
+| Neo vào ảnh ghép | ~110ms, **mỗi nhịp** | ~10ms, chỉ khi ghi ô (dò theo cửa sổ từng khung dò) |
+| Nén PNG | **mỗi nhịp**, rồi bỏ đi | chỉ khi ghi ô, và không bắt nhịp phải chờ |
+| Nhịp ghi ô (tổng) | ~310ms | ~70ms |
+| Nhịp xử lý thực tế | ~3,4/giây | ~9,7/giây |
+| Luồng giao diện bị chiếm | ~60% | ~15–19% |
+
+Nhịp bị chiếm quá lâu thì nhịp sau bị bỏ, tiêu bản trượt quá xa giữa hai lần nhìn, và
+app mất dấu. Trên camera giả lập 1600×1200, bản trước mất dấu ở **600 px/giây**; bản
+này giữ được tới **2000 px/giây** (mất dấu ở 3000). Ở tốc độ đó thì ảnh thật đã nhoè vì
+chuyển động — tốc độ giờ bị giới hạn bởi camera, không phải bởi app.
+
+Ảnh của ô được nén PNG ở nền: ô được ghi ngay, ảnh gắn vào khi nén xong. Mọi thứ đọc
+ảnh ô (dựng lại, hậu kiểm, xuất ZIP) đều chờ các ô đang nén trước (`settleBlobs`).
 
 Việc dán là **block copy tại toạ độ nguyên** — không warp, không nội suy. Mọi pixel
 trong ảnh ghép đúng là pixel ra từ camera, nguyên vẹn, tại đúng (x, y) mà bộ đo
@@ -95,6 +131,45 @@ lượng trôi mà bước này đang bù** — đó là con số để bạn bi
 
 Tắt được (chỉ để chẩn đoán, xem chuỗi đo thô).
 
+## Tinh chỉnh ở độ phân giải gốc
+
+Mọi phép đo ở trên chạy trên bản thu nhỏ ~640px. Với camera 2000px, một pixel ở đó là
+~3 pixel camera, nên sai số hệ thống nhỏ của nội suy dưới pixel (peak-locking) cũng to
+gấp ~3 lần trong ảnh ghép — và sai số hệ thống là thứ cộng dồn thành cả dải nghiêng.
+
+Mỗi khi ghi ô (không phải mỗi nhịp), app lấy một lưới 3×3 mảng 112px từ khung **gốc**,
+tìm từng mảng trong ảnh ghép gốc trong cửa sổ ±vài pixel quanh vị trí đã đo, chỉ dùng
+mảng nào nằm trọn trong phần đã quét, cần ≥3 mảng đồng ý (lệch < 1,5px), và chỉ được
+nhích ô vài pixel. Nhật ký ghi `tinh chỉnh độ phân giải gốc Npx (k mảng)`. Tắt cùng
+với "Neo từng ô vào ảnh ghép".
+
+Trên camera giả lập (`bench/e2e.mjs`), sau 3 cột × 3200px, sai lệch ngang của mọi ô so
+với vị trí thật ≤ 0,14px. Camera giả lập không có nhoè chuyển động, màn trập cuộn hay
+méo ống kính, nên đây là giới hạn của thuật toán chứ không phải con số sẽ thấy trên kính
+thật.
+
+## Chỉ ghi ô khi tay dừng
+
+Tuỳ chọn ở mục *Mật độ ô*. App vẫn bám vị trí liên tục, nhưng chỉ ghi ô khi ảnh gần như
+đứng yên (< 5% cạnh ngắn của khung mỗi giây, tối thiểu 15 px/s): kéo tới chỗ mới, dừng
+tay một nhịp, kéo tiếp.
+
+Lý do: khung chụp lúc đang kéo bị **nhoè**, và trên camera **màn trập cuộn** (rolling
+shutter — hầu hết camera CMOS giá rẻ) thì các hàng ảnh được đọc ở những thời điểm khác
+nhau nên cả khung bị xô lệch. Vị trí đo được vẫn đúng, nhưng dán khung xô lệch vào thì
+đường nối lệch vài pixel — nhìn như trôi mà không phải trôi, và không bước tối ưu nào
+sửa được. Trên camera giả lập, chế độ này cho sai số vị trí ô trung bình 0,03px (tối
+đa 0,1px) so với các điểm dừng thật.
+
+## Phân biệt "trôi" với các thứ trông giống trôi
+
+| Thấy gì | Thường là | Làm gì |
+|---|---|---|
+| Cả dải nghiêng đều, đường nối vẫn khớp | Camera xoay lệch so với trục bàn kính | Xoay lại camera, hoặc *Xoay thẳng trục khi xuất PNG* |
+| Đường nối lệch, lệch nhiều hơn khi kéo nhanh | Nhoè / màn trập cuộn | Bật *Chỉ ghi ô khi tay dừng* |
+| Lệch tăng dần dọc đường quét | Trôi thật (sai số cộng dồn) | Quét zigzag cho các cột chồng lên nhau, rồi *Tối ưu vị trí toàn cục* |
+| Một khối ô nằm sai chỗ hẳn | Khớp nhầm trên mô lặp lại | Xem nhật ký, bỏ ô sai, quét lại đoạn đó |
+
 ## Hai mốc tham chiếu
 
 Khung dò được lấy từ **hai** mốc, không phải một:
@@ -110,7 +185,7 @@ tới khung sau, mà tới khi bạn kéo tiêu bản trở lại chỗ trùng v
 lúc nào đó. Một cú giật vượt tầm với là kết thúc phiên quét — và đảo chiều trục
 (độ rơ cơ khí, tay chạm vào stage khi đổi núm) đúng là chỗ cú giật đó xảy ra.
 
-Mốc "khung ngay trước đó" luôn chỉ cũ 200ms, nên mất dấu chỉ tốn **1 khung** thay
+Mốc "khung ngay trước đó" luôn chỉ cũ một nhịp (100ms), nên mất dấu chỉ tốn **1 khung** thay
 vì phần còn lại của phiên. Nhật ký ghi `nối qua khung trước` khi điều đó xảy ra.
 
 ### Tự tìm lại vị trí khi mất dấu
@@ -326,7 +401,7 @@ khung ảnh sạch thì cả 5 đều đồng ý — đòi 3 vẫn dư sức b�
 trúc lặp lại** ở hàng bên cạnh và cùng báo sai một offset — trên mô học thì đó không
 phải khả năng xa vời. Và một ô đặt sai sẽ trở thành mốc tham chiếu cho mọi ô sau nó.
 
-Một khung bị bỏ tốn 200ms. Một khung bị đặt sai tốn cả phiên quét. `test-agree.mjs` có
+Một khung bị bỏ tốn một nhịp. Một khung bị đặt sai tốn cả phiên quét. `test-agree.mjs` có
 test dựng đúng tình huống cặp khung dò cùng sai đó.
 
 Bước tìm lại vị trí đòi cao hơn vì nó **dịch ô đi xa**, chứ không phải nhích một chút.
@@ -625,7 +700,22 @@ vì nếu không chính nó sẽ tạo context với thiết lập mặc định
 ```bash
 npm install
 npm run dev
-npm run test   # đồng thuận khung dò + chuyển hệ toạ độ khi neo + quy tắc hậu kiểm
+npm run test   # đồng thuận khung dò, hệ toạ độ khi neo, hậu kiểm, và test-track
+               # (chạy opencv.js thật trên tiêu bản giả lập: thô-rồi-tinh, neo, tinh chỉnh)
+```
+
+### Bench đầu-cuối
+
+`bench/e2e.mjs` chạy **app thật** đã build trong Chromium headless, chỉ thay camera bằng
+một kính hiển vi giả lập (`canvas.captureStream`) có bàn kính đi theo đường zigzag biết
+trước. Nó in ra số ô, số nhịp xử lý mỗi giây, tỉ lệ luồng giao diện bị chiếm, và sai lệch
+vị trí so với đường thật.
+
+```bash
+npm i -D playwright && npx playwright install chromium
+npm run build && npx vite preview --port 4173 &
+SPEED=1200 LEN=3200 npm run bench -- http://localhost:4173/ drag    # kéo liên tục
+SPEED=900  LEN=1500 npm run bench -- http://localhost:4173/ still   # dừng-rồi-đi
 ```
 
 Cần chạy qua HTTP(S)/localhost — API chia sẻ màn hình yêu cầu "secure context",
@@ -670,9 +760,11 @@ khai lên host tĩnh nào cũng được (đã có `netlify.toml`).
   cho việc đếm.
 - **Chưa có calibration µm/pixel**, nên toạ độ trong manifest là pixel, không map
   được về vernier của stage.
-- Toàn bộ OpenCV chạy trên main thread. Nhẹ hơn bản cũ nhiều (5 lần
-  `matchTemplate` trên mảng nhỏ mỗi tick, thay vì ORB + BFMatcher trên nhiều ứng
-  viên), nhưng vẫn chưa dùng Web Worker.
+- Toàn bộ OpenCV vẫn chạy trên main thread (chưa dùng Web Worker). Một nhịp thường
+  tốn ~30ms, nhịp ghi ô ~70ms (đo trong Chromium), nên vẫn còn dư so với nhịp 100ms.
+- Ở tốc độ kéo rất cao (≥ 3000 px/giây trên khung 1600×1200) vẫn mất dấu: tiêu bản
+  trượt quá tầm với của khung dò giữa hai nhịp. Khi đó app tự tìm lại khi kéo về vùng
+  đã quét.
 
 ## Lưu ý
 

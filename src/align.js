@@ -334,3 +334,121 @@ export function detectFieldRect(mat, insetFrac = 0.06) {
   left += ix; right -= ix; top += iy; bottom -= iy;
   return { x: left, y: top, w: right - left, h: bottom - top };
 }
+
+// ---------- coarse-to-fine tracking ----------
+//
+// estimateShift above searches the WHOLE working frame for each of five patches.
+// In opencv.js (WebAssembly, no threads) one matchTemplate of a 56px patch over a
+// 640px frame costs ~25ms, so a single estimate is ~130ms and a tick that needs
+// the previous-frame fallback is ~260ms — longer than the 200ms tick, so ticks
+// were silently skipped and the effective sampling rate fell to 2–3 Hz. At that
+// rate the slide moves a long way between samples, which is exactly what makes
+// tracking drop out unless the operator drags slowly.
+//
+// The fix is the standard pyramid: find each patch roughly on a small copy of
+// the frame (where a full search is cheap), then measure it precisely at working
+// resolution inside a small window around that rough answer. Reach is unchanged —
+// the coarse search still covers the whole frame — and the precise measurement
+// and the five-patch agreement are the same as before. Cost drops ~10x.
+
+export const COARSE_MAX_DIM = 200;
+const COARSE_PATCH_MIN_PX = 20;
+const COARSE_MIN_SCORE = 0.25;
+const COARSE_TOL_PX = 2;
+
+// Coarse copy of a working-resolution gray frame. `k` maps working px -> coarse px.
+export function toCoarse(gray, maxDim = COARSE_MAX_DIM) {
+  const k = Math.min(1, maxDim / Math.max(gray.cols, gray.rows));
+  const coarse = new cv.Mat();
+  cv.resize(gray, coarse, new cv.Size(Math.max(8, Math.round(gray.cols * k)), Math.max(8, Math.round(gray.rows * k))), 0, 0, cv.INTER_AREA);
+  return coarse;
+}
+
+// Where each patch roughly went, from the coarse copies. Returns the agreed shift in
+// WORKING pixels, or null if the coarse level can't say.
+function coarseShift(refC, curC, k, patchFrac) {
+  const pw = Math.max(COARSE_PATCH_MIN_PX, Math.round(refC.cols * patchFrac));
+  const ph = Math.max(COARSE_PATCH_MIN_PX, Math.round(refC.rows * patchFrac));
+  const found = [];
+  for (const [cx, cy] of PATCH_CENTERS) {
+    const r = matchOnePatch(refC, curC, cx, cy, pw, ph);
+    if (!r || r.atEdge || r.score < COARSE_MIN_SCORE) continue;
+    found.push(r);
+  }
+  if (found.length < 2) return null;
+  const group = largestAgreeingGroup(found, COARSE_TOL_PX);
+  if (group.length < 2) return null;
+  const dx = group.reduce((a, r) => a + r.dx, 0) / group.length;
+  const dy = group.reduce((a, r) => a + r.dy, 0) / group.length;
+  return { dx: dx / k, dy: dy / k };
+}
+
+// Same contract and return shape as estimateShift, but `ref` and `cur` are
+// { gray, coarse } pairs. Falls back to the full search when the coarse level
+// finds nothing usable, so it is never less capable than estimateShift — only
+// faster in the common case.
+export function estimateShiftFast(ref, cur, patchFrac, { minScore = 0.4, tolPx = 4, minAgree = 2 } = {}) {
+  const refGray = ref.gray;
+  const curGray = cur.gray;
+  const k = ref.coarse.cols / refGray.cols;
+  const c = coarseShift(ref.coarse, cur.coarse, k, patchFrac);
+  if (!c) return { ...estimateShift(refGray, curGray, patchFrac, { minScore, tolPx, minAgree }), path: 'full' };
+
+  const pw = Math.max(PATCH_MIN_PX, Math.round(refGray.cols * patchFrac));
+  const ph = Math.max(PATCH_MIN_PX, Math.round(refGray.rows * patchFrac));
+  const total = PATCH_CENTERS.length;
+  const info = { patchPx: Math.round(pw / (refGray.cols / 100)) / 100, pw, ph, total, path: 'fast' };
+  // Window half-size: a couple of coarse pixels of slack, in working pixels.
+  const rad = Math.ceil(2.5 / k) + 3;
+
+  const good = [];
+  let edged = 0;
+  let bestScore = 0;
+  for (const [cx, cy] of PATCH_CENTERS) {
+    const tx = Math.round(cx * refGray.cols - pw / 2);
+    const ty = Math.round(cy * refGray.rows - ph / 2);
+    if (tx < 0 || ty < 0 || tx + pw > refGray.cols || ty + ph > refGray.rows) continue;
+    // Predicted top-left of this patch in the current frame.
+    const px = Math.round(tx - c.dx);
+    const py = Math.round(ty - c.dy);
+    const wx = Math.max(0, px - rad);
+    const wy = Math.max(0, py - rad);
+    const wr = Math.min(curGray.cols, px + pw + rad);
+    const wb = Math.min(curGray.rows, py + ph + rad);
+    if (wr - wx < pw + 2 || wb - wy < ph + 2) { edged++; continue; } // patch has left the frame
+    const tpl = refGray.roi(new cv.Rect(tx, ty, pw, ph));
+    const win = curGray.roi(new cv.Rect(wx, wy, wr - wx, wb - wy));
+    const res = new cv.Mat();
+    try {
+      cv.matchTemplate(win, tpl, res, cv.TM_CCOEFF_NORMED);
+      const mm = cv.minMaxLoc(res);
+      if (mm.maxVal > bestScore) bestScore = mm.maxVal;
+      // A peak on the window's edge means the coarse guess was off by more than
+      // the slack — not a measurement. (An edge that is the frame's own edge is
+      // the same situation as the full search's atEdge.)
+      const atEdge = mm.maxLoc.x <= 0 || mm.maxLoc.y <= 0 || mm.maxLoc.x >= res.cols - 1 || mm.maxLoc.y >= res.rows - 1;
+      if (atEdge) { edged++; continue; }
+      if (mm.maxVal < minScore) continue;
+      const [sx, sy] = subpixelPeakOf(res, mm.maxLoc);
+      good.push({ score: mm.maxVal, dx: tx - (wx + sx), dy: ty - (wy + sy) });
+    } finally {
+      res.delete();
+      win.delete();
+      tpl.delete();
+    }
+  }
+
+  if (good.length === 0) {
+    return { ok: false, reason: edged >= 2 ? 'too-far' : 'no-signal', bestScore, used: 0, edged, all: [], ...info };
+  }
+  const group = largestAgreeingGroup(good, tolPx);
+  const all = good.map((r) => ({ dx: r.dx, dy: r.dy, score: r.score }));
+  if (group.length < minAgree) {
+    return { ok: false, reason: edged >= 2 ? 'too-far' : 'disagree', bestScore, used: good.length, edged, all, ...info };
+  }
+  const dx = group.reduce((a, r) => a + r.dx, 0) / group.length;
+  const dy = group.reduce((a, r) => a + r.dy, 0) / group.length;
+  const score = group.reduce((a, r) => a + r.score, 0) / group.length;
+  const spread = Math.max(...group.map((r) => Math.hypot(r.dx - dx, r.dy - dy)));
+  return { ok: true, dx, dy, score, spread, all, used: group.length, checked: good.length, edged, ...info };
+}
